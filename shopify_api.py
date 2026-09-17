@@ -19,9 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 # HOSTED API SERVERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 API_SERVERS = [
-    "https://angelic-perfection-production-2c92.up.railway.app",
-    "https://api-production-a26f.up.railway.app",
-    "https://api-production-6fdbd.up.railway.app",
+    "https://fadaapi.up.railway.app",
 ]
 
 # Primary API Key configured across the replicas
