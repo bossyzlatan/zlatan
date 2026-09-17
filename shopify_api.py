@@ -19,7 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 # HOSTED API SERVERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 API_SERVERS = [
-    "https://shopify-production-b02d.up.railway.app",
+    "https://fadaapi.up.railway.app",
 ]
 
 # Primary API Key configured across the replicas
