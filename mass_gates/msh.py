@@ -542,6 +542,34 @@ REACTIONS = [
     "tickle", "tired", "wave", "wink", "yay", "yes"
 ]
 
+# ══════════════════════════════════════════════════════════════════
+# INSUFFICIENT FUNDS — every known variant returned by Shopify APIs
+# ──────────────────────────────────────────────────────────────────
+# NOTE: Previously the classifier only matched the exact string
+# "INSUFFICIENT_FUNDS" (with underscore). That caused many real
+# insufficient-funds hits to fall through to the retry loop and end
+# up as ERROR — never triggering the DM or the hit-log notification.
+# These lists fix that by covering all common wordings.
+# ══════════════════════════════════════════════════════════════════
+INSUFFICIENT_FUNDS_KEYWORDS = [
+    "INSUFFICIENT",              # catches INSUFFICIENT_FUNDS, INSUFFICIENT FUNDS, "...insufficient funds"
+    "NOT_ENOUGH_BALANCE",
+    "NOT ENOUGH BALANCE",
+    "LOW_BALANCE",
+    "LOW BALANCE",
+    "INSUFFICIENT_BALANCE",
+    "INSUFFICIENT BALANCE",
+]
+
+# Other "live card" approved signals (CVC, 3DS, AVS) — these should
+# NOT trigger a DM to the user; only insufficient funds should.
+OTHER_LIVE_KEYWORDS = [
+    "INCORRECT_CVC", "INVALID_CVC", "INVALID_CVV", "CVC_DECLINED",
+    "3DS_REQUIRED", "3DS REQUIRED", "OTP_REQUIRED", "OTP REQUIRED",
+    "AUTHENTICATION_REQUIRED", "AUTHENTICATION REQUIRED",
+    "INCORRECT_ZIP", "AVS_FAILED", "BILLING_ADDRESS_MISMATCH",
+]
+
 def is_session_stopped(session_id: str) -> bool:
     session = MSH_SESSIONS.get(session_id)
     if not session:
@@ -1319,6 +1347,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     bin_data = {}
     used_proxy = None
 
+    # ── Flag: set to True when the response is confirmed insufficient funds.
+    #     Drives whether we send a DM + hit-log for APPROVED cards.
+    is_insufficient = False
+
     MAX_RETRIES = 15
     attempt = 0
 
@@ -1487,9 +1519,29 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                     response_msg = message
                     break
 
-            elif any(k in message_upper for k in ["INSUFFICIENT_FUNDS", "INCORRECT_CVC", "INVALID_CVC", "3DS_REQUIRED", "OTP_REQUIRED"]):
+            # ──────────────────────────────────────────────────────────────
+            # INSUFFICIENT FUNDS — matched FIRST (and separate from other
+            # live-card signals) so we can reliably DM the user.
+            # Previously only the exact string "INSUFFICIENT_FUNDS" matched,
+            # which caused "INSUFFICIENT FUNDS", "NOT_ENOUGH_BALANCE", etc.
+            # to fall through to the retry loop and silently become ERROR.
+            # ──────────────────────────────────────────────────────────────
+            elif any(k in message_upper for k in INSUFFICIENT_FUNDS_KEYWORDS):
                 result_status = "APPROVED"
                 response_msg = message
+                is_insufficient = True
+                logging.info(f"[MSH] INSUFFICIENT FUNDS matched: {message!r}")
+                break
+
+            # ──────────────────────────────────────────────────────────────
+            # OTHER LIVE-CARD SIGNALS (CVC / 3DS / AVS) — approved but silent
+            # (no DM, no hit-log; only insufficient funds notifies the user)
+            # ──────────────────────────────────────────────────────────────
+            elif any(k in message_upper for k in OTHER_LIVE_KEYWORDS):
+                result_status = "APPROVED"
+                response_msg = message
+                is_insufficient = False
+                logging.info(f"[MSH] LIVE (non-insufficient) approved: {message!r}")
                 break
 
             elif any(declined.upper() in message_upper for declined in DECLINED_RESPONSES):
@@ -1614,8 +1666,13 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             asyncio.to_thread(update_user_stats, user_id, True),
         )
 
-        # Only notify user for insufficient funds; 3DS/CVC etc. stay silent.
-        if "insufficient" in str(response_msg).lower():
+        # Only notify user for insufficient funds; 3DS/CVC/etc. stay silent.
+        # Rely on the boolean flag set at classification time — NOT on a
+        # substring check of the raw response — so every insufficient variant
+        # (INSUFFICIENT FUNDS, NOT_ENOUGH_BALANCE, LOW_BALANCE, …) triggers
+        # the DM and the hit-log.
+        if is_insufficient:
+            logging.info(f"[MSH] Sending INSUFFICIENT DM + log for {cc_formatted} — {response_msg!r}")
             await asyncio.gather(
                 send_hit_log_to_group(bot, cc_formatted, response_msg, bin_data,
                                       user_obj, plan_name, proxy_status_formatted,
@@ -1624,6 +1681,8 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                                           proxy_status_formatted, api_price,
                                           user_obj, plan_name, send_to_extra=False),
             )
+        else:
+            logging.info(f"[MSH] Approved but not insufficient — staying silent: {response_msg!r}")
         # Otherwise, do not send any notification.
 
     elif result_status == "DEAD":
@@ -1796,7 +1855,14 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
 
 @router.message(F.text.startswith("/stopmsh"))
 async def stopmsh_command(message: types.Message):
-    """Admin-only: stop every running MSH check across all users."""
+    """Admin-only: stop every running MSH check across all users.
+
+    For every running session this:
+      1. Marks the session STOPPED and cancels all pending tasks.
+      2. Deletes the original progress message from the chat/group it was sent in.
+      3. Posts a NEW message in that same chat naming the admin who stopped it.
+      4. DMs the affected user with the same information.
+    """
     user = message.from_user
     if user.id not in ADMIN_IDS:
         await message.reply(
@@ -1819,29 +1885,65 @@ async def stopmsh_command(message: types.Message):
         )
         return
 
+    # Admin display name — clickable when possible, HTML-escaped always
+    admin_name = html_escape(user.first_name or "Admin")
+    if user.username:
+        admin_link = f'<a href="https://t.me/{html_escape(user.username)}">{admin_name}</a>'
+    else:
+        admin_link = f'<a href="tg://user?id={user.id}">{admin_name}</a>'
+
     stopped = []
 
     for session_id, session in running_sessions:
         try:
-            # Mark session as STOPPED so workers exit their loops
+            # ── 1. Mark STOPPED and cancel every pending task ──
             session['status'] = "STOPPED"
 
-            # Cancel every pending task
             cancelled = 0
             for task in session.get('tasks', []):
                 if not task.done():
                     task.cancel()
                     cancelled += 1
 
-            # Force-refresh the progress message so the Stop button disappears
-            try:
-                session['last_text'] = ""
-                await update_progress_message(message.bot, session_id)
-            except Exception as e:
-                logging.error(f"[stopmsh] Could not update progress for {session_id}: {e}")
+            chat_id   = session.get('chat_id')
+            msg_id    = session.get('msg_id')
+            owner_id  = session.get('user_id')
 
-            # Notify the affected user (DM)
-            owner_id = session.get('user_id')
+            # ── 2. Delete the original progress message ──
+            if chat_id and msg_id:
+                try:
+                    await message.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"[stopmsh] Could not delete progress msg for {session_id}: {e}"
+                    )
+
+            # ── 3. Post a NEW message in the same chat naming the admin ──
+            stop_notice = (
+                "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
+                "<b>𝗖𝗛𝗘𝗖𝗞 𝗦𝗧𝗢𝗣𝗣𝗘𝗗 𝗕𝗬 𝗔𝗗𝗠𝗜𝗡</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
+                f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>\n"
+                f"<b><tg-emoji emoji-id='5388632425314140043'>🔍</tg-emoji> 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 ➛</b> <code>{session.get('checked', 0)}/{session.get('total', 0)}</code>"
+            )
+
+            if chat_id:
+                try:
+                    await message.bot.send_message(
+                        chat_id=chat_id,
+                        text=stop_notice,
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"[stopmsh] Could not send stop-notice to chat {chat_id}: {e}"
+                    )
+
+            # ── 4. DM the affected user with the same information ──
             if owner_id:
                 try:
                     await message.bot.send_message(
@@ -1849,9 +1951,11 @@ async def stopmsh_command(message: types.Message):
                         text=(
                             "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
                             "<b>𝗬𝗼𝘂𝗿 𝗰𝗵𝗲𝗰𝗸 𝘄𝗮𝘀 𝘀𝘁𝗼𝗽𝗽𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━\n"
+                            f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
                             f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
                         ),
-                        parse_mode="HTML"
+                        parse_mode="HTML",
                     )
                 except Exception as e:
                     logging.warning(f"[stopmsh] Could not notify user {owner_id}: {e}")
@@ -1864,16 +1968,21 @@ async def stopmsh_command(message: types.Message):
                 'cancelled': cancelled,
             })
 
-            logging.info(f"🛑 [stopmsh] Stopped session {session_id} (user {owner_id}) — cancelled {cancelled} tasks")
+            logging.info(
+                f"🛑 [stopmsh] Stopped session {session_id} "
+                f"(user {owner_id}) by admin {user.id} — cancelled {cancelled} tasks"
+            )
 
         except Exception as e:
             logging.error(f"[stopmsh] Error stopping session {session_id}: {e}")
 
-    # Build admin confirmation
+    # ── Admin confirmation in the admin's own chat ──
     lines = [
-        "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>𝗔𝗟𝗟 𝗠𝗦𝗛 𝗖𝗛𝗘𝗖𝗞𝗦 𝗦𝗧𝗢𝗣𝗣𝗘𝗗</b>",
+        "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
+        "<b>𝗔𝗟𝗟 𝗠𝗦𝗛 𝗖𝗛𝗘𝗖𝗞𝗦 𝗦𝗧𝗢𝗣𝗣𝗘𝗗</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀 ➛</b> <code>{len(stopped)}</code>",
+        f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗕𝘆 ➛</b> {admin_link}",
         ""
     ]
     for s in stopped:
