@@ -470,8 +470,8 @@ async def check_site_status(site_url: str) -> tuple:
                     except ValueError:
                         actual_price = -1.0
 
-            if not (0.00 <= actual_price <= 10.00):
-                return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> $10.00 Rejected) | {response_msg}"
+            if not (0.00 <= actual_price <= 5.00):
+                return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> $5.00 Rejected) | {response_msg}"
 
             FAKE_CARDS = ["4003035140199121|11|29|470", "4400666318254873|03|27|336"]
             fake_charged = 0
