@@ -867,6 +867,16 @@ def ensure_pending_feedback_table():
         logger.error(f"Error initializing pending_feedback collection: {e}")
         raise
 
+def ensure_settings_table():
+    """Key/value settings store used by sitechk (max price, etc.)."""
+    try:
+        db = _get_db()
+        db.settings.create_index("key", unique=True)
+        logger.info("Settings collection initialized")
+    except Exception as e:
+        logger.error(f"Error initializing settings collection: {e}")
+        raise
+
 def ensure_stats_table(gate_name: str):
     try:
         db = _get_db()
@@ -942,6 +952,7 @@ def initialize_schema():
         ensure_banned_users_table()
         ensure_user_sites_table()
         ensure_pending_feedback_table()
+        ensure_settings_table()
         db = _get_db()
         db.global_sites.create_index("url", unique=True)
         for gate in ["ST", "STR", "PF", "VBV", "FT", "BL", "PP", "AT", "PW", "PYU"]:
@@ -1695,6 +1706,38 @@ def clear_global_sites() -> int:
     except Exception as e:
         logger.error(f"Error clearing global sites: {e}")
         return 0
+
+# ═══════════════════════════════════════════════════════════════
+# SETTINGS MANAGEMENT (key/value runtime config, used by /setprice)
+# ═══════════════════════════════════════════════════════════════
+
+def get_setting(key: str, default=None):
+    """Return the value of a setting, or `default` if not set."""
+    try:
+        db = _get_db()
+        doc = db.settings.find_one({"key": key})
+        if doc is None:
+            return default
+        return doc.get("value", default)
+    except Exception as e:
+        logger.error(f"Error fetching setting '{key}': {e}")
+        return default
+
+
+def set_setting(key: str, value) -> bool:
+    """Upsert a setting value. Returns True on success."""
+    try:
+        db = _get_db()
+        db.settings.update_one(
+            {"key": key},
+            {"$set": {"key": key, "value": value, "updated_at": datetime.now()}},
+            upsert=True,
+        )
+        logger.info(f"Setting '{key}' updated to {value!r}")
+        return True
+    except Exception as e:
+        logger.error(f"Error setting '{key}': {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════════
 # PENDING FEEDBACK MANAGEMENT (persists across restarts)
