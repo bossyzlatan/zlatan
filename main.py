@@ -58,7 +58,8 @@ from mass_gates.mst import (
 from mass_gates.sitechk import (
     sitechk_command, addsite_command, siteall_command,
     removeall_command, dedupe_command, proxyinfo_command, resetproxy_command,
-    remsite_command, mysites_command, clearsites_command
+    remsite_command, mysites_command, clearsites_command,
+    setprice_command,
 )
 
 import payments as pay_sys
@@ -545,6 +546,9 @@ DOT_COMMAND_MAP = {
     "removeall": removeall_command, "dedupe": dedupe_command,
     "proxyinfo": proxyinfo_command, "resetproxy": resetproxy_command,
     "remsite": remsite_command,
+    "mysites": mysites_command, "mysite": mysites_command,
+    "clearsites": clearsites_command, "clearsite": clearsites_command,
+    "setprice": setprice_command,
     "cmds": cmds_command, "fb": feedback_cmd, "broad": broad_command,
     "ban": ban_command, "unban": unban_command, "vps": vps_command,
     "api": None,
@@ -756,6 +760,7 @@ for _cmd, _fn in [
     ("clearsites", clearsites_command), ("clearsite", clearsites_command),
     ("siteall", siteall_command), ("removeall", removeall_command), ("dedupe", dedupe_command),
     ("proxyinfo", proxyinfo_command), ("resetproxy", resetproxy_command),
+    ("setprice", setprice_command),
     ("stats", stats_command), ("proxy", proxy_command), ("checkproxy", checkproxy_command),
     ("clearproxy", clearproxy_command), ("rtvproxy", rtvproxy_command),
     ("bin", binn_command), ("binn", binn_command),
