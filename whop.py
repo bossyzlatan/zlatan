@@ -60,7 +60,7 @@ def to_math_bold(s: str) -> str:
 
 user_last_command_time = {}
 
-ADMIN_IDS = {6962534443}
+ADMIN_IDS = {6962534443, 8428369446}
 
 DEFAULT_ADMIN_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
