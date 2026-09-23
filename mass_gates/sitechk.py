@@ -14,7 +14,10 @@ import json
 from aiogram import types, F, Router, Bot
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, BufferedInputFile
-from database import get_db_connection, get_user_sites_db, add_user_sites_db, clear_user_sites_db
+from database import (
+    get_db_connection, get_user_sites_db, add_user_sites_db, clear_user_sites_db,
+    get_setting, set_setting,
+)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CONFIGURATION
@@ -35,6 +38,22 @@ API_TIMEOUT = 90
 
 PROXY_LIST = []
 BAD_PROXIES = set()
+
+DEFAULT_MAX_PRICE = 5.0
+
+
+def _get_max_price() -> float:
+    """Read the current max price from settings (falls back to 5.0)."""
+    try:
+        return float(get_setting("sitechk_max_price", DEFAULT_MAX_PRICE))
+    except Exception:
+        return DEFAULT_MAX_PRICE
+
+
+def _price_range_label() -> str:
+    """Human-friendly label like '0–5.00' for use in status text."""
+    return f"$0-{_get_max_price():.2f}"
+
 
 DEAD_ERRORS = [
     'site error! status: 404', 'site error! status: 500', 'site error! status: 402',
@@ -107,7 +126,6 @@ BANNED_SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ba
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _db_read_global_sites():
-    """Try to read global sites from MongoDB. Returns None if DB is unavailable."""
     try:
         from database import get_global_sites
         return get_global_sites()
@@ -117,7 +135,6 @@ def _db_read_global_sites():
 
 
 def _db_write_global_sites(sites_list):
-    """Try to replace global sites in MongoDB. Returns True on success."""
     try:
         from database import set_global_sites
         set_global_sites(sites_list)
@@ -128,7 +145,6 @@ def _db_write_global_sites(sites_list):
 
 
 def _db_add_global_sites(new_sites):
-    """Try to add (upsert) sites to MongoDB. Returns count added or None on failure."""
     try:
         from database import add_global_sites
         return add_global_sites(new_sites)
@@ -138,7 +154,6 @@ def _db_add_global_sites(new_sites):
 
 
 def _db_remove_global_site(site_url):
-    """Try to remove one site from MongoDB. Returns True/False, or None on failure."""
     try:
         from database import _get_db
         db = _get_db()
@@ -151,7 +166,6 @@ def _db_remove_global_site(site_url):
 
 
 def _db_clear_global_sites():
-    """Try to clear all global sites in MongoDB. Returns count or None on failure."""
     try:
         from database import clear_global_sites
         return clear_global_sites()
@@ -197,26 +211,21 @@ def _txt_add_sites(new_sites):
 # ── Unified API (used by all commands) ──────────────────────────────────────
 
 def read_sites():
-    """Read global sites — MongoDB first, txt file as fallback.
-    If DB is empty but txt has sites, auto-migrate them to DB."""
     db_sites = _db_read_global_sites()
     if db_sites is not None:
         if db_sites:
             return db_sites
-        # DB is empty — check if there are legacy sites in the txt file to migrate
         legacy = _txt_read_sites()
         if legacy:
             logging.info(f"[SITECHK] Migrating {len(legacy)} legacy sites from txt → DB")
             _db_write_global_sites(legacy)
             return legacy
         return []
-    # DB unreachable → use txt fallback
     logging.warning("[SITECHK] Using txt fallback for read_sites()")
     return _txt_read_sites()
 
 
 def write_sites(sites_list):
-    """Replace global sites — MongoDB first, txt file as fallback. Returns final count."""
     if _db_write_global_sites(sites_list):
         return len(set(sites_list))
     logging.warning("[SITECHK] Using txt fallback for write_sites()")
@@ -224,7 +233,6 @@ def write_sites(sites_list):
 
 
 def add_sites(new_sites):
-    """Add sites (upsert, dedup) — MongoDB first, txt as fallback. Returns count added."""
     db_added = _db_add_global_sites(new_sites)
     if db_added is not None:
         return db_added
@@ -233,12 +241,10 @@ def add_sites(new_sites):
 
 
 def remove_site(site_url):
-    """Remove one site — MongoDB first, txt as fallback. Returns True if removed."""
     normalized = normalize_url(site_url)
 
     db_result = _db_remove_global_site(site_url)
     if db_result is not None:
-        # Also scrub any txt copy in case of old data
         try:
             txt_sites = _txt_read_sites()
             filtered = [s for s in txt_sites if normalize_url(s) != normalized]
@@ -248,7 +254,6 @@ def remove_site(site_url):
             pass
         return db_result
 
-    # DB unreachable → txt fallback
     logging.warning("[SITECHK] Using txt fallback for remove_site()")
     txt_sites = _txt_read_sites()
     filtered = [s for s in txt_sites if normalize_url(s) != normalized]
@@ -259,10 +264,8 @@ def remove_site(site_url):
 
 
 def clear_all_sites():
-    """Clear all global sites — MongoDB first, txt as fallback. Returns count deleted."""
     db_count = _db_clear_global_sites()
     if db_count is not None:
-        # Also clear txt fallback so it doesn't come back
         try:
             _txt_write_sites([])
         except Exception:
@@ -433,6 +436,8 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str) -> d
 
 async def check_site_status(site_url: str) -> tuple:
     MAX_RETRIES = 3
+    # Snapshot the max price once per site so it can't change mid-run
+    max_price = _get_max_price()
     for attempt in range(MAX_RETRIES):
         proxy = get_random_proxy()
         result = await call_site_check_api(site_url=site_url, cc_formatted=TEST_CARD, proxy=proxy)
@@ -470,8 +475,8 @@ async def check_site_status(site_url: str) -> tuple:
                     except ValueError:
                         actual_price = -1.0
 
-            if not (0.00 <= actual_price <= 5.00):
-                return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> $5.00 Rejected) | {response_msg}"
+            if not (0.00 <= actual_price <= max_price):
+                return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> ${max_price:.2f} Rejected) | {response_msg}"
 
             FAKE_CARDS = ["4003035140199121|11|29|470", "4400666318254873|03|27|336"]
             fake_charged = 0
@@ -505,6 +510,9 @@ async def check_site_status(site_url: str) -> tuple:
 async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Audit", status_message_id=None, user_id=None):
     global BAD_PROXIES
     BAD_PROXIES.clear()
+
+    # Snapshot the price label once — every message in this run uses the same value
+    price_label = _price_range_label()
 
     total_sites = len(sites_to_check)
     valid_sites = []
@@ -577,7 +585,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                         message_id=status_message_id,
                         text=f"🔄 <b>{command_name}ing {total_sites} Sites...</b>\n"
                              f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-                             f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>Kept ($0-10):</b> <code>{live_count}</code>\n"
+                             f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>Kept ({price_label}):</b> <code>{live_count}</code>\n"
                              f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Rejected:</b> <code>{dead_count}</code>\n"
                              f"🔄 <b>Checked:</b> <code>{checked_count}/{total_sites}</code>\n"
                              f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies Available:</b> <code>{len(PROXY_LIST) - len(BAD_PROXIES)}/{len(PROXY_LIST)}</code>"
@@ -617,7 +625,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     filename = f"report_{command_name.lower()}_{int(time.time())}.txt"
     file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     file_content += f"TOTAL CHECKED: {total_sites}\n"
-    file_content += f"WORKING SITES (Price $0-10): {len(final_unique_sites)}\n"
+    file_content += f"WORKING SITES (Price {price_label}): {len(final_unique_sites)}\n"
     file_content += f"REJECTED (Dead/High Price): {dead_count}\n"
     if duplicate_count > 0 or removed_dupes > 0:
         file_content += f"DUPLICATES SKIPPED: {duplicate_count + removed_dupes}\n"
@@ -641,7 +649,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                     message_id=status_message_id,
                     text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>{command_name} Complete!</b>\n\n"
                          f"<b>Total Checked:</b> {total_sites}\n"
-                         f"<b>Valid ($0-10):</b> {len(final_unique_sites)} <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>\n"
+                         f"<b>Valid ({price_label}):</b> {len(final_unique_sites)} <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>\n"
                          f"<b>Rejected:</b> {dead_count} <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>\n"
                          f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
                          f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies Used:</b> {len(PROXY_LIST)} | <b>Bad:</b> {len(BAD_PROXIES)}"
@@ -687,11 +695,13 @@ async def sitechk_command(message: types.Message):
         await message.answer("📭 <b>No sites found in the global pool.</b>", parse_mode="HTML")
         return
 
+    price_label = _price_range_label()
+
     status_msg = await message.answer(
         f"🔄 <b>Starting Audit on {len(sites)} Sites...</b>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"🔄 <b>Checked:</b> <code>0/{len(sites)}</code>\n"
-        f"<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> <b>Kept ($0-10):</b> <code>0</code>\n"
+        f"<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> <b>Kept ({price_label}):</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Rejected:</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> <code>{len(PROXY_LIST)}</code>",
         parse_mode="HTML"
@@ -759,14 +769,16 @@ async def addsite_command(message: types.Message):
 
     except Exception as e:
         logging.error(f"Error downloading file: {e}", exc_info=True)
-        await message.answer(f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Error reading file:</b> {e}", parse_mode="HTML")
+        await message.answer(f"<tg-emoji emoji-id='6234166879663987'>❌</tg-emoji> <b>Error reading file:</b> {e}", parse_mode="HTML")
         return
+
+    price_label = _price_range_label()
 
     status_msg = await message.answer(
         f"🔄 <b>Starting Addition of {len(new_sites)} Sites...</b>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"🔄 <b>Checked:</b> <code>0/{len(new_sites)}</code>\n"
-        f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>Added ($0-10):</b> <code>0</code>\n"
+        f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>Added ({price_label}):</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Rejected:</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Duplicates:</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> <code>{len(PROXY_LIST)}</code>",
@@ -1019,3 +1031,60 @@ async def remsite_command(message: types.Message):
         f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Site is now added to <code>banned_sites.json</code> {active_removed_str} and will never be used again.",
         parse_mode="HTML"
     )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# /setprice — Change the max accepted price for site checks
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.message(Command("setprice"))
+async def setprice_command(message: types.Message):
+    """Admin-only: set the maximum accepted price for /sitechk and /addsite."""
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        return
+
+    args = message.text.split()[1:]
+    if not args:
+        current = _get_max_price()
+        await message.answer(
+            f"<b>💵 Current max price ➛</b> <code>${current:.2f}</code>\n\n"
+            f"<b>Usage:</b> <code>/setprice 10</code>\n"
+            f"<i>Sets the highest price a site is allowed to have for it to be kept.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    raw = args[0].replace("$", "").strip()
+    try:
+        new_price = float(raw)
+        if new_price < 0:
+            raise ValueError("Must be non-negative")
+    except ValueError:
+        await message.answer(
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            "<b>Invalid amount.</b> Example: <code>/setprice 7.5</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    old_price = _get_max_price()
+    ok = await asyncio.to_thread(set_setting, "sitechk_max_price", new_price)
+
+    if ok:
+        await message.answer(
+            f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> "
+            f"<b>Max price updated</b>\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"<b>Before ➛</b> <code>${old_price:.2f}</code>\n"
+            f"<b>After  ➛</b> <code>${new_price:.2f}</code>\n\n"
+            f"<i>Applies immediately to the next /sitechk or /addsite run.</i>",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            "<b>Failed to save setting.</b>",
+            parse_mode="HTML"
+        )
