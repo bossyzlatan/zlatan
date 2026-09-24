@@ -6,6 +6,7 @@ Features:
 - curl_cffi AsyncSession with real browser TLS fingerprint emulation (impersonate="chrome131", "chrome133")
 - Full realistic device profile rotation (User-Agent, sec-ch-ua, screen dimensions, WebGL vendor/renderer, timezones)
 - Next.js RSC & structured JSON product plan resolution (avoiding $0.00 free tiers)
+- Custom-field auto-fill (prevents "Custom field response not included in array" errors)
 - Containerized Basis Theory card tokenization with Whop merchant container exchange
 - Strict charge classification (zero false positives, real gateway decline extraction)
 """
@@ -180,11 +181,126 @@ def format_proxy(raw: Optional[str]) -> Optional[str]:
         return f"http://{host}:{port}"
     return f"http://{raw}"
 
+
+# ═══════════════════════════════════════════════════════════════
+# CUSTOM FIELD EXTRACTION & AUTO-FILL
+# ═══════════════════════════════════════════════════════════════
+
+def _extract_custom_fields_from_html(page_html: str, plan_id: str) -> List[Dict[str, Any]]:
+    """
+    Best-effort extraction of the plan's custom field definitions from the
+    Next.js RSC payload. Looks in a window around the plan_id for a
+    `customFields` / `custom_fields` array.
+
+    Returns a list of dicts:
+        [{"id": "field_xxx", "name": "...", "field_type": "text", "required": True}, ...]
+    Returns [] if nothing is found (plan has no custom fields).
+    """
+    fields: List[Dict[str, Any]] = []
+    try:
+        if not page_html or not plan_id:
+            return fields
+
+        idx = page_html.find(plan_id)
+        if idx == -1:
+            return fields
+
+        # Search a generous window around the plan id
+        window = page_html[max(0, idx - 4000): idx + 6000]
+
+        # Find the customFields array inside that window (multiple key styles)
+        cf_match = (
+            re.search(r'customFields\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
+            or re.search(r'custom_fields\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
+            or re.search(r'"customFields"\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
+            or re.search(r'"custom_fields"\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
+        )
+        if not cf_match:
+            return fields
+
+        body = cf_match.group(1)
+
+        # Each field object — tolerate nested-free flat objects
+        for obj in re.findall(r'\{[^{}]*\}', body):
+            f_id = re.search(r'(?:id|field_id|fieldId)\s*:\s*"([^"]+)"', obj)
+            if not f_id:
+                continue
+
+            f_name = re.search(r'(?:name|label|title)\s*:\s*"([^"]*)"', obj)
+            f_type = re.search(r'(?:field_type|fieldType|type)\s*:\s*"([^"]+)"', obj)
+            f_req = re.search(r'required\s*:\s*(!0|true|!1|false)', obj)
+
+            required_val = True
+            if f_req:
+                required_val = f_req.group(1) in ("!0", "true")
+
+            fields.append({
+                "id": f_id.group(1),
+                "name": f_name.group(1) if f_name else "",
+                "field_type": (f_type.group(1) if f_type else "text").lower(),
+                "required": required_val,
+            })
+    except Exception as e:
+        logger.warning(f"[whop_hitter] custom field extraction failed: {e}")
+
+    return fields
+
+
+def _build_custom_field_responses(fields: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Produce a valid 'custom_field_responses' array for the checkout payload.
+    Every field gets a sensible dummy answer depending on its type.
+    """
+    responses: List[Dict[str, str]] = []
+    for f in fields:
+        ftype = (f.get("field_type") or "text").lower()
+        name_lower = (f.get("name") or "").lower()
+
+        # Smart-ish defaults based on field name
+        if "discord" in name_lower:
+            answer = "user#0001"
+        elif "email" in name_lower:
+            answer = "buyer@example.com"
+        elif "phone" in name_lower or "mobile" in name_lower:
+            answer = "5551234567"
+        elif "name" in name_lower:
+            answer = "John Doe"
+        elif "age" in name_lower or "number" in name_lower or "quantity" in name_lower:
+            answer = "1"
+        else:
+            # Type-based fallback
+            if ftype in ("text", "textarea", "string", "short_text", "long_text"):
+                answer = "N/A"
+            elif ftype in ("number", "numeric", "integer", "int"):
+                answer = "1"
+            elif ftype in ("email",):
+                answer = "buyer@example.com"
+            elif ftype in ("phone", "tel", "telephone"):
+                answer = "5551234567"
+            elif ftype in ("checkbox", "boolean", "bool", "toggle"):
+                answer = "true"
+            elif ftype in ("dropdown", "select", "choice", "radio", "multi_select"):
+                # Free-text fallback — will work on free-form dropdowns,
+                # may be rejected on strict ones (that's expected).
+                answer = "N/A"
+            elif ftype in ("date",):
+                answer = "2000-01-01"
+            else:
+                answer = "N/A"
+
+        responses.append({
+            "id": f["id"],
+            "answer": answer,
+        })
+
+    return responses
+
+
 async def get_tempmail_address() -> Tuple[str, str]:
     first = random.choice(FIRST_NAMES)
     last = random.choice(LAST_NAMES)
     full_name = f"{first} {last}"
-    
+
     for base_url in TEMPMAIL_BRIDGE_URLS:
         try:
             async with httpx.AsyncClient(timeout=3) as client:
@@ -201,6 +317,7 @@ async def get_tempmail_address() -> Tuple[str, str]:
     email = f"{first.lower()}.{last.lower()}{random.randint(10, 99)}@{domain}".lower()
     return full_name, email
 
+
 class WhopHitter:
     def __init__(self, proxy: Optional[str] = None):
         self.proxy = format_proxy(proxy)
@@ -209,7 +326,7 @@ class WhopHitter:
 
     async def hit(self, url: str, email: Optional[str], card: str) -> Dict[str, Any]:
         start_time = time.time()
-        
+
         parts = card.split("|")
         if len(parts) != 4:
             return {
@@ -218,7 +335,7 @@ class WhopHitter:
                 "Message": "Invalid card format (expected CC|MM|YY|CVV)",
                 "Time": f"{time.time() - start_time:.2f}s"
             }
-        
+
         cc, mm, yy, cv = parts
         mm = int(mm)
         if len(yy) == 2:
@@ -267,6 +384,7 @@ class WhopHitter:
 
         async with AsyncSession(impersonate=impersonate_target, proxy=self.proxy, verify=False, timeout=30) as client:
             plan_id = None
+            page_html = ""   # hoisted so it's always defined
             url_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', url)
             if url_plans:
                 plan_id = url_plans[0]
@@ -275,11 +393,11 @@ class WhopHitter:
                 try:
                     r_page = await client.get(url, headers={"user-agent": profile["ua"]})
                     page_html = r_page.text
-                    
+
                     # Parse structured plan definitions with free indicator
                     pattern = r'\{id:"(plan_[a-zA-Z0-9]{12,18})",free:(!0|!1)(?:,[^}]+?formattedPeriodV2:"([^"]+)")?'
                     matches = re.findall(pattern, page_html)
-                    
+
                     parsed_plans = []
                     seen_pids = set()
                     for pid, free_val, period in matches:
@@ -290,9 +408,9 @@ class WhopHitter:
                                 "free": free_val == "!0",
                                 "period": (period or "").lower()
                             })
-                    
+
                     slug = parsed_url.path.rstrip("/").split("/")[-1].lower()
-                    
+
                     if "month" in slug:
                         for p in parsed_plans:
                             if not p["free"] and "month" in p["period"]:
@@ -308,7 +426,7 @@ class WhopHitter:
                         paid = [p["id"] for p in parsed_plans if not p["free"]]
                         if paid:
                             plan_id = paid[0]
-                    
+
                     if not plan_id:
                         html_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', page_html)
                         if html_plans:
@@ -318,6 +436,7 @@ class WhopHitter:
                             rsc_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', r_rsc.text)
                             if rsc_plans:
                                 plan_id = rsc_plans[0]
+                                page_html = r_rsc.text
                 except Exception as e:
                     return {
                         "Response": "PAGE_ERROR",
@@ -341,10 +460,39 @@ class WhopHitter:
                 }
 
             prod_slug = parsed_url.path.strip("/").split("/")[0] if parsed_url.path.strip("/") else ""
-            checkout_payload = {
+
+            # ─────────────────────────────────────────────────────────
+            # AUTO-FILL CUSTOM FIELDS (Option A fix)
+            # Prevents the "Custom field response not included in array"
+            # error by injecting `custom_field_responses` when the plan
+            # declares any custom fields.
+            # ─────────────────────────────────────────────────────────
+            custom_field_defs: List[Dict[str, Any]] = []
+            try:
+                custom_field_defs = _extract_custom_fields_from_html(page_html, plan_id)
+            except Exception as e:
+                logger.warning(f"[whop_hitter] custom field extraction error: {e}")
+
+            checkout_payload: Dict[str, Any] = {
                 "items": [{"plan": plan_id, "quantity": 1}],
-                "attribution": {"source": "product_page_direct"}
+                "attribution": {"source": "product_page_direct"},
             }
+
+            if custom_field_defs:
+                responses = _build_custom_field_responses(custom_field_defs)
+                if responses:
+                    checkout_payload["custom_field_responses"] = responses
+                    logger.info(
+                        f"[whop_hitter] injected {len(responses)} custom_field_responses "
+                        f"for plan {plan_id} "
+                        f"({[f['name'] for f in custom_field_defs]})"
+                    )
+            else:
+                # Always send an empty array so Whop has the key present.
+                # This is harmless for plans without custom fields and
+                # satisfies endpoints that require the key to exist.
+                checkout_payload["custom_field_responses"] = []
+
             if affiliate_code:
                 checkout_payload["affiliate_code"] = affiliate_code
                 checkout_payload["tracking_link_ids_by_account"] = {}
@@ -683,6 +831,7 @@ class WhopHitter:
                     "final_status": final_status,
                 }
             }
+
 
 if __name__ == "__main__":
     import sys
