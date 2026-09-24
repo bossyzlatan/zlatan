@@ -9,8 +9,8 @@ from typing import Optional, Dict, Any
 # ADMIN & WALLET CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ADMIN_CONTACT_USERNAME = "Salluuxx"
-ADMIN_CONTACT_URL = "https://t.me/Salluuxx"
+ADMIN_CONTACT_USERNAME = "Lanxo2"
+ADMIN_CONTACT_URL = "https://t.me/Lanxo2"
 
 USDT_ADDRESSES: Dict[str, Dict[str, str]] = {
     "BEP20": {
