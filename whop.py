@@ -90,6 +90,7 @@ DEFAULT_ADMIN_PROXIES = [
 
 DEFAULT_WHOP_URL = "https://whop.com/selfmade-society/selfmade-society?a=oozaruh"
 
+
 def normalize_proxy(proxy: str) -> str:
     if not proxy or not proxy.strip():
         return ""
@@ -110,6 +111,7 @@ def normalize_proxy(proxy: str) -> str:
             return f'http://{proxy}'
     return f'http://{proxy}'
 
+
 async def get_user_live_proxies(user_id: int):
     proxies = []
     try:
@@ -129,6 +131,7 @@ async def get_user_live_proxies(user_id: int):
         return normalized, False
     return DEFAULT_ADMIN_PROXIES[:], True
 
+
 async def get_user_plan_name(user_id):
     is_premium, _ = await asyncio.to_thread(get_hitter_status, user_id)
     if is_premium:
@@ -136,31 +139,37 @@ async def get_user_plan_name(user_id):
             def _sync_fetch():
                 conn = get_db_connection()
                 cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                cursor.execute("SELECT plan FROM receipts WHERE user_id = %s ORDER BY purchased_on DESC LIMIT 1", (user_id,))
+                cursor.execute(
+                    "SELECT plan FROM receipts WHERE user_id = %s ORDER BY purchased_on DESC LIMIT 1",
+                    (user_id,)
+                )
                 row = cursor.fetchone()
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "zlatan", "darkanon", "carderx"]): return 'Carder X <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
-                    if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
-                    if "elite" in p: return '𝗘𝗹𝗶𝘁𝗲 ⭐'
-                    if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
+                    if any(k in p for k in ["kashim", "chirag", "zlatan", "darkanon", "carderx"]):
+                        return 'Carder X <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
+                    if "root" in p:
+                        return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
+                    if "elite" in p:
+                        return '𝗘𝗹𝗶𝘁𝗲 ⭐'
+                    if "core" in p:
+                        return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
                     return row['plan']
                 return "PREMIUM"
             return await asyncio.to_thread(_sync_fetch)
         except Exception as e:
             logging.error(f"Error fetching plan name: {e}")
         return "PREMIUM"
-    else:
-        return "TRIAL"
+    return "TRIAL"
+
 
 def luhn_check(card_number: str) -> bool:
     card_number = str(card_number).strip()
     if not card_number.isdigit():
         return False
     total = 0
-    reverse_digits = card_number[::-1]
-    for i, char in enumerate(reverse_digits):
+    for i, char in enumerate(card_number[::-1]):
         digit = int(char)
         if i % 2 == 1:
             digit *= 2
@@ -169,12 +178,14 @@ def luhn_check(card_number: str) -> bool:
         total += digit
     return total % 10 == 0
 
+
 @router.message(F.text.regexp(r'^/(?:whop|whophit)(?:\s|$)'))
 async def whop_command(message: types.Message):
     if not await asyncio.to_thread(is_gate_enabled, "whop"):
         await message.reply(
-            "<tg-emoji emoji-id='4958926882994127612'>🚧</tg-emoji> <b>𝗪𝗵𝗼𝗽 𝗛𝗶𝘁𝘁𝗲𝗿 𝗶𝘀 𝘂𝗻𝗱𝗲𝗿 𝗺𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>\n"
-            "𝗜𝘁 𝘄𝗶𝗹𝗹 𝗯𝗲 𝗯𝗮𝗰𝗸 𝘀𝗵𝗼𝗿𝘁𝗹𝘆 𝘄𝗶𝘁𝗵 𝗲𝘅𝗰𝗶𝘁𝗶𝗻𝗴 𝗶𝗺𝗽𝗿𝗼𝘃𝗲𝗺𝗲𝗻𝘁𝘀.<tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji>",
+            "<tg-emoji emoji-id='4958926882994127612'>🚧</tg-emoji> "
+            "<b>𝗪𝗵𝗼𝗽 𝗛𝗶𝘁𝘁𝗲𝗿 𝗶𝘀 𝘂𝗻𝗱𝗲𝗿 𝗺𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>\n"
+            "𝗜𝘁 𝘄𝗶𝗹𝗹 𝗯𝗲 𝗯𝗮𝗰𝗸 𝘀𝗵𝗼𝗿𝘁𝗹𝘆 𝘄𝗶𝘁𝗵 𝗲𝘅𝗰𝗶𝘁𝗶𝗻𝗴 𝗶𝗺𝗽𝗿𝗼𝘃𝗲𝗺𝗲𝗻𝘁𝘀.",
             parse_mode="HTML"
         )
         return
@@ -192,8 +203,9 @@ async def whop_command(message: types.Message):
                 remaining_time = round(10 - elapsed, 1)
                 await message.reply(
                     f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>𝗦𝗹𝗼𝘄 𝗗𝗼𝘄𝗻!</b>\n"
-                    f"𝗣𝗹𝗲𝗮𝘀𝗲 𝘄𝗮𝗶𝘁 <code>{remaining_time}</code> 𝘀𝗲𝗰𝗼𝗻𝗱𝘀 𝗯𝗲𝗳𝗼𝗿𝗲 𝗰𝗼𝗻𝘁𝗶𝗻𝘂𝗶𝗻𝗴.\n"
-                    f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗨𝗻𝗹𝗼𝗰𝗸 𝗣𝗿𝗲𝗺𝗶𝘂𝗺 𝗳𝗼𝗿 𝗶𝗻𝘀𝘁𝗮𝗻𝘁, 𝘂𝗻𝗹𝗶𝗺𝗶𝘁𝗲𝗱 𝘂𝘀𝗲.",
+                    f"𝗣𝗹𝗲𝗮𝘀𝗲 𝘄𝗮𝗶𝘁 <code>{remaining_time}</code> 𝘀𝗲𝗰𝗼𝗻𝗱𝘀.\n"
+                    f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> "
+                    f"𝗨𝗻𝗹𝗼𝗰𝗸 𝗣𝗿𝗲𝗺𝗶𝘂𝗺 𝗳𝗼𝗿 𝗶𝗻𝘀𝘁𝗮𝗻𝘁, 𝘂𝗻𝗹𝗶𝗺𝗶𝘁𝗲𝗱 𝘂𝘀𝗲.",
                     parse_mode="HTML"
                 )
                 return
@@ -209,9 +221,7 @@ async def whop_command(message: types.Message):
             "<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗠𝗶𝘀𝘀𝗶𝗻𝗴 𝗪𝗵𝗼𝗽 𝗟𝗶𝗻𝗸:</b>\n"
             "You must provide a valid Whop product URL!\n\n"
             "<b>Usage:</b>\n"
-            "<code>/whop &lt;whop_url&gt; &lt;cc|mm|yy|cvv&gt;</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/whop https://whop.com/arts-crypto-circle/arts-crypto-circle-monthly23?a=wickyone 4242424242424242|05|28|123</code>",
+            "<code>/whop &lt;whop_url&gt; &lt;cc|mm|yy|cvv&gt;</code>",
             parse_mode="HTML"
         )
         return
@@ -224,9 +234,7 @@ async def whop_command(message: types.Message):
     if not cc_match:
         await message.reply(
             "<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗨𝘀𝗮𝗴𝗲:</b>\n"
-            "<code>/whop &lt;whop_url&gt; &lt;cc|mm|yy|cvv&gt;</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/whop https://whop.com/arts-crypto-circle/arts-crypto-circle-monthly23?a=wickyone 4242424242424242|05|28|123</code>\n"
+            "<code>/whop &lt;whop_url&gt; &lt;cc|mm|yy|cvv&gt;</code>\n"
             "<i>Or reply to a message containing a card or Whop link.</i>",
             parse_mode="HTML"
         )
@@ -246,7 +254,6 @@ async def whop_command(message: types.Message):
 
     user_proxies, is_admin_fallback = await get_user_live_proxies(user_id)
     selected_proxy = random.choice(user_proxies) if user_proxies else None
-
     plan_name = await get_user_plan_name(user_id)
 
     user_link = f"<a href='tg://user?id={user_id}'>{user.first_name}</a>"
@@ -266,10 +273,12 @@ async def whop_command(message: types.Message):
         )
     )
 
+
 async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc, mm, yy, cvv,
                              whop_url, selected_proxy, plan_name, is_admin_fallback):
     try:
         start_time = time.time()
+
         try:
             await asyncio.to_thread(create_user, user_id, user.username)
         except Exception as e:
@@ -287,13 +296,18 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         buyer_email = ""
         otp_code = "N/A"
 
+        # ── RUN THE HIT ────────────────────────────────────────────
         try:
             hitter = WhopHitter(proxy=selected_proxy)
             result = await hitter.hit(url=whop_url, email=None, card=formatted_cc)
 
             resp_code = str(result.get("Response", "")).upper()
-            if selected_proxy and any(k in resp_code for k in ("PAGE_ERROR", "CHECKOUT_INIT_FAILED", "PATCH_EXCEPTION", "PATCH_FAILED", "CREATE_FAILED", "CREATE_EXCEPTION", "EMBED_EXCEPTION", "TOKEN_EXCEPTION", "FAILED TO CONNECT", "INCOMPLETE")):
-                logging.warning(f"Selected proxy failed for Whop check ({resp_code}), falling back to direct connection...")
+            if selected_proxy and any(k in resp_code for k in (
+                "PAGE_ERROR", "CHECKOUT_INIT_FAILED", "PATCH_EXCEPTION", "PATCH_FAILED",
+                "CREATE_FAILED", "CREATE_EXCEPTION", "EMBED_EXCEPTION", "TOKEN_EXCEPTION",
+                "FAILED TO CONNECT", "INCOMPLETE"
+            )):
+                logging.warning(f"Proxy failed for Whop check ({resp_code}), falling back to direct connection...")
                 hitter = WhopHitter(proxy=None)
                 result = await hitter.hit(url=whop_url, email=None, card=formatted_cc)
 
@@ -312,25 +326,31 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             otp_code = "N/A"
             elapsed = round(time.time() - start_time, 2)
 
+        # ── CLASSIFY ───────────────────────────────────────────────
         is_charged = False
         is_insufficient = False
         is_approved = False
         msg_lower = res_message.lower()
 
         if status_raw == "CHARGED" and ("placed successfully" in msg_lower or "order placed" in msg_lower):
-            final_status = f'𝗖𝗛𝗔𝗥𝗚𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_CHARGED_EMOJI_ID}\">💎</tg-emoji>'
+            final_status = f'𝗖𝗛𝗔𝗥𝗚𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_CHARGED_EMOJI_ID}">💎</tg-emoji>'
             is_charged = True
         elif "insufficient" in msg_lower or "not enough funds" in msg_lower or "no funds" in msg_lower:
-            final_status = f'𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 <tg-emoji emoji-id=\"{CUSTOM_INSUFFICIENT_EMOJI_ID}\">💰</tg-emoji>'
+            final_status = f'𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 <tg-emoji emoji-id="{CUSTOM_INSUFFICIENT_EMOJI_ID}">💰</tg-emoji>'
             is_insufficient = True
-        elif status_raw in ("APPROVED", "LIVE") or any(k in msg_lower for k in ["incorrect cvc", "security code", "3d", "authenticate", "zip code"]):
-            final_status = f'𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_APPROVED_EMOJI_ID}\">✅</tg-emoji>'
+        elif status_raw in ("APPROVED", "LIVE") or any(k in msg_lower for k in [
+            "incorrect cvc", "security code", "3d", "authenticate", "zip code"
+        ]):
+            final_status = f'𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_APPROVED_EMOJI_ID}">✅</tg-emoji>'
             is_approved = True
-        elif status_raw == "DECLINED" or any(k in msg_lower for k in ["declined", "card_declined", "do_not_honor", "generic_decline", "incomplete", "failed"]):
-            final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_DECLINED_EMOJI_ID}\">❌</tg-emoji>'
+        elif status_raw == "DECLINED" or any(k in msg_lower for k in [
+            "declined", "card_declined", "do_not_honor", "generic_decline", "incomplete", "failed"
+        ]):
+            final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_DECLINED_EMOJI_ID}">❌</tg-emoji>'
         else:
-            final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id=\"{CUSTOM_DECLINED_EMOJI_ID}\">❌</tg-emoji>'
+            final_status = f'𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_DECLINED_EMOJI_ID}">❌</tg-emoji>'
 
+        # ── BIN LOOKUP ─────────────────────────────────────────────
         try:
             bin_info = await get_bin_info(cc[:6])
         except Exception as e:
@@ -345,18 +365,19 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         country_flag = bin_info.get("country_emoji", "")
         bin_country = f"{country_flag} {country_name}" if country_flag else country_name
 
+        # ── STATS ──────────────────────────────────────────────────
         try:
             await asyncio.to_thread(update_user_stats, user_id, is_charged)
         except Exception as e:
             logging.error(f"Failed to update stats: {e}")
 
+        # ── BUILD THE RESULT MESSAGE ───────────────────────────────
         user_name_safe = html.escape(user.first_name or "User")
         user_link = f'<a href="tg://user?id={user.id}">{user_name_safe}</a>'
         dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
         user_display = f"{user_link} ({plan_name})"
 
         proxy_indicator = "Admin Proxy (Default)" if is_admin_fallback else "User Proxy"
-
         email_display = f"<code>{html.escape(buyer_email)}</code>" if buyer_email else "<code>N/A</code>"
         otp_display = f"<code>{html.escape(otp_code)}</code>" if otp_code and otp_code != "N/A" else "<code>Direct Multi-PSP</code>"
 
@@ -382,22 +403,113 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         )
 
         reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+            [InlineKeyboardButton(
+                text="CARDER X",
+                url="https://t.me/zlatanchecker_bot",
+                icon_custom_emoji_id="5042097984083330584",
+                style="primary"
+            )]
         ])
 
+        # ── SEND RESULT (flat, no deep nesting) ────────────────────
+        edited_ok = False
         try:
             await proc_msg.edit_text(
                 text=final_caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup
             )
+            edited_ok = True
         except Exception as e:
-            logging.error(f"Error editing message with HTML: {e}")
+            logging.error(f"[whop] edit_text failed: {e}")
+
+        if not edited_ok:
             try:
                 await message.reply(
                     text=final_caption,
                     parse_mode="HTML",
                     reply_markup=reply_markup
                 )
+                edited_ok = True
             except Exception as e2:
-                logging.error(f"Fallback reply with HTML failed: {e2}")
+                logging.error(f"[whop] reply with HTML failed: {e2}")
+
+        if not edited_ok:
+            try:
+                plain_caption = re.sub(r'<[^>]+>', '', final_caption)
+                await proc_msg.edit_text(text=plain_caption, reply_markup=reply_markup)
+                edited_ok = True
+            except Exception as e3:
+                logging.error(f"[whop] plain edit_text failed: {e3}")
+
+        if not edited_ok:
+            try:
+                plain_caption = re.sub(r'<[^>]+>', '', final_caption)
+                await message.reply(text=plain_caption)
+            except Exception:
+                pass
+
+        # ── BROADCAST ──────────────────────────────────────────────
+        if is_charged or is_insufficient:
+            if is_charged:
+                header         = "<b>💎 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
+                summary_header = "<b>💎 𝗪𝗛𝗢𝗣 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
+                badge          = "CHARGED"
+            else:
+                header         = "<b>💰 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
+                summary_header = "<b>💰 𝗪𝗛𝗢𝗣 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
+                badge          = "INSUFFICIENT"
+
+            url_line = f"<b>🔗 𝗪𝗵𝗼𝗽 𝗨𝗥𝗟:</b> <code>{html.escape(whop_url)}</code>\n"
+
+            full_text = (
+                f"{header}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{url_line}"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{final_caption}"
+            )
+
+            try:
+                await safe_send_message(
+                    message.bot,
+                    chat_id=CHARGED_GROUP_CHAT_ID,
+                    text=full_text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logging.error(f"Whop broadcast → CHARGED_GROUP_CHAT_ID failed: {e}")
+
+            short_text = (
+                f"{summary_header}\n"
+                f"<b>🌐 𝗚𝗮𝘁𝗲:</b> 𝗪𝗵𝗼𝗽 𝗔𝘂𝘁𝗼-𝗛𝗶𝘁𝘁𝗲𝗿\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>💬 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲:</b> {html.escape(str(res_message or badge))}\n"
+                f"<b>📦 𝗣𝗹𝗮𝗻:</b> <code>{html.escape(str(plan_id))}</code>\n"
+                f"<b>👤 𝗨𝘀𝗲𝗿:</b> {user_display}"
+            )
+
+            try:
+                await safe_send_message(
+                    message.bot,
+                    chat_id=SUMMARY_GROUP_CHAT_ID,
+                    text=short_text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logging.error(f"Whop broadcast → SUMMARY_GROUP_CHAT_ID failed: {e}")
+
+    except Exception as fatal_err:
+        logging.error(f"Fatal unhandled exception in process_whop_check: {fatal_err}", exc_info=True)
+        try:
+            await proc_msg.edit_text(
+                f"⚠️ <b>Check Failed:</b> {html.escape(str(fatal_err)[:100])}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            try:
+                await proc_msg.edit_text(f"⚠️ Check Failed: {str(fatal_err)[:100]}")
+            except Exception:
+                pass
