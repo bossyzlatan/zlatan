@@ -61,7 +61,6 @@ from mass_gates.sitechk import (
     remsite_command, mysites_command, clearsites_command,
 )
 
-# /setprice is optional — tolerate older sitechk.py builds that lack it.
 try:
     from mass_gates.sitechk import setprice_command
 except ImportError:
@@ -71,7 +70,6 @@ except ImportError:
         "/setprice will be disabled. Update sitechk.py to enable it."
     )
 
-# Whop auto-hitter
 from whop import whop_command, router as whop_router
 
 import payments as pay_sys
@@ -82,10 +80,11 @@ WEBHOOK_URL = f""
 WEBHOST = "0.0.0.0"
 WEBPORT = 8080
 
-LOG_CHANNEL_ID = -1003905461082
+LOG_CHANNEL_ID = -1004437051761
 BOT_LINK = "https://t.me/zlatanchecker_bot"
-CHANNEL_LINK = "https://t.me/zlatanchannel"
-GROUP_LINK = "https://t.me/zlatanchatxlogs"
+CHANNEL_LINK = "https://t.me/+93nNDkmK2PRjZjg8"
+GROUP_LINK = "https://t.me/+KrM3-0iNKrRjNWJk"
+DEV_LINK = "https://t.me/Lanxo2"
 
 PRICING_TEXT = (
     "<b>┌── <tg-emoji emoji-id='5039623284056917259'>💳</tg-emoji> 𝗣𝗥𝗜𝗖𝗜𝗡𝗚 𝗣𝗟𝗔𝗡𝗦 ──┐</b>\n\n"
@@ -211,7 +210,7 @@ def _status_sync(user_id):
         'A':'𝗔','B':'𝗕','C':'𝗖','D':'𝗗','E':'𝗘','F':'𝗙','G':'𝗚','H':'𝗛','I':'𝗜','J':'𝗝','K':'𝗞','L':'𝗟','M':'𝗠','N':'𝗡','O':'𝗢','P':'𝗣','Q':'𝗤','R':'𝗥','S':'𝗦','T':'𝗧','U':'𝗨','V':'𝗩','W':'𝗪','X':'𝗫','Y':'𝗬','Z':'𝗭'
     }
     if plan.lower() in ("kashim", "chirag", "darkanon"):
-        plan_formatted = "Zlatan <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
+        plan_formatted = "Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
     else:
         plan_formatted = "".join(bold_map.get(c, c) for c in plan)
     return plan_formatted, joined_str
@@ -219,7 +218,7 @@ def _status_sync(user_id):
 async def _get_caption(user) -> str:
     access_str, joined_str = await asyncio.to_thread(_status_sync, user.id)
     ul = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    dl = '<a href="https://t.me/zlatanchatxlogs">Zlatan</a>'
+    dl = '<a href="https://t.me/Lanxo2">Carder X</a>'
     return (
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {ul}\n"
         f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{user.id}</code>\n"
@@ -231,7 +230,7 @@ async def _get_caption(user) -> str:
 
 def _loading_caption(user) -> str:
     ul = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    dl = '<a href="https://t.me/zlatanchatxlogs">Zlatan</a>'
+    dl = '<a href="https://t.me/Lanxo2">Carder X</a>'
     return (
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {ul}\n"
         f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{user.id}</code>\n"
@@ -258,7 +257,7 @@ _MAIN_KB = {
          {"text": " 𝗕𝘂𝘆 𝗡𝗼𝘄", "callback_data": "menu_payment_methods", "icon_custom_emoji_id": "5039727497143387500", "style": "success"}],
         [{"text": " 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", "url": CHANNEL_LINK, "icon_custom_emoji_id": "5424818078833715060", "style": "primary"},
          {"text": " 𝗚𝗿𝗼𝘂𝗽", "url": GROUP_LINK, "icon_custom_emoji_id": "6237927637906364256", "style": "success"}],
-        [{"text": " 𝗦𝘂𝗽𝗽𝗼𝗿𝘁", "url": "https://t.me/Salluuxx", "icon_custom_emoji_id": "5040030395416969985", "style": "danger"},
+        [{"text": " 𝗦𝘂𝗽𝗽𝗼𝗿𝘁", "url": "https://t.me/Lanxo2", "icon_custom_emoji_id": "5040030395416969985", "style": "danger"},
          {"text": " 𝗣𝗿𝗼𝘅𝘆", "callback_data": "menu_proxy", "icon_custom_emoji_id": "5039895103947146186", "style": "primary"}]
     ]
 }
@@ -273,9 +272,9 @@ _FSUB_KB = {
 
 FSUB_TEXT = (
     "<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗠𝗲𝗺𝗯𝗲𝗿𝘀𝗵𝗶𝗽 𝗥𝗲𝗾𝘂𝗶𝗿𝗲𝗱</b>\n\n"
-    "To access <b>Zlatan</b>, you must join our official Channel and Group:\n\n"
-    "<b><tg-emoji emoji-id='5424818078833715060'>📢</tg-emoji> 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ➛</b> <a href='https://t.me/Zlatanchannel'>Zlatan Channel</a>\n"
-    "<b><tg-emoji emoji-id='6237927637906364256'>👥</tg-emoji> 𝗚𝗿𝗼𝘂𝗽 ➛</b> <a href='https://t.me/zlatanchatxlogs'>Zlatan Chats</a>\n\n"
+    "To access <b>Carder X</b>, you must join our official Channel and Group:\n\n"
+    "<b><tg-emoji emoji-id='5424818078833715060'>📢</tg-emoji> 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ➛</b> <a href='https://t.me/+93nNDkmK2PRjZjg8'>Carder X Channel</a>\n"
+    "<b><tg-emoji emoji-id='6237927637906364256'>👥</tg-emoji> 𝗚𝗿𝗼𝘂𝗽 ➛</b> <a href='https://t.me/+KrM3-0iNKrRjNWJk'>Carder X Chats</a>\n\n"
     "<i>Join both links above, then tap <b>Verify Membership</b> below!</i>"
 )
 
@@ -295,7 +294,7 @@ _KB_BACK_CHARGE = _back("menu_charge")
 _KB_PRICING = {
     "inline_keyboard": [
         [{"text": " 𝗣𝗮𝘆 𝗩𝗶𝗮", "callback_data": "menu_payment_methods", "icon_custom_emoji_id": "5039539210072097557", "style": "success"},
-         {"text": "Contact Admin", "url": "https://t.me/Salluuxx", "icon_custom_emoji_id": "5042329873662609701", "style": "primary"}],
+         {"text": "Contact Admin", "url": "https://t.me/Lanxo2", "icon_custom_emoji_id": "5042329873662609701", "style": "primary"}],
         _KB_BACK_MAIN["inline_keyboard"][0]
     ]
 }
@@ -635,7 +634,7 @@ async def button_handler(callback: types.CallbackQuery):
 
     if data == "verify_fsub":
         if await is_subscribed(callback.bot, user_id):
-            await _safe_answer(callback, "✅ Membership verified! Welcome to ZlatanX.", show_alert=True)
+            await _safe_answer(callback, "✅ Membership verified! Welcome to Carder X.", show_alert=True)
             user = callback.from_user
             quick = _loading_caption(user)
             caption_task = asyncio.create_task(_get_caption(user))
@@ -655,7 +654,7 @@ async def button_handler(callback: types.CallbackQuery):
             except Exception:
                 pass
         else:
-            await _safe_answer(callback, "❌ You have not joined both yet! Join @Zlatanchannel and @zlatanchatxlogs then tap Verify.", show_alert=True)
+            await _safe_answer(callback, "❌ You have not joined both yet! Join our Channel and Group then tap Verify.", show_alert=True)
         return
 
     static = STATIC_MENU_MAP.get(data)
@@ -783,7 +782,6 @@ for _cmd, _fn in [
     ("gen", gen_command)
 ]:
     if _fn is None:
-        # Optional command not present in this build — skip silently.
         continue
     dp.message.register(_fn, Command(_cmd))
 
