@@ -334,6 +334,12 @@ def _parse_columns(cols_str: str) -> List[str]:
     return [c.strip() for c in cols_str.split(",")]
 
 def _parse_set_clause(set_clause: str) -> Dict[str, Any]:
+    """
+    Parse a SET clause into a dict. Supports:
+      - literal assignments:        col = value
+      - arithmetic increments:      col = col + N   →  {"__inc__": +N}
+      - arithmetic decrements:      col = col - N   →  {"__inc__": -N}
+    """
     result = {}
     assignments = []
     current = ""
@@ -358,7 +364,28 @@ def _parse_set_clause(set_clause: str) -> Dict[str, Any]:
     for assignment in assignments:
         m = re.match(r"(.+?)\s*=\s*(.+)", assignment)
         if m:
-            result[m.group(1).strip()] = _parse_sql_value(m.group(2).strip())
+            col = m.group(1).strip()
+            val_expr = m.group(2).strip()
+            # `col = col + N`
+            inc_m = re.match(
+                rf"^{re.escape(col)}\s*\+\s*(-?\d+(?:\.\d+)?)\s*$",
+                val_expr, re.IGNORECASE
+            )
+            if inc_m:
+                num = inc_m.group(1)
+                result[col] = {"__inc__": float(num) if "." in num else int(num)}
+                continue
+            # `col = col - N`
+            dec_m = re.match(
+                rf"^{re.escape(col)}\s*-\s*(-?\d+(?:\.\d+)?)\s*$",
+                val_expr, re.IGNORECASE
+            )
+            if dec_m:
+                num = dec_m.group(1)
+                val = float(num) if "." in num else int(num)
+                result[col] = {"__inc__": -val}
+                continue
+            result[col] = _parse_sql_value(val_expr)
     return result
 
 # ═══════════════════════════════════════════════════════════════
@@ -406,6 +433,13 @@ class MongoCursorWrapper:
                 self._rowcount = 0
                 self._result_type = "many"
                 return self
+
+            # Route any SELECT containing JOIN / DISTINCT ON to the
+            # dedicated handler before attempting the plain SELECT regex.
+            if upper.startswith("SELECT") and (" JOIN " in upper or re.search(r"\bJOIN\b", upper) or "DISTINCT ON" in upper):
+                handled = self._execute_join_query(query)
+                if handled is not None:
+                    return handled
 
             select_match = re.match(
                 r"SELECT\s+(.+?)\s+FROM\s+(\w+)"
@@ -590,11 +624,25 @@ class MongoCursorWrapper:
                 collection = self.db[table.lower()]
                 filt = _parse_where(where) if where else {}
                 updates = _parse_set_clause(set_clause)
-                result = collection.update_many(filt, {"$set": updates})
+                set_dict = {}
+                inc_dict = {}
+                for k, v in updates.items():
+                    if isinstance(v, dict) and "__inc__" in v:
+                        inc_dict[k] = v["__inc__"]
+                    else:
+                        set_dict[k] = v
+                update_op: Dict[str, Any] = {}
+                if set_dict:
+                    update_op["$set"] = set_dict
+                if inc_dict:
+                    update_op["$inc"] = inc_dict
+                if not update_op:
+                    update_op = {"$set": {}}
+                result = collection.update_many(filt, update_op)
                 self._rowcount = result.modified_count
                 self._last_result = []
                 self._result_type = "update"
-                logger.info(f"[Mongo] UPDATE {table} WHERE {filt} -> modified {result.modified_count}")
+                logger.info(f"[Mongo] UPDATE {table} WHERE {filt} op={list(update_op.keys())} -> modified {result.modified_count}")
                 return self
 
             m = re.match(
@@ -618,6 +666,199 @@ class MongoCursorWrapper:
         except Exception as e:
             logger.error(f"[SQL] ERROR: {e} | Query: {query[:200]}")
             raise
+
+    # ───────────────────────────────────────────────────────────
+    # JOIN QUERY HANDLER
+    # Supports: SELECT ... FROM a JOIN b ON a.x = b.y [WHERE ...]
+    #           [ORDER BY ...] [LIMIT n]
+    #           SELECT DISTINCT ON (col) ... FROM a LEFT JOIN b ...
+    # ───────────────────────────────────────────────────────────
+    def _execute_join_query(self, query: str):
+        """
+        Handle SELECT with JOIN and optional DISTINCT ON by doing manual
+        lookups against MongoDB collections and merging the results.
+        Returns self on success, or None if the query isn't a JOIN we can handle.
+        """
+        q_flat = re.sub(r'\s+', ' ', query.strip())
+
+        m = re.match(
+            r"SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?",
+            q_flat, re.IGNORECASE
+        )
+        if not m:
+            return None
+        cols_str, base_table, base_alias = m.groups()
+        base_alias = base_alias or base_table
+
+        distinct_on = None
+        distinct_m = re.match(
+            r"DISTINCT\s+ON\s*\(([^)]+)\)\s+(.+)",
+            cols_str.strip(), re.IGNORECASE
+        )
+        if distinct_m:
+            distinct_on = distinct_m.group(1).strip()
+            cols_str = distinct_m.group(2).strip()
+
+        rest = q_flat[m.end():]
+
+        join_parts = []
+        for jm in re.finditer(
+            r"(?:LEFT\s+|INNER\s+|RIGHT\s+|OUTER\s+|FULL\s+)?JOIN\s+(\w+)"
+            r"(?:\s+(?:AS\s+)?(\w+))?\s+ON\s+"
+            r"(.+?)(?=\s+(?:LEFT|INNER|RIGHT|OUTER|FULL)?\s*JOIN"
+            r"|\s+WHERE|\s+ORDER|\s+LIMIT|\s*$)",
+            rest, re.IGNORECASE
+        ):
+            join_parts.append({
+                'table': jm.group(1),
+                'alias': jm.group(2) or jm.group(1),
+                'on': jm.group(3).strip(),
+            })
+
+        where_m = re.search(r"WHERE\s+(.+?)(?=\s+ORDER\s+BY|\s+LIMIT|\s*$)", rest, re.IGNORECASE)
+        where = where_m.group(1).strip() if where_m else None
+
+        order_m = re.search(r"ORDER\s+BY\s+(.+?)(?=\s+LIMIT|\s*$)", rest, re.IGNORECASE)
+        order_by = order_m.group(1).strip() if order_m else None
+
+        limit_m = re.search(r"LIMIT\s+(\d+)", rest, re.IGNORECASE)
+        limit = int(limit_m.group(1)) if limit_m else None
+
+        aliases = {base_alias, base_table}
+        for j in join_parts:
+            aliases.add(j['alias'])
+            aliases.add(j['table'])
+
+        base_filter = {}
+        if where:
+            where_stripped = re.sub(
+                r'\b(\w+)\.(\w+)',
+                lambda mm: mm.group(2) if mm.group(1) in aliases else mm.group(0),
+                where
+            )
+            base_filter = _parse_where(where_stripped)
+
+        base_collection = self.db[base_table.lower()]
+        base_docs = list(base_collection.find(base_filter))
+        if not base_docs:
+            self._last_result = []
+            self._rowcount = 0
+            self._result_type = "many"
+            return self
+
+        join_indexes = []
+        for j in join_parts:
+            on_m = re.match(r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", j['on'])
+            if not on_m:
+                join_indexes.append(None)
+                continue
+            left_alias, left_col, right_alias, right_col = on_m.groups()
+            if left_alias in (base_alias, base_table):
+                base_col_name = left_col
+                joined_col_name = right_col
+            else:
+                base_col_name = right_col
+                joined_col_name = left_col
+
+            joined_docs = list(self.db[j['table'].lower()].find({}))
+            index: Dict[Any, List[Dict[str, Any]]] = {}
+            for doc in joined_docs:
+                key = doc.get(joined_col_name)
+                if key is not None:
+                    index.setdefault(key, []).append(doc)
+            join_indexes.append((j, base_col_name, index))
+
+        # Merge
+        merged_rows: List[Dict[str, Any]] = []
+        for base_doc in base_docs:
+            bucket = [{'__base__': base_doc}]
+            for join_info in join_indexes:
+                if join_info is None:
+                    continue
+                j, base_col_name, index = join_info
+                base_val = base_doc.get(base_col_name)
+                matches = index.get(base_val, [])
+                if matches:
+                    new_bucket = []
+                    for mrow in bucket:
+                        for match in matches:
+                            nm = dict(mrow)
+                            nm[f"__{j['alias']}__"] = match
+                            new_bucket.append(nm)
+                    bucket = new_bucket
+            merged_rows.extend(bucket)
+
+        # Project
+        col_parts = [c.strip() for c in cols_str.split(',')]
+        parsed_cols = []
+        for c in col_parts:
+            if c == '*':
+                parsed_cols.append(('*', None))
+            elif '.' in c:
+                a, col = c.split('.', 1)
+                parsed_cols.append((col, a))
+            else:
+                parsed_cols.append((c, None))
+
+        projected: List[Dict[str, Any]] = []
+        for mrow in merged_rows:
+            base = mrow.get('__base__', {})
+            out: Dict[str, Any] = {}
+            for col, alias in parsed_cols:
+                if col == '*' and alias is None:
+                    for k, v in base.items():
+                        if k != '_id':
+                            out[k] = v
+                elif col == '*' and alias:
+                    joined_doc = mrow.get(f'__{alias}__')
+                    if joined_doc:
+                        for k, v in joined_doc.items():
+                            if k != '_id':
+                                out[k] = v
+                elif alias is None:
+                    if col in base:
+                        out[col] = base[col]
+                else:
+                    joined_doc = mrow.get(f'__{alias}__')
+                    if joined_doc and col in joined_doc:
+                        out[col] = joined_doc[col]
+            projected.append(out)
+
+        # DISTINCT ON
+        if distinct_on:
+            d = distinct_on.split('.', 1)[1] if '.' in distinct_on else distinct_on
+            seen = set()
+            dedup = []
+            for p in projected:
+                key = p.get(d)
+                if key not in seen:
+                    seen.add(key)
+                    dedup.append(p)
+            projected = dedup
+
+        # ORDER BY
+        if order_by:
+            specs = []
+            for part in order_by.split(','):
+                part = part.strip()
+                bits = part.split()
+                col = bits[0].split('.', 1)[1] if '.' in bits[0] else bits[0]
+                direction = -1 if len(bits) > 1 and bits[1].upper() == "DESC" else 1
+                specs.append((col, direction))
+            for col, direction in reversed(specs):
+                projected.sort(
+                    key=lambda x: (x.get(col) is None, x.get(col) if x.get(col) is not None else 0),
+                    reverse=(direction == -1),
+                )
+
+        if limit:
+            projected = projected[:limit]
+
+        self._last_result = projected
+        self._rowcount = len(projected)
+        self._result_type = "many"
+        logger.info(f"[Mongo] JOIN SELECT base={base_table} joins={[j['table'] for j in join_parts]} -> {self._rowcount} rows")
+        return self
 
     def fetchone(self):
         if self._closed:
