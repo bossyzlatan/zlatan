@@ -23,7 +23,9 @@ except ImportError:
 ADMIN_IDS = {6962534443, 8761005192, 8428369446}
 LOG_CHANNEL_ID = -1004462990283
 
-KEY_PATTERN = re.compile(r'CARDERX-[A-Z]+-[A-Z0-9]+')
+# Middle segment allows letters AND digits so keys like
+# CARDERX-6H-XXX, CARDERX-12H-XXX, CARDERX-3D-XXX all match.
+KEY_PATTERN = re.compile(r'CARDERX-[A-Z0-9]+-[A-Z0-9]+')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -78,8 +80,6 @@ def resolve_plan_arg(plan_arg: str, custom_name: str = None):
     """
     Given a plan argument, return (display_name, duration_hours, credits, amount)
     or None if invalid.
-    - If plan_arg is a preset name (core/elite/root/trial), use the preset.
-    - Otherwise try to parse it as a duration (e.g. 6h, 3d).
     """
     if not plan_arg:
         return None
@@ -209,7 +209,6 @@ def init_db():
     except Exception:
         conn.rollback()
 
-    # Idempotent add-column for existing deployments
     try:
         cursor.execute("ALTER TABLE plan_keys ADD COLUMN IF NOT EXISTS duration_hours INTEGER")
         conn.commit()
@@ -365,10 +364,6 @@ def get_premium_status(user_id):
 
 
 def _sub_db_sync(target_id, display_name, plan_name, duration_hours, credits, amount):
-    """
-    Grants premium to a user for the given duration (in hours).
-    Returns the new receipt_id.
-    """
     expiry_date = datetime.now() + timedelta(hours=duration_hours)
     receipt_id = generate_receipt_id()
     purchased_on = datetime.now()
@@ -447,9 +442,6 @@ def _rsub_db_sync(target_id):
 
 
 def _revokeall_preview_sync():
-    """
-    Return the number of users that would be affected by /revokeall.
-    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -464,11 +456,6 @@ def _revokeall_preview_sync():
 
 
 def _revokeall_db_sync():
-    """
-    Revoke premium from ALL users.
-    Resets is_premium=0, premium_expiry=NULL, credits=150.
-    Returns the number of affected users.
-    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -479,6 +466,35 @@ def _revokeall_db_sync():
         affected = cursor.rowcount if hasattr(cursor, "rowcount") else 0
         conn.commit()
         return affected
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _revoke_user_db_sync(target_id):
+    """
+    Revoke premium from a single user.
+    Clears is_premium and premium_expiry but KEEPS credits (unlike /rsub).
+    Returns dict with user info on success, None if user does not exist.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT first_name, username, is_premium FROM users WHERE user_id = %s", (target_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if row['is_premium'] != 1:
+            return {"was_premium": False, "first_name": row['first_name'], "username": row['username']}
+
+        cursor.execute(
+            "UPDATE users SET is_premium = 0, premium_expiry = NULL WHERE user_id = %s",
+            (target_id,)
+        )
+        conn.commit()
+        return {"was_premium": True, "first_name": row['first_name'], "username": row['username']}
     except Exception:
         conn.rollback()
         raise
@@ -744,13 +760,7 @@ async def eren_admin_command(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMAND: /sub — grant premium to a user
-#
-# Usage:
-#   /sub <user> <preset>                       → e.g. /sub 123 core
-#   /sub <user> <duration>                     → e.g. /sub 123 6h  |  /sub 123 3d
-#   /sub <user> <duration> <custom name>       → e.g. /sub 123 12h Starter Pass
-#   /sub <user> <preset> <custom name>         → e.g. /sub 123 core Custom Core
+# COMMAND: /sub
 # ═══════════════════════════════════════════════════════════════
 
 @router.message(F.text.startswith("/sub"))
@@ -867,7 +877,7 @@ async def adcr_command(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMAND: /rsub — remove premium
+# COMMAND: /rsub — remove premium (resets credits)
 # ═══════════════════════════════════════════════════════════════
 
 @router.message(F.text.startswith("/rsub"))
@@ -937,10 +947,121 @@ async def rsub_command(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
+# COMMAND: /revoke — revoke premium from a single user (keeps credits)
+# ═══════════════════════════════════════════════════════════════
+
+@router.message(F.text.regexp(r'^/revoke(?:\s|$)'))
+async def revoke_command(message: types.Message):
+    user = message.from_user
+    if user.id not in ADMIN_IDS:
+        await message.reply(
+            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
+            "𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝘁𝗼 𝘂𝘀𝗲 𝘁𝗵𝗶𝘀."
+        )
+        return
+
+    args = message.text.split()[1:]
+    if not args:
+        await message.reply(
+            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>𝗨𝘀𝗮𝗴𝗲:</b>\n"
+            "<code>/revoke &lt;user_id | @username&gt;</code>\n\n"
+            "<b>𝗘𝘅𝗮𝗺𝗽𝗹𝗲:</b>\n"
+            "<code>/revoke 123456789</code>\n"
+            "<code>/revoke @username</code>\n\n"
+            "<i>Clears the user's plan but keeps their credits.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    target_input = args[0]
+    target_id = await asyncio.to_thread(_resolve_user_id_sync, target_input)
+    if not target_id:
+        await message.reply(
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            "𝗖𝗼𝘂𝗹𝗱 𝗻𝗼𝘁 𝗿𝗲𝘀𝗼𝗹𝘃𝗲 𝘂𝘀𝗲𝗿."
+        )
+        return
+
+    try:
+        result = await asyncio.to_thread(_revoke_user_db_sync, target_id)
+    except Exception as e:
+        logging.error(f"Error in /revoke: {e}")
+        await message.reply(
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            "𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲 𝗘𝗿𝗿𝗼𝗿."
+        )
+        return
+
+    if not result:
+        await message.reply(
+            f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            f"𝗨𝘀𝗲𝗿 <code>{target_id}</code> 𝗻𝗼𝘁 𝗳𝗼𝘂𝗻𝗱 𝗶𝗻 𝗱𝗮𝘁𝗮𝗯𝗮𝘀𝗲."
+        )
+        return
+
+    if not result.get("was_premium"):
+        await message.reply(
+            f"<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> "
+            f"𝗨𝘀𝗲𝗿 <code>{target_id}</code> 𝗱𝗼𝗲𝘀 𝗻𝗼𝘁 𝗵𝗮𝘃𝗲 𝗮𝗻 𝗮𝗰𝘁𝗶𝘃𝗲 𝗽𝗹𝗮𝗻.\n"
+            f"<i>Nothing to revoke.</i>"
+        )
+        return
+
+    display_name = result.get("first_name") or result.get("username") or "User"
+    user_link = f'<a href="tg://user?id={target_id}">{display_name}</a>'
+
+    dm_text = (
+        f"⚠️ 𝗬𝗼𝘂𝗿 𝗽𝗹𝗮𝗻 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.\n\n"
+        f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {display_name}\n"
+        f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{target_id}</code>\n"
+        f"👑 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ <b>Trial</b>\n"
+        f"<i>Your credits remain unchanged.</i>"
+    )
+    buy_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="𝗕𝘂𝘆 𝗡𝗼𝘄", callback_data="show_buy_plans")]
+    ])
+
+    try:
+        await message.bot.send_message(
+            chat_id=target_id,
+            text=dm_text,
+            parse_mode="HTML",
+            reply_markup=buy_kb
+        )
+    except Exception as e:
+        logging.warning(f"[revoke] Could not DM user {target_id}: {e}")
+
+    admin_name = user.first_name or "Admin"
+    if user.username:
+        admin_link = f'<a href="https://t.me/{user.username}">{admin_name}</a>'
+    else:
+        admin_link = f'<a href="tg://user?id={user.id}">{admin_name}</a>'
+
+    log_text = (
+        "<b>🚫 𝗦𝗜𝗡𝗚𝗟𝗘 𝗥𝗘𝗩𝗢𝗞𝗘 𝗘𝗫𝗘𝗖𝗨𝗧𝗘𝗗</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>👤 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
+        f"<b>🎯 𝗧𝗮𝗿𝗴𝗲𝘁 ➛</b> {user_link}\n"
+        f"<b>🆔 𝗧𝗮𝗿𝗴𝗲𝘁 𝗜𝗗 ➛</b> <code>{target_id}</code>\n"
+        f"<b>⏰ 𝗧𝗶𝗺𝗲 ➛</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+    )
+    try:
+        await message.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    await message.reply(
+        f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> "
+        f"𝗣𝗹𝗮𝗻 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 𝗳𝗿𝗼𝗺 {user_link}.\n"
+        f"<i>Credits preserved.</i>",
+        parse_mode="HTML"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
 # COMMAND: /revokeall — revoke premium from ALL users
 # ═══════════════════════════════════════════════════════════════
 
-# Tracks /revokeall confirmation state: {admin_user_id: preview_count}
 REVOKEALL_PENDING = {}
 
 
@@ -1019,7 +1140,6 @@ async def revokeall_callback(callback: types.CallbackQuery):
         await callback.answer("❌ 𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.", show_alert=True)
         return
 
-    # ── Cancel ─────────────────────────────────────────────────
     if action == "no":
         REVOKEALL_PENDING.pop(owner_id, None)
         await callback.answer("❌ Cancelled", show_alert=False)
@@ -1033,7 +1153,6 @@ async def revokeall_callback(callback: types.CallbackQuery):
             pass
         return
 
-    # ── Confirm ────────────────────────────────────────────────
     await callback.answer("⏳ Revoking...", show_alert=False)
 
     try:
@@ -1340,7 +1459,7 @@ async def claim_command(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMAND: /gen — generate plan keys
+# COMMAND: /gen
 # ═══════════════════════════════════════════════════════════════
 
 @router.message(F.text.startswith("/gen"))
