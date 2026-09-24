@@ -80,7 +80,7 @@ WEBHOOK_URL = f""
 WEBHOST = "0.0.0.0"
 WEBPORT = 8080
 
-LOG_CHANNEL_ID = -1004437051761
+LOG_CHANNEL_ID = -1003905461082
 BOT_LINK = "https://t.me/zlatanchecker_bot"
 CHANNEL_LINK = "https://t.me/+93nNDkmK2PRjZjg8"
 GROUP_LINK = "https://t.me/+KrM3-0iNKrRjNWJk"
