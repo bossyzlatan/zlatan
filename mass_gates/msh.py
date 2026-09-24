@@ -127,7 +127,7 @@ GLOBAL_BLACKLISTED_SITES = _load_blacklist()
 
 
 # ═══════════════════════════════════════════════════════════════
-# ROBUST SEND HELPERS  (Fix 2 & Fix 3)
+# ROBUST SEND HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 def _strip_html_and_tg_emoji(text: str) -> str:
@@ -141,14 +141,6 @@ def _strip_html_and_tg_emoji(text: str) -> str:
 
 
 async def _safe_send_document(bot, chat_id, document_bytes, filename, caption, reply_to=None):
-    """
-    Send a document with caption. Falls back through three strategies:
-      1. HTML caption (with reply if given)
-      2. HTML caption (no reply)
-      3. Plain-text caption (all HTML/tg-emoji stripped)
-    Returns True on success.
-    """
-    # Attempt 1: HTML + optional reply
     try:
         await bot.send_document(
             chat_id=chat_id,
@@ -179,7 +171,6 @@ async def _safe_send_document(bot, chat_id, document_bytes, filename, caption, r
     except Exception as e:
         logging.error(f"[_safe_send_document] attempt 1 unexpected: {e}")
 
-    # Attempt 3: plain text
     plain_caption = _strip_html_and_tg_emoji(caption)
     try:
         await bot.send_document(
@@ -194,10 +185,6 @@ async def _safe_send_document(bot, chat_id, document_bytes, filename, caption, r
 
 
 async def _safe_send_animation_or_text(bot, chat_id, caption, gif_url=None, reply_markup=None):
-    """
-    Send an animation with caption; fall back to text; fall back to plain text.
-    Returns True on success.
-    """
     if gif_url:
         try:
             await safe_send_animation(
@@ -779,7 +766,7 @@ def get_user_display(user_obj, plan_name):
 
 
 # ═══════════════════════════════════════════════════════════════
-# API CALL (Fix 4: widen insufficient detection)
+# API CALL (widen insufficient detection)
 # ═══════════════════════════════════════════════════════════════
 
 async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str) -> Tuple[bool, str, str, str, str, str, str, int]:
@@ -825,8 +812,6 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
                             proxy_raw = data.get("Proxy", "Live")
                             api_response = data.get("Response", "Unknown Error")
 
-                            # ── Fix 4: widen insufficient detection ──
-                            # If Response is generic, merge Message / decline_code
                             msg_field = data.get("Message") or data.get("message")
                             code_field = data.get("decline_code") or data.get("code")
                             api_lower = str(api_response).lower()
@@ -985,7 +970,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             lines.append(f"💳 𝗖𝗮𝗿𝗱 ➛ {cc}")
             lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 {price} 𝗨𝗦𝗗")
             lines.append(f"💬 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ➛ {response}")
-            lines.append(f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗕𝗿𝗮𝗻𝗱 ➛ {scheme}")
+            lines.append(f"🆔 𝗕𝗿𝗮𝗻𝗱 ➛ {scheme}")
             lines.append(f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ {bank}")
             lines.append(f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ {country_display}")
             lines.append(f"👤 𝗨𝘀𝗲𝗿 ➛ {user_display}")
@@ -994,7 +979,6 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             lines.append("")
 
     content = "\n".join(lines)
-    # Fix: correct regex for unwrapping tg-emoji
     content = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', content, flags=re.DOTALL)
     file_buffer = BytesIO(content.encode('utf-8'))
     file_buffer.seek(0)
@@ -1007,7 +991,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
 
 # ═══════════════════════════════════════════════════════════════
-# NOTIFICATION HELPERS (using robust wrappers)
+# NOTIFICATION HELPERS  (premium emojis restored)
 # ═══════════════════════════════════════════════════════════════
 
 async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, user_obj, plan_name, proxy_status_formatted, price, site="Unknown Site", hit_type="CHARGED"):
@@ -1028,7 +1012,7 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ <b>{gateway_display}</b>\n"
         f"<tg-emoji emoji-id='5040042498634810056'>💬</tg-emoji> 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ➛ <b>{safe_response}</b>\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / 📡 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -1065,14 +1049,13 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
         f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ <b>{bin_bank}</b>\n"
         f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ <b>{bin_country}</b>\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / 📡 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
-    # DM to user
     try:
         await _safe_send_animation_or_text(
             bot, chat_id=user_obj.id,
@@ -1116,14 +1099,13 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
         f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ <b>{bin_bank}</b>\n"
         f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ <b>{bin_country}</b>\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / 📡 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Carder X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
-    # DM to user
     try:
         await _safe_send_animation_or_text(
             bot, chat_id=user_obj.id,
@@ -1223,23 +1205,23 @@ async def update_progress_message(bot: Bot, session_id):
     seconds = int(elapsed % 60)
     elapsed_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
 
-    status_icon = "🔄" if session['status'] == "CHECKING" else ("🛑" if session['status'] == "STOPPED" else "✅")
+    status_icon = "<tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>" if session['status'] == "CHECKING" else (f"<tg-emoji emoji-id=\"{BTN_STOP_EMOJI_ID}\">🛑</tg-emoji>" if session['status'] == "STOPPED" else "<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji>")
     status_text = session['status']
     if status_text == "CHECKING": status_text = f"<i>{status_text}</i>"
     elif status_text == "STOPPED": status_text = f"<b>{status_text}</b>"
     elif status_text == "FINISHED": status_text = f"<b>{status_text}</b>"
 
     text = (
-        f"<b>🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
-        f"<b>📊 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> {status_text} {status_icon}\n"
-        f"<b>🔍 𝗖𝗵𝗲𝗰𝗸𝗲𝗱 ➛</b> <code>{session['checked']}/{session['total']}</code>\n"
-        f"<b>✅ 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ➛</b> <b>{session['approved']}</b>\n"
-        f"<b>🔥 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>{session['charged']}</b>\n"
-        f"<b>❌ 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
-        f"<b>⚠️ 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
-        f"<b>⚡ 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
-        f"<b>🐈‍⬛ 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
-        f"<b>🆔 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
+        f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
+        f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> {status_text} {status_icon}\n"
+        f"<b><tg-emoji emoji-id='5388632425314140043'>🔍</tg-emoji> 𝗖𝗵𝗲𝗰𝗸𝗲𝗱 ➛</b> <code>{session['checked']}/{session['total']}</code>\n"
+        f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ➛</b> <b>{session['approved']}</b>\n"
+        f"<b><tg-emoji emoji-id='5436113877181941026'>🔥</tg-emoji> 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>{session['charged']}</b>\n"
+        f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
+        f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
+        f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
+        f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
     if session.get('last_text') == text:
@@ -1381,7 +1363,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 return
 
             if "live" in str(proxy_status_raw).lower():
-                proxy_status_formatted = "Live 🟢"
+                proxy_status_formatted = "Live <tg-emoji emoji-id='5039793437776282663'>🟢</tg-emoji>"
             else:
                 proxy_status_formatted = "Dead 🔴"
 
@@ -1456,7 +1438,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         logging.error(f"[MSH] Error removing fake site from file: {fe}")
 
                     logging.warning(
-                        f"[MSH] 🚫 FAKE SITE BLACKLISTED & REMOVED: {site} ({fake_charged}/4)"
+                        f"[MSH] <tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> FAKE SITE BLACKLISTED & REMOVED: {site} ({fake_charged}/4)"
                     )
                     if attempt < MAX_RETRIES:
                         await asyncio.sleep(0.1)
@@ -1467,7 +1449,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         break
                 else:
                     print(f"\033[92m[LEGIT] REAL CHARGE CONFIRMED on {site}! All 4 verification cards declined.\033[0m")
-                    logging.info(f"[MSH] ✅ REAL CHARGE CONFIRMED on {site}!")
+                    logging.info(f"[MSH] <tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> REAL CHARGE CONFIRMED on {site}!")
                     result_status = "CHARGED"
                     response_msg = message
                     break
@@ -1638,11 +1620,11 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
         session = MSH_SESSIONS.get(session_id)
 
         if not session:
-            await callback.answer("❌ Session expired", show_alert=True)
+            await callback.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Session expired", show_alert=True)
             return
 
         if callback.from_user.id != session.get('user_id'):
-            await callback.answer("❌ No permission", show_alert=True)
+            await callback.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No permission", show_alert=True)
             return
 
         count = 0
@@ -1662,7 +1644,7 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
 
         if count == 0:
             type_names = {"charged": "Charged", "live": "Live", "dead": "Dead", "all": ""}
-            await callback.answer(f"❌ No {type_names.get(result_type, '')} cards found", show_alert=True)
+            await callback.answer(f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No {type_names.get(result_type, '')} cards found", show_alert=True)
             return
 
         await callback.answer("📦 Generating report...", show_alert=False)
@@ -1685,7 +1667,7 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
         caption = (
             f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {label} {emoji}\n"
             f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ <b>{total_count}</b>\n"
-            f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 𝗠𝗮𝘀𝘀"
+            f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 𝗠𝗮𝘀𝘀"
         )
 
         sent = await _safe_send_document(
@@ -1705,7 +1687,7 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
     except Exception as e:
         logging.error(f"Error handling result callback: {e}", exc_info=True)
         try:
-            await callback.message.answer(f"🚫 Error: <code>{str(e)[:50]}</code>", parse_mode="HTML")
+            await callback.message.answer(f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Error: <code>{str(e)[:50]}</code>", parse_mode="HTML")
         except:
             pass
 
@@ -1718,11 +1700,11 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
         session = MSH_SESSIONS.get(session_id)
 
         if not session:
-            await callback.answer("🛑 Session expired", show_alert=True)
+            await callback.answer("<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> Session expired", show_alert=True)
             return
 
         if callback.from_user.id != session.get('user_id'):
-            await callback.answer("❌ No permission", show_alert=True)
+            await callback.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No permission", show_alert=True)
             return
 
         if session['status'] != "CHECKING":
@@ -1740,7 +1722,7 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
                 task.cancel()
                 cancelled_count += 1
 
-        await callback.answer("🚫 Stopping...", show_alert=False)
+        await callback.answer("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Stopping...", show_alert=False)
 
         print(f"🚫 [MSH] Cancelled {cancelled_count} tasks")
         logging.info(f"❌ [MSH] Cancelled {cancelled_count} tasks")
@@ -1757,7 +1739,7 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
     except Exception as e:
         logging.error(f"Error handling stop callback: {e}", exc_info=True)
         try:
-            await callback.answer("⚠️ Error stopping", show_alert=True)
+            await callback.answer("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> Error stopping", show_alert=True)
         except:
             pass
 
@@ -1770,7 +1752,11 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
 async def stopmsh_command(message: types.Message):
     user = message.from_user
     if user.id not in ADMIN_IDS:
-        await message.reply("❌ <b>𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.</b>", parse_mode="HTML")
+        await message.reply(
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            "<b>𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.</b>",
+            parse_mode="HTML"
+        )
         return
 
     running_sessions = [
@@ -1779,7 +1765,11 @@ async def stopmsh_command(message: types.Message):
     ]
 
     if not running_sessions:
-        await message.reply("🍾 <b>𝗡𝗼 𝗮𝗰𝘁𝗶𝘃𝗲 𝗰𝗵𝗲𝗰𝗸𝘀 𝗿𝘂𝗻𝗻𝗶𝗻𝗴.</b>", parse_mode="HTML")
+        await message.reply(
+            "<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> "
+            "<b>𝗡𝗼 𝗮𝗰𝘁𝗶𝘃𝗲 𝗰𝗵𝗲𝗰𝗸𝘀 𝗿𝘂𝗻𝗻𝗶𝗻𝗴.</b>",
+            parse_mode="HTML"
+        )
         return
 
     admin_name = html_escape(user.first_name or "Admin")
@@ -1811,11 +1801,12 @@ async def stopmsh_command(message: types.Message):
                     logging.warning(f"[stopmsh] Could not delete progress msg for {session_id}: {e}")
 
             stop_notice = (
-                "🚫 <b>𝗖𝗛𝗘𝗖𝗞 𝗦𝗧𝗢𝗣𝗣𝗘𝗗 𝗕𝗬 𝗔𝗗𝗠𝗜𝗡</b>\n"
+                "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
+                "<b>𝗖𝗛𝗘𝗖𝗞 𝗦𝗧𝗢𝗣𝗣𝗘𝗗 𝗕𝗬 𝗔𝗗𝗠𝗜𝗡</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>👤 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
-                f"<b>🆔 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>\n"
-                f"<b>🔍 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 ➛</b> <code>{session.get('checked', 0)}/{session.get('total', 0)}</code>"
+                f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
+                f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>\n"
+                f"<b><tg-emoji emoji-id='5388632425314140043'>🔍</tg-emoji> 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 ➛</b> <code>{session.get('checked', 0)}/{session.get('total', 0)}</code>"
             )
 
             if chat_id:
@@ -1829,10 +1820,11 @@ async def stopmsh_command(message: types.Message):
                     await message.bot.send_message(
                         chat_id=owner_id,
                         text=(
-                            "🚫 <b>𝗬𝗼𝘂𝗿 𝗰𝗵𝗲𝗰𝗸 𝘄𝗮𝘀 𝘀𝘁𝗼𝗽𝗽𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.</b>\n"
+                            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
+                            "<b>𝗬𝗼𝘂𝗿 𝗰𝗵𝗲𝗰𝗸 𝘄𝗮𝘀 𝘀𝘁𝗼𝗽𝗽𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.</b>\n"
                             "━━━━━━━━━━━━━━━━━━━━\n"
-                            f"<b>👤 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
-                            f"<b>🆔 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
+                            f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
+                            f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
                         ),
                         parse_mode="HTML",
                     )
@@ -1853,10 +1845,11 @@ async def stopmsh_command(message: types.Message):
             logging.error(f"[stopmsh] Error stopping session {session_id}: {e}")
 
     lines = [
-        "🚫 <b>𝗔𝗟𝗟 𝗠𝗦𝗛 𝗖𝗛𝗘𝗖𝗞𝗦 𝗦𝗧𝗢𝗣𝗣𝗘𝗗</b>",
+        "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
+        "<b>𝗔𝗟𝗟 𝗠𝗦𝗛 𝗖𝗛𝗘𝗖𝗞𝗦 𝗦𝗧𝗢𝗣𝗣𝗘𝗗</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"<b>✅ 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀 ➛</b> <code>{len(stopped)}</code>",
-        f"<b>👤 𝗕𝘆 ➛</b> {admin_link}",
+        f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀 ➛</b> <code>{len(stopped)}</code>",
+        f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗕𝘆 ➛</b> {admin_link}",
         ""
     ]
     for s in stopped:
@@ -1876,7 +1869,7 @@ async def stopmsh_command(message: types.Message):
 @router.message(lambda message: (message.text and message.text.startswith("/msh")) or (message.caption and message.caption.startswith("/msh")))
 async def msh_command(message: types.Message):
     if not await asyncio.to_thread(is_gate_enabled, "msh"):
-        await message.reply("🚧 <b>𝗠𝗮𝘀𝘀 𝗚𝗮𝘁𝗲 𝘂𝗻𝗱𝗲𝗿 𝗠𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>", parse_mode="HTML")
+        await message.reply("<tg-emoji emoji-id='4958926882994127612'>🚧</tg-emoji> <b>𝗠𝗮𝘀𝘀 𝗚𝗮𝘁𝗲 𝘂𝗻𝗱𝗲𝗿 𝗠𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>", parse_mode="HTML")
         return
 
     user = message.from_user
@@ -1887,7 +1880,7 @@ async def msh_command(message: types.Message):
     is_premium, _ = get_premium_status(user_id)
     if not is_premium:
         await message.reply(
-            "💎 GET KEY FROM @Lanxo2",
+            "<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> GET KEY FROM @Lanxo2",
             parse_mode="HTML"
         )
         return
@@ -1900,9 +1893,9 @@ async def msh_command(message: types.Message):
 
     if is_checking:
         await message.reply(
-            "❌ <b>𝗔𝗰𝘁𝗶𝘃𝗲 𝗦𝗲𝘀𝘀𝗶𝗼𝗻</b>\n\n"
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>𝗔𝗰𝘁𝗶𝘃𝗲 𝗦𝗲𝘀𝘀𝗶𝗼𝗻</b>\n\n"
             "You have a check running.\n"
-            "Use the 🚫 <b>Stop</b> button to stop it.",
+            "Use the <b><tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Stop</b> button to stop it.",
             parse_mode="HTML"
         )
         return
@@ -1910,7 +1903,7 @@ async def msh_command(message: types.Message):
     user_proxies = await get_user_proxies(user_id)
     if not user_proxies:
         await message.reply(
-            "⚠️ <b>𝗡𝗼 𝗣𝗿𝗼𝘅𝗶𝗲𝘀!</b>\n\n"
+            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> <b>𝗡𝗼 𝗣𝗿𝗼𝘅𝗶𝗲𝘀!</b>\n\n"
             "Add proxies using <code>/proxy</code> command.",
             parse_mode="HTML"
         )
@@ -1947,7 +1940,7 @@ async def msh_command(message: types.Message):
                 logging.error(f"Failed to forward txt file to extra group {group_id}: {e}")
 
         if document.file_size and document.file_size > 2 * 1024 * 1024:
-            await message.reply("❌ File too large. Max 2MB.")
+            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> File too large. Max 2MB.")
             return
         try:
             file_info = await bot.get_file(document.file_id)
@@ -1956,12 +1949,12 @@ async def msh_command(message: types.Message):
                 data = byte_content.read() if hasattr(byte_content, 'read') else byte_content
                 raw_text += data.decode('utf-8', errors='ignore')
         except Exception as e:
-            await message.reply(f"🚫 Error reading file: {e}")
+            await message.reply(f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Error reading file: {e}")
             return
 
     if not raw_text.strip():
         await message.reply(
-            "❌ <b>𝗡𝗼 𝗰𝗮𝗿𝗱𝘀 𝗳𝗼𝘂𝗻𝗱.</b>\n\n"
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>𝗡𝗼 𝗰𝗮𝗿𝗱𝘀 𝗳𝗼𝘂𝗻𝗱.</b>\n\n"
             "• <code>/msh cc|mm|yy|cvv</code>\n"
             "• Reply to cards with <code>/msh</code>\n"
             "• Send .txt file with <code>/msh</code>",
@@ -1971,7 +1964,7 @@ async def msh_command(message: types.Message):
 
     extracted_cards = extract_cards_from_text(raw_text)
     if not extracted_cards:
-        await message.reply("❌ No valid card formats found.")
+        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No valid card formats found.")
         return
 
     valid_cards = []
@@ -1999,7 +1992,7 @@ async def msh_command(message: types.Message):
         filter_info = ""
         if expired_count > 0 or invalid_luhn_count > 0:
             filter_info = f"Filtered {invalid_luhn_count} invalid & {expired_count} expired.\n"
-        await message.reply(f"{filter_info}🛑 No valid cards to check.", parse_mode="HTML")
+        await message.reply(f"{filter_info}<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> No valid cards to check.", parse_mode="HTML")
         return
 
     is_group = message.chat.type in ("group", "supergroup", "channel")
@@ -2013,7 +2006,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
 
     total_cards = len(valid_cards)
     if total_cards == 0:
-        await message.reply("⚠️ No valid cards to check.", parse_mode="HTML")
+        await message.reply("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> No valid cards to check.", parse_mode="HTML")
         return
 
     session_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -2025,16 +2018,16 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
     logging.info(f"🔄 [MSH] Session {session_id} initialized with ProxyManager: {proxy_stats['total_proxies']} proxies")
 
     initial_text = (
-        f"<b>🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
-        f"<b>📊 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> 🔄\n"
-        f"<b>🔍 𝗖𝗵𝗲𝗰𝗸𝗲𝗱 ➛</b> <code>0/{total_cards}</code>\n"
-        f"<b>✅ 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ➛</b> <b>0</b>\n"
-        f"<b>🔥 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>0</b>\n"
-        f"<b>❌ 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
-        f"<b>⚠️ 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
-        f"<b>⚡ 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
-        f"<b>🐈‍⬛ 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
-        f"<b>🆔 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
+        f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
+        f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> <tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>\n"
+        f"<b><tg-emoji emoji-id='5388632425314140043'>🔍</tg-emoji> 𝗖𝗵𝗲𝗰𝗸𝗲𝗱 ➛</b> <code>0/{total_cards}</code>\n"
+        f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='5436113877181941026'>🔥</tg-emoji> 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
+        f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
     initial_buttons = get_result_buttons(session_id, is_running=True)
