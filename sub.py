@@ -25,6 +25,7 @@ LOG_CHANNEL_ID = -1004462990283
 
 KEY_PATTERN = re.compile(r'CARDERX-[A-Z]+-[A-Z0-9]+')
 
+
 # ═══════════════════════════════════════════════════════════════
 # PLAN PRESETS + DURATION HELPERS
 # ═══════════════════════════════════════════════════════════════
@@ -36,6 +37,7 @@ PLAN_PRESETS = {
     "elite": ("Elite ⭐",        15 * 24, 999999999, 7),
     "root":  ("Root 👑",        30 * 24, 999999999, 15),
 }
+
 
 def parse_duration(s: str):
     """
@@ -444,6 +446,46 @@ def _rsub_db_sync(target_id):
         conn.close()
 
 
+def _revokeall_preview_sync():
+    """
+    Return the number of users that would be affected by /revokeall.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE is_premium = 1")
+        rows = cursor.fetchall()
+        return len(rows)
+    except Exception as e:
+        logging.error(f"Error counting premium users: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _revokeall_db_sync():
+    """
+    Revoke premium from ALL users.
+    Resets is_premium=0, premium_expiry=NULL, credits=150.
+    Returns the number of affected users.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET is_premium = 0, premium_expiry = NULL, credits = 150 "
+            "WHERE is_premium = 1"
+        )
+        affected = cursor.rowcount if hasattr(cursor, "rowcount") else 0
+        conn.commit()
+        return affected
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _rc_db_sync(receipt_id):
     conn = get_db_connection()
     try:
@@ -519,10 +561,6 @@ def _g_code_db_sync(amount):
 
 
 def _gen_plan_keys_db_sync(plan, plan_name, duration_hours, amount):
-    """
-    Generate `amount` plan keys with the given duration.
-    `days` field is kept for backwards compatibility (0 if <24h).
-    """
     generated = []
     days_val = duration_hours // 24 if duration_hours >= 24 else 0
     conn = get_db_connection()
@@ -546,14 +584,6 @@ def _gen_plan_keys_db_sync(plan, plan_name, duration_hours, amount):
 
 
 def _claim_db_sync(user_id, display_name, code):
-    """
-    Returns one of:
-      ("invalid",  None)
-      ("claimed",  None)
-      ("premium",  None)
-      ("plan_ok",  (plan_name, duration_hours, receipt_id))
-      ("error",    None)
-    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -578,12 +608,11 @@ def _claim_db_sync(user_id, display_name, code):
 
             cursor.execute("UPDATE users SET first_name = %s WHERE user_id = %s", (display_name, user_id))
 
-            # Determine duration: prefer duration_hours, fall back to days
             duration_hours = p_row.get('duration_hours')
             if not duration_hours:
                 duration_hours = (p_row.get('days') or 0) * 24
             if duration_hours <= 0:
-                duration_hours = 24  # safety fallback: 1 day
+                duration_hours = 24
 
             expiry_date = datetime.now() + timedelta(hours=duration_hours)
             receipt_id = generate_receipt_id()
@@ -908,6 +937,155 @@ async def rsub_command(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
+# COMMAND: /revokeall — revoke premium from ALL users
+# ═══════════════════════════════════════════════════════════════
+
+# Tracks /revokeall confirmation state: {admin_user_id: preview_count}
+REVOKEALL_PENDING = {}
+
+
+@router.message(F.text.regexp(r'^/revokeall(?:\s|$)'))
+async def revokeall_command(message: types.Message):
+    user = message.from_user
+    if user.id not in ADMIN_IDS:
+        await message.reply(
+            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
+            "𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝘁𝗼 𝘂𝘀𝗲 𝘁𝗵𝗶𝘀."
+        )
+        return
+
+    premium_count = await asyncio.to_thread(_revokeall_preview_sync)
+
+    if premium_count == 0:
+        await message.reply(
+            "<b>📭 𝗡𝗼 𝗽𝗿𝗲𝗺𝗶𝘂𝗺 𝘂𝘀𝗲𝗿𝘀 𝗳𝗼𝘂𝗻𝗱.</b>\n\n"
+            "Nothing to revoke.",
+            parse_mode="HTML"
+        )
+        return
+
+    REVOKEALL_PENDING[user.id] = premium_count
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Yes, Revoke All",
+                callback_data=f"revokeall_yes_{user.id}",
+                style="danger"
+            ),
+            InlineKeyboardButton(
+                text="❌ Cancel",
+                callback_data=f"revokeall_no_{user.id}",
+                style="success"
+            ),
+        ]
+    ])
+
+    await message.reply(
+        "<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗥𝗘𝗩𝗢𝗞𝗘 𝗔𝗟𝗟 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗣𝗟𝗔𝗡𝗦</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"This will revoke premium access from <b>{premium_count}</b> user(s).\n\n"
+        "• All premium flags → <code>Trial</code>\n"
+        "• All expiry dates → <code>cleared</code>\n"
+        "• All credits → <code>150</code>\n\n"
+        "<b>⚠️ This action cannot be undone.</b>\n\n"
+        "<b>Are you sure?</b>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("revokeall_"))
+async def revokeall_callback(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        return
+
+    action = parts[1]
+    try:
+        owner_id = int(parts[2])
+    except ValueError:
+        return
+
+    if callback.from_user.id != owner_id:
+        await callback.answer(
+            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
+            "𝗬𝗼𝘂 𝗰𝗮𝗻𝗻𝗼𝘁 𝗶𝗻𝘁𝗲𝗿𝗮𝗰𝘁.",
+            show_alert=True
+        )
+        return
+
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ 𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.", show_alert=True)
+        return
+
+    # ── Cancel ─────────────────────────────────────────────────
+    if action == "no":
+        REVOKEALL_PENDING.pop(owner_id, None)
+        await callback.answer("❌ Cancelled", show_alert=False)
+        try:
+            await callback.message.edit_text(
+                "<b>❌ 𝗥𝗲𝘃𝗼𝗸𝗲 𝗔𝗹𝗹 𝗰𝗮𝗻𝗰𝗲𝗹𝗹𝗲𝗱.</b>\n\n"
+                "No plans were changed.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Confirm ────────────────────────────────────────────────
+    await callback.answer("⏳ Revoking...", show_alert=False)
+
+    try:
+        affected = await asyncio.to_thread(_revokeall_db_sync)
+    except Exception as e:
+        logging.error(f"Error in /revokeall: {e}")
+        try:
+            await callback.message.edit_text(
+                f"<b>❌ Error:</b> <code>{str(e)[:100]}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    REVOKEALL_PENDING.pop(owner_id, None)
+
+    admin_name = callback.from_user.first_name or "Admin"
+    if callback.from_user.username:
+        admin_link = f'<a href="https://t.me/{callback.from_user.username}">{admin_name}</a>'
+    else:
+        admin_link = f'<a href="tg://user?id={owner_id}">{admin_name}</a>'
+
+    log_text = (
+        "<b>⚠️ 𝗥𝗘𝗩𝗢𝗞𝗘 𝗔𝗟𝗟 𝗘𝗫𝗘𝗖𝗨𝗧𝗘𝗗</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>👤 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
+        f"<b>🚫 𝗥𝗲𝘃𝗼𝗸𝗲𝗱 ➛</b> <code>{affected}</code> user(s)\n"
+        f"<b>⏰ 𝗧𝗶𝗺𝗲 ➛</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+    )
+    try:
+        await callback.bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=log_text,
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_text(
+            "<b>✅ 𝗥𝗲𝘃𝗼𝗸𝗲 𝗔𝗹𝗹 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>🚫 𝗥𝗲𝘃𝗼𝗸𝗲𝗱 ➛</b> <code>{affected}</code> user(s)\n"
+            "<b>👑 𝗔𝗹𝗹 𝗽𝗿𝗲𝗺𝗶𝘂𝗺 𝗽𝗹𝗮𝗻𝘀 𝗵𝗮𝘃𝗲 𝗯𝗲𝗲𝗻 𝗿𝗲𝘀𝗲𝘁.</b>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════
 # COMMAND: /rc — receipt lookup
 # ═══════════════════════════════════════════════════════════════
 
@@ -1163,11 +1341,6 @@ async def claim_command(message: types.Message):
 
 # ═══════════════════════════════════════════════════════════════
 # COMMAND: /gen — generate plan keys
-#
-# Usage:
-#   /gen <preset> <qty>                       → e.g. /gen core 10
-#   /gen <duration> <qty>                     → e.g. /gen 6h 10   |  /gen 3d 5
-#   /gen <duration> <qty> <custom name>       → e.g. /gen 12h 5 Starter Pass
 # ═══════════════════════════════════════════════════════════════
 
 @router.message(F.text.startswith("/gen"))
@@ -1210,11 +1383,9 @@ async def gen_command(message: types.Message):
 
     plan_name, duration_hours, credits, _ = resolved
 
-    # For custom-duration keys we need a stable "plan" identifier for the key prefix
     if plan_arg.lower() in PLAN_PRESETS:
         plan_id = plan_arg.lower()
     else:
-        # For custom durations the key prefix is a short code derived from the duration
         if duration_hours < 24:
             plan_id = f"{duration_hours}H"
         else:
