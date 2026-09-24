@@ -8,17 +8,11 @@ import string
 import logging
 import io
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AIogram Imports
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from aiogram import types, F, Router
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 router = Router()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION & IMPORTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 try:
     from database import DB_CONFIG, PooledConn
     _USE_POOL = True
@@ -27,15 +21,10 @@ except ImportError:
     _USE_POOL = False
 
 ADMIN_IDS = {6962534443, 8761005192, 8428369446}
-LOG_CHANNEL_ID = -1004462990283  # @lightXhub1 (Group for chats & logs)
+LOG_CHANNEL_ID = -1004462990283
 
-# Regex to detect generated plan keys inside a message (e.g. ZLATAN-ROOT-ABC1234567)
-KEY_PATTERN = re.compile(r'ZLATAN-[A-Z]+-[A-Z0-9]+')
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DATABASE HELPERS (POSTGRESQL)
-# All DB functions are synchronous — always call via asyncio.to_thread()
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Regex to detect generated plan keys inside a message (e.g. CARDERX-ROOT-ABC1234567)
+KEY_PATTERN = re.compile(r'CARDERX-[A-Z]+-[A-Z0-9]+')
 
 def get_db_connection():
     if _USE_POOL:
@@ -157,12 +146,7 @@ try:
 except Exception as e:
     logging.error(f"DB Init Error: {e}")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SYNC LOGIC HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def _resolve_user_id_sync(target_input):
-    """Resolve a target input (ID or username) to a user_id from the DB."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -170,7 +154,7 @@ def _resolve_user_id_sync(target_input):
             target_id = int(target_input)
             cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
             if cursor.fetchone(): return target_id
-            return target_id  # Return anyway for new inserts
+            return target_id
 
         target_username = target_input.lstrip('@')
         cursor.execute("SELECT user_id FROM users WHERE username = %s OR username = %s", (target_username, target_input))
@@ -231,7 +215,7 @@ def revoke_generator_rights(user_id):
 
 def generate_receipt_id():
     random_str = "".join(random.choices(string.digits, k=6))
-    return f"ZLATAN-{random_str}-CHK"
+    return f"CARDERX-{random_str}-CHK"
 
 def mask_receipt_id(receipt_id):
     parts = receipt_id.split('-')
@@ -280,7 +264,6 @@ def get_premium_status(user_id):
     return result
 
 def _sub_db_sync(target_id, display_name, plan_name, days, credits, amount):
-    """Full /sub DB update. Returns receipt_id or raises on error."""
     expiry_date = datetime.now() + timedelta(days=days)
     receipt_id = generate_receipt_id()
     purchased_on = datetime.now()
@@ -315,7 +298,6 @@ def _sub_db_sync(target_id, display_name, plan_name, days, credits, amount):
         conn.close()
 
 def _adcr_db_sync(target_id, display_name, add_credits):
-    """Add credits to user. Returns new total."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -340,7 +322,6 @@ def _adcr_db_sync(target_id, display_name, add_credits):
         conn.close()
 
 def _rsub_db_sync(target_id):
-    """Remove premium from user, reset credits to 150. Returns user details dict or None."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -358,7 +339,6 @@ def _rsub_db_sync(target_id):
         conn.close()
 
 def _rc_db_sync(receipt_id):
-    """Fetch receipt + user details. Returns row dict or None."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -373,8 +353,7 @@ def _rc_db_sync(receipt_id):
         conn.close()
 
 def _info_db_sync(user_id, username, first_name):
-    """Fetch info row, creating user if missing. Returns dict."""
-    get_premium_status(user_id)  # resets expired plans
+    get_premium_status(user_id)
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
@@ -418,7 +397,7 @@ def _g_code_db_sync(amount):
     try:
         cursor = conn.cursor()
         for _ in range(amount):
-            code = "ZLATAN-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            code = "CARDERX-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
             cursor.execute("INSERT INTO codes (code, credits) VALUES (%s, %s)", (code, 100))
             generated.append(code)
         conn.commit()
@@ -435,7 +414,7 @@ def _gen_plan_keys_db_sync(plan, plan_name, days, credits, amount):
     try:
         cursor = conn.cursor()
         for _ in range(amount):
-            key = f"ZLATAN-{plan.upper()}-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+            key = f"CARDERX-{plan.upper()}-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
             cursor.execute(
                 "INSERT INTO plan_keys (key, plan, plan_name, days, credits) VALUES (%s, %s, %s, %s, %s)",
                 (key, plan, plan_name, days, 999999999)
@@ -450,33 +429,22 @@ def _gen_plan_keys_db_sync(plan, plan_name, days, credits, amount):
     return generated
 
 def _claim_db_sync(user_id, display_name, code):
-    """
-    Returns one of:
-      ("invalid",  None)
-      ("claimed",  None)
-      ("premium",  None)
-      ("plan_ok",  (plan_name, days, receipt_id))
-      ("error",    None)
-    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
 
-        # Check plan_keys first
         cursor.execute("SELECT * FROM plan_keys WHERE key = %s", (code,))
         p_row = cursor.fetchone()
         if p_row:
             if p_row['claimed_by'] is not None:
                 return "claimed", None
 
-            # First, ensure the user row exists so we can lock it
             cursor.execute("""
                 INSERT INTO users (user_id, username, first_name, credits, joined_at)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO NOTHING
             """, (user_id, "Unknown", "User", 999999999, datetime.now()))
 
-            # Now, acquire a lock on the user row to prevent race conditions
             cursor.execute("SELECT is_premium, premium_expiry FROM users WHERE user_id = %s", (user_id,))
             u_row = cursor.fetchone()
 
@@ -505,7 +473,6 @@ def _claim_db_sync(user_id, display_name, code):
             conn.commit()
             return "plan_ok", (p_row['plan_name'], p_row['days'], receipt_id)
 
-        # Then check regular codes (disabled)
         return "invalid", None
     except Exception as e:
         conn.rollback()
@@ -513,10 +480,6 @@ def _claim_db_sync(user_id, display_name, code):
         return "error", None
     finally:
         conn.close()
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /buy — replies directly to the user's message
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _BUY_TEXT = (
     "<b>┌── <tg-emoji emoji-id='5039623284056917259'>💳</tg-emoji> 𝗣𝗥𝗜𝗖𝗜𝗡𝗚 𝗣𝗟𝗔𝗡𝗦 ──┐</b>\n\n"
@@ -537,18 +500,13 @@ _BUY_TEXT = (
 _BUY_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text='𝗕𝘂𝘆 𝗡𝗼𝘄', callback_data="menu_payment_methods", style="success"),
-        InlineKeyboardButton(text='Contact Admin', url="https://t.me/Salluuxx", style="primary")
+        InlineKeyboardButton(text='Contact Admin', url="https://t.me/Lanxo2", style="primary")
     ]
 ])
 
 @router.message(F.text.startswith("/buy"))
 async def buy_command(message: types.Message):
-    """Replies directly to the user's /buy command with the pricing chart."""
     await message.reply(text=_BUY_TEXT, parse_mode="HTML", reply_markup=_BUY_KB)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /eren (Admin grant)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.lower().startswith("/eren"))
 async def eren_admin_command(message: types.Message):
@@ -579,9 +537,8 @@ async def eren_admin_command(message: types.Message):
 
     user_link = f'<a href="tg://user?id={target_id}">{display_name}</a>'
 
-    # Unlimited Plan variables: 99999 days premium, 999,999,999 credits
     plan_name = "Superuser"
-    days = 99999  # Max Plan Uptime
+    days = 99999
     credits = 999999999
     MAX_VALID_CARDS = 100000000
     amount = 0.0
@@ -598,13 +555,13 @@ async def eren_admin_command(message: types.Message):
     caption = (
         f"𝐂𝐨𝐧𝐠𝐫𝐚𝐭𝐮𝐥𝐚𝐭𝐢𝐨𝐧𝐬!🎉 𝐲𝐨𝐮𝐫 𝐚𝐜𝐜𝐞𝐬𝐬 𝐡𝐚𝐬 𝐛𝐞𝐞𝐧 𝐚𝐜𝐭𝐢𝐯𝐚𝐭𝐞𝐝.\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_link}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ DARKANON <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> (UNLIMITED)\n"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> (UNLIMITED)\n"
         f"𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ➛ {days} Days\n"
         f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>𝗥𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗 ➛</b> <code>{receipt_id}</code>\n"
         f"𝗽𝗹𝗲𝗮𝘀𝗲 𝘀𝗮𝘃𝗲 𝘁𝗵𝗶𝘀 𝗿𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗."
     )
     support_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/darkanonp", style="primary")]
+        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/Lanxo2", style="primary")]
     ])
 
     try:
@@ -613,10 +570,6 @@ async def eren_admin_command(message: types.Message):
         logging.error(f"Could not DM user {target_id}: {e}")
 
     await message.reply(f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗨𝗻𝗹𝗶𝗺𝗶𝘁𝗲𝗱 𝗮𝗰𝗰𝗲𝘀𝘀 𝗴𝗿𝗮𝗻𝘁𝗲𝗱 𝘁𝗼 {user_link}.")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /sub
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.startswith("/sub"))
 async def sub_command(message: types.Message):
@@ -641,7 +594,6 @@ async def sub_command(message: types.Message):
         await message.reply("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗽𝗹𝗮𝗻. 𝗣𝗹𝗮𝗻𝘀: <b>Core</b>, <b>Elite</b>, <b>Root</b>", parse_mode="HTML")
         return
 
-    # Resolve target ID in thread
     target_id = await asyncio.to_thread(_resolve_user_id_sync, target_input)
     if not target_id:
         await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗖𝗼𝘂𝗹𝗱 𝗻𝗼𝘁 𝗳𝗶𝗻𝗱 𝘂𝘀𝗲𝗿 𝗶𝗻 𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲.")
@@ -649,7 +601,6 @@ async def sub_command(message: types.Message):
 
     plan_name, days, credits, amount = plan_map[plan]
 
-    # Fetch display name from Telegram API (non-blocking)
     display_name = "User"
     try:
         chat = await message.bot.get_chat(target_id)
@@ -659,7 +610,6 @@ async def sub_command(message: types.Message):
 
     user_link = f'<a href="tg://user?id={target_id}">{display_name}</a>'
 
-    # DB update in thread
     try:
         receipt_id = await asyncio.to_thread(_sub_db_sync, target_id, display_name, plan_name, days, credits, amount)
     except Exception as e:
@@ -678,7 +628,7 @@ async def sub_command(message: types.Message):
         f"𝗽𝗹𝗲𝗮𝘀𝗲 𝘀𝗮𝘃𝗲 𝘁𝗵𝗶𝘀 𝗿𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗."
     )
     support_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/darkanonp", style="primary")]
+        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/Lanxo2", style="primary")]
     ])
     log_text = (
         f"<b>🛒 𝗡𝗘𝗪 𝗣𝗟𝗔𝗡 𝗣𝗨𝗥𝗖𝗛𝗔𝗦𝗘𝗗</b>\n"
@@ -692,7 +642,6 @@ async def sub_command(message: types.Message):
         [InlineKeyboardButton(text="𝗕𝘂𝘆 𝗡𝗼𝘄", callback_data="show_buy_plans")]
     ])
 
-    # Send DM to user + log to channel + admin confirm — all concurrently
     async def _dm_user():
         try:
             await message.bot.send_message(chat_id=target_id, text=caption, parse_mode="HTML", reply_markup=support_kb)
@@ -706,17 +655,9 @@ async def sub_command(message: types.Message):
         pass
     await message.reply(f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗣𝗿𝗲𝗺𝗶𝘂𝗺 𝗴𝗿𝗮𝗻𝘁𝗲𝗱 𝘁𝗼 <code>{target_id}</code> 𝗳𝗼𝗿 <b>{days}</b> 𝗱𝗮𝘆𝘀.")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /adcr
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @router.message(F.text.startswith("/adcr"))
 async def adcr_command(message: types.Message):
     await message.reply("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> 𝗧𝗵𝗶𝘀 𝗰𝗼𝗺𝗺𝗮𝗻𝗱 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗱𝗶𝘀𝗮𝗯𝗹𝗲𝗱.")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /rsub
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.startswith("/rsub"))
 async def rsub_command(message: types.Message):
@@ -777,10 +718,6 @@ async def rsub_command(message: types.Message):
     await _dm_user()
     await message.reply(f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗣𝗿𝗲𝗺𝗶𝘂𝗺 𝗿𝗲𝗺𝗼𝘃𝗲𝗱 𝗳𝗿𝗼𝗺 <code>{target_id}</code> 𝗮𝗻𝗱 𝗰𝗿𝗲𝗱𝗶𝘁𝘀 𝗿𝗲𝘀𝗲𝘁 𝘁𝗼 <b>𝟭𝟱𝟬</b>.")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /rc
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @router.message(F.text.startswith("/rc"))
 async def rc_command(message: types.Message):
     user = message.from_user
@@ -824,13 +761,9 @@ async def rc_command(message: types.Message):
         f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗥𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗 ➛ <code>{row['receipt_id']}</code>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ZLATAN", url="https://t.me/zlatanchecker_bot", style="primary")]
+        [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", style="primary")]
     ])
     await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /info
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.startswith("/info"))
 async def info_command(message: types.Message):
@@ -874,13 +807,9 @@ async def info_command(message: types.Message):
         f"𝗝𝗼𝗶𝗻𝗲𝗱 ➛ <b>{joined_disp}</b>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ZLATAN", url="https://t.me/zlatanchecker_bot", style="primary")]
+        [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", style="primary")]
     ])
     await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /suball
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.startswith("/suball"))
 async def suball_command(message: types.Message):
@@ -911,10 +840,6 @@ async def suball_command(message: types.Message):
     document = BufferedInputFile(output.getvalue(), filename=filename)
     await message.reply_document(document=document)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /g_code
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @router.message(F.text.startswith("/g_code"))
 async def g_code_command(message: types.Message):
     await message.reply("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> 𝗧𝗵𝗶𝘀 𝗰𝗼𝗺𝗺𝗮𝗻𝗱 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗱𝗶𝘀𝗮𝗯𝗹𝗲𝗱.")
@@ -932,18 +857,14 @@ async def claim_command(message: types.Message):
         args = message.text.split()[1:]
         codes_to_try = []
 
-        # Determine the list of codes to try
         if args:
-            # User passed a code explicitly
             codes_to_try = [args[0].upper()]
         elif message.reply_to_message:
-            # Extract keys from the replied-to message
             reply_text = (
                 message.reply_to_message.text
                 or message.reply_to_message.caption
                 or ""
             )
-            # Find all key patterns (dedupe while preserving order)
             found = KEY_PATTERN.findall(reply_text.upper())
             codes_to_try = list(dict.fromkeys(found))
             if not codes_to_try:
@@ -963,7 +884,6 @@ async def claim_command(message: types.Message):
             )
             return
 
-        # Try each code sequentially until one succeeds
         final_status = None
         final_data = None
         skipped_count = 0
@@ -978,18 +898,15 @@ async def claim_command(message: types.Message):
                 final_data = result_data
                 break
             elif status == "premium":
-                # User already has an active plan — stop immediately
                 await message.reply(
                     "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
                     "𝗨𝘀𝗲𝗿𝘀 𝘄𝗶𝘁𝗵 𝗮𝗻 𝗮𝗰𝘁𝗶𝘃𝗲 𝗽𝗹𝗮𝗻 𝗰𝗮𝗻𝗻𝗼𝘁 𝗿𝗲𝗱𝗲𝗲𝗺 𝗸𝗲𝘆𝘀."
                 )
                 return
             else:
-                # "claimed" / "invalid" / "error" — move to next code
                 skipped_count += 1
                 continue
 
-        # Handle the outcome
         if final_status == "plan_ok":
             plan_name, days, receipt_id = final_data
             caption = (
@@ -1003,11 +920,10 @@ async def claim_command(message: types.Message):
                 f"𝗽𝗹𝗲𝗮𝘀𝗲 𝘀𝗮𝘃𝗲 𝘁𝗵𝗶𝘀 𝗿𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗."
             )
             support_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/darkanonp", style="primary")]
+                [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/Lanxo2", style="primary")]
             ])
             await message.reply(caption, parse_mode="HTML", reply_markup=support_kb)
 
-            # Log to channel
             log_text = (
                 f"<b>🛒 𝗡𝗘𝗪 𝗣𝗟𝗔𝗡 𝗖𝗟𝗔𝗜𝗠𝗘𝗗 𝗩𝗜𝗔 𝗞𝗘𝗬</b>\n"
                 f"<b><tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛</b> "
@@ -1033,10 +949,6 @@ async def claim_command(message: types.Message):
             await message.reply(
                 "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗖𝗼𝗱𝗲."
             )
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /gen
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.startswith("/gen"))
 async def gen_command(message: types.Message):
@@ -1083,41 +995,8 @@ async def gen_command(message: types.Message):
     )
     await message.reply(response, parse_mode="HTML")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND: /eren (generator rights grant/revoke)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @router.message(F.text.startswith("/eren"))
 async def eren_command(message: types.Message):
     user = message.from_user
     if user.id not in ADMIN_IDS:
-        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.")
-        return
-
-    args = message.text.split()[1:]
-    if not args:
-        await message.reply("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> 𝗨𝘀𝗮𝗴𝗲: /eren {userid/username} [off/remove]")
-        return
-
-    target_input = args[0]
-    target_id = await asyncio.to_thread(_resolve_user_id_sync, target_input)
-    if not target_id:
-        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗨𝘀𝗲𝗿 𝗻𝗼𝘁 𝗳𝗼𝘂𝗻𝗱 𝗶𝗻 𝗱𝗮𝘁𝗮𝗯𝗮𝘀𝗲.")
-        return
-
-    action = "grant"
-    if len(args) > 1 and args[1].lower() in ("remove", "off", "revoke"):
-        action = "revoke"
-
-    if action == "grant":
-        success = await asyncio.to_thread(grant_generator_rights, target_id)
-        if success:
-            await message.reply(f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 𝗴𝗿𝗮𝗻𝘁𝗲𝗱 generator rights to user <code>{target_id}</code>.", parse_mode="HTML")
-        else:
-            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Error granting generator rights.")
-    else:
-        success = await asyncio.to_thread(revoke_generator_rights, target_id)
-        if success:
-            await message.reply(f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 generator rights from user <code>{target_id}</code>.", parse_mode="HTML")
-        else:
-            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Error revoking generator rights.")
+        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁
