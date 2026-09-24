@@ -999,4 +999,33 @@ async def gen_command(message: types.Message):
 async def eren_command(message: types.Message):
     user = message.from_user
     if user.id not in ADMIN_IDS:
-        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁
+        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.")
+        return
+
+    args = message.text.split()[1:]
+    if not args:
+        await message.reply("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> 𝗨𝘀𝗮𝗴𝗲: /eren {userid/username} [off/remove]")
+        return
+
+    target_input = args[0]
+    target_id = await asyncio.to_thread(_resolve_user_id_sync, target_input)
+    if not target_id:
+        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗨𝘀𝗲𝗿 𝗻𝗼𝘁 𝗳𝗼𝘂𝗻𝗱 𝗶𝗻 𝗱𝗮𝘁𝗮𝗯𝗮𝘀𝗲.")
+        return
+
+    action = "grant"
+    if len(args) > 1 and args[1].lower() in ("remove", "off", "revoke"):
+        action = "revoke"
+
+    if action == "grant":
+        success = await asyncio.to_thread(grant_generator_rights, target_id)
+        if success:
+            await message.reply(f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 𝗴𝗿𝗮𝗻𝘁𝗲𝗱 generator rights to user <code>{target_id}</code>.", parse_mode="HTML")
+        else:
+            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Error granting generator rights.")
+    else:
+        success = await asyncio.to_thread(revoke_generator_rights, target_id)
+        if success:
+            await message.reply(f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 generator rights from user <code>{target_id}</code>.", parse_mode="HTML")
+        else:
+            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Error revoking generator rights.")
