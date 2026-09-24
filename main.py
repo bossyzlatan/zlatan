@@ -37,7 +37,8 @@ from status import vps_command, router as status_router
 from sub import (
     sub_command, rc_command, suball_command, g_code_command,
     claim_command, info_command, rsub_command, buy_command, adcr_command,
-    eren_admin_command, gen_command
+    eren_admin_command, gen_command,
+    revokeall_command, revokeall_callback,
 )
 from proxy import proxy_command, checkproxy_command, clearproxy_command, rtvproxy_command
 
@@ -562,6 +563,7 @@ DOT_COMMAND_MAP = {
     "clearsites": clearsites_command, "clearsite": clearsites_command,
     "setprice": setprice_command,
     "whop": whop_command, "whophit": whop_command,
+    "revokeall": revokeall_command,
     "cmds": cmds_command, "fb": feedback_cmd, "broad": broad_command,
     "ban": ban_command, "unban": unban_command, "vps": vps_command,
     "api": None,
@@ -601,6 +603,9 @@ async def button_handler(callback: types.CallbackQuery):
     data = callback.data or ""
 
     if data.startswith(_MASS_PREFIXES):
+        return
+
+    if data.startswith("revokeall_"):
         return
 
     user_id = callback.from_user.id
@@ -760,6 +765,7 @@ dp.callback_query.register(msh_result_handler, MshResultCallback.filter())
 dp.callback_query.register(mst_stop_handler, MstStopCallback.filter())
 dp.callback_query.register(mst_result_handler, MstResultCallback.filter())
 dp.callback_query.register(sh_callback_handler, F.data.startswith("sh_"))
+dp.callback_query.register(revokeall_callback, F.data.startswith("revokeall_"))
 
 for _cmd, _fn in [
     ("sh", sh_command), ("st", st_command), ("ffc", st_command),
@@ -768,6 +774,7 @@ for _cmd, _fn in [
     ("suball", suball_command), ("g_code", g_code_command), ("claim", claim_command),
     ("info", info_command), ("rsub", rsub_command), ("buy", buy_command),
     ("adcr", adcr_command), ("on", on_command), ("off", off_command),
+    ("revokeall", revokeall_command),
     ("sitechk", sitechk_command), ("addsite", addsite_command),
     ("mysites", mysites_command), ("mysite", mysites_command),
     ("clearsites", clearsites_command), ("clearsite", clearsites_command),
