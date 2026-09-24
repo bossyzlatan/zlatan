@@ -4,7 +4,6 @@ import aiohttp
 import asyncio
 from datetime import datetime
 from urllib.parse import quote
-import io
 
 from aiogram import types, F, Router
 from aiogram.types import BufferedInputFile
@@ -22,11 +21,13 @@ from database import (
 
 router = Router()
 
-ADMIN_IDS = {6962534443, 8761005192, 8428369446}
+# Synced with main.py
+ADMIN_IDS = {6962534443, 8428369446}
 
 MAX_CONCURRENT_CHECKS = 5
 PROXY_TIMEOUT = 8
 IPIFY_API_URL = "https://api.ipify.org?format=json"
+
 
 def parse_proxy_input(proxy_input):
     s = proxy_input.strip()
@@ -76,6 +77,7 @@ def parse_proxy_input(proxy_input):
 
     return None
 
+
 def build_dict(user, password, ip, port, protocol, original_input):
     user = user.strip()
     password = password.strip()
@@ -93,6 +95,7 @@ def build_dict(user, password, ip, port, protocol, original_input):
         "db_format": f"{user} {password} {ip} {port}",
         "http_format": f"http://{user}:{password}@{ip}:{port}"
     }
+
 
 async def check_proxy_live(proxy_url, session=None, timeout=PROXY_TIMEOUT):
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
@@ -133,6 +136,7 @@ async def check_proxy_live(proxy_url, session=None, timeout=PROXY_TIMEOUT):
         if close_session:
             await session.close()
 
+
 async def check_proxies_parallel(proxies_list, max_concurrent=MAX_CONCURRENT_CHECKS):
     semaphore = asyncio.Semaphore(max_concurrent)
     async def check_with_semaphore(proxy_data):
@@ -149,11 +153,8 @@ async def check_proxies_parallel(proxies_list, max_concurrent=MAX_CONCURRENT_CHE
             processed.append(res)
     return processed
 
-async def run_db_operation(func, *args):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, func, *args)
 
-async def process_proxies_background(bot, message: types.Message, valid_proxies: list, is_premium: bool):
+async def process_proxies_background(bot, message: types.Message, valid_proxies: list):
     user_id = message.from_user.id
     total_count = len(valid_proxies)
     status_msg = await message.reply(
@@ -222,6 +223,7 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
         )
     except Exception:
         await message.reply(caption, parse_mode="HTML")
+
 
 async def check_db_proxies_background(bot, message: types.Message):
     user_id = message.from_user.id
@@ -299,13 +301,13 @@ async def check_db_proxies_background(bot, message: types.Message):
         logging.error(f"File send error: {e}")
         await message.reply(caption, parse_mode="HTML")
 
-@router.message(F.text.startswith("/proxy"))
+
+@router.message(F.text.regexp(r'^/proxy(?:\s|$)'))
 async def proxy_command(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username or "Unknown"
     first_name = message.from_user.first_name or "User"
     await asyncio.to_thread(create_user, user_id, username)
-    is_premium, expiry = await asyncio.to_thread(get_premium_status, user_id)
 
     raw_text = ""
     parts = message.text.split(maxsplit=1)
@@ -321,7 +323,7 @@ async def proxy_command(message: types.Message):
         document = message.reply_to_message.document
 
     if document:
-        if document.file_size > 2 * 1024 * 1024:
+        if document.file_size and document.file_size > 2 * 1024 * 1024:
             await message.reply("<b>⚠️ File too large. Max 2MB.</b>", parse_mode="HTML")
             return
         try:
@@ -334,7 +336,14 @@ async def proxy_command(message: types.Message):
             return
 
     if not raw_text.strip():
-        await message.reply("<b>❌ Invalid Usage!</b>", parse_mode="HTML")
+        await message.reply(
+            "<b>❌ Invalid Usage!</b>\n\n"
+            "<b>How to use:</b>\n"
+            "• <code>/proxy user:pass@host:port</code>\n"
+            "• Reply to a message containing proxies with <code>/proxy</code>\n"
+            "• Or upload a .txt file with proxies and caption it <code>/proxy</code>",
+            parse_mode="HTML"
+        )
         return
 
     lines = raw_text.strip().split('\n')
@@ -348,13 +357,15 @@ async def proxy_command(message: types.Message):
         await message.reply("<b>⚠️ No valid proxies found.</b>", parse_mode="HTML")
         return
 
-    asyncio.create_task(process_proxies_background(message.bot, message, valid_proxies, is_premium))
+    asyncio.create_task(process_proxies_background(message.bot, message, valid_proxies))
 
-@router.message(F.text.startswith("/checkproxy"))
+
+@router.message(F.text.regexp(r'^/checkproxy(?:\s|$)'))
 async def checkproxy_command(message: types.Message):
     asyncio.create_task(check_db_proxies_background(message.bot, message))
 
-@router.message(F.text.startswith("/clearproxy"))
+
+@router.message(F.text.regexp(r'^/clearproxy(?:\s|$)'))
 async def clearproxy_command(message: types.Message):
     user_id = message.from_user.id
     deleted_count = await asyncio.to_thread(clear_proxies, user_id)
@@ -364,7 +375,8 @@ async def clearproxy_command(message: types.Message):
         msg = "<b>📭 Database is already empty.</b>"
     await message.reply(msg, parse_mode="HTML")
 
-@router.message(F.text.startswith("/myproxies"))
+
+@router.message(F.text.regexp(r'^/myproxies(?:\s|$)'))
 async def myproxies_command(message: types.Message):
     user_id = message.from_user.id
     count = await asyncio.to_thread(count_proxies, user_id)
@@ -388,7 +400,7 @@ async def myproxies_command(message: types.Message):
 # ADMIN: /rtvproxy — Retrieve every proxy across all users
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@router.message(F.text.startswith("/rtvproxy"))
+@router.message(F.text.regexp(r'^/rtvproxy(?:\s|$)'))
 async def rtvproxy_command(message: types.Message):
     """Admin-only: download every proxy in the database, grouped by user."""
     user = message.from_user
@@ -400,7 +412,7 @@ async def rtvproxy_command(message: types.Message):
         )
         return
 
-    status_msg = await message.answer(
+    status_msg = await message.reply(
         "<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> "
         "<b>Collecting proxies from all users...</b>",
         parse_mode="HTML"
