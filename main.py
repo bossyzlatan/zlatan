@@ -39,6 +39,7 @@ from sub import (
     claim_command, info_command, rsub_command, buy_command, adcr_command,
     eren_admin_command, gen_command,
     revokeall_command, revokeall_callback,
+    revoke_command, revokeuser_command,
 )
 from proxy import proxy_command, checkproxy_command, clearproxy_command, rtvproxy_command
 
@@ -81,7 +82,7 @@ WEBHOOK_URL = f""
 WEBHOST = "0.0.0.0"
 WEBPORT = 8080
 
-LOG_CHANNEL_ID = -1003905461082
+LOG_CHANNEL_ID = -1004479507133
 BOT_LINK = "https://t.me/zlatanchecker_bot"
 CHANNEL_LINK = "https://t.me/+93nNDkmK2PRjZjg8"
 GROUP_LINK = "https://t.me/+KrM3-0iNKrRjNWJk"
@@ -564,6 +565,8 @@ DOT_COMMAND_MAP = {
     "setprice": setprice_command,
     "whop": whop_command, "whophit": whop_command,
     "revokeall": revokeall_command,
+    "revoke": revoke_command,
+    "revokeuser": revokeuser_command,
     "cmds": cmds_command, "fb": feedback_cmd, "broad": broad_command,
     "ban": ban_command, "unban": unban_command, "vps": vps_command,
     "api": None,
@@ -775,6 +778,8 @@ for _cmd, _fn in [
     ("info", info_command), ("rsub", rsub_command), ("buy", buy_command),
     ("adcr", adcr_command), ("on", on_command), ("off", off_command),
     ("revokeall", revokeall_command),
+    ("revoke", revoke_command),
+    ("revokeuser", revokeuser_command),
     ("sitechk", sitechk_command), ("addsite", addsite_command),
     ("mysites", mysites_command), ("mysite", mysites_command),
     ("clearsites", clearsites_command), ("clearsite", clearsites_command),
