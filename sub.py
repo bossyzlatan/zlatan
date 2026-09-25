@@ -23,6 +23,13 @@ except ImportError:
 ADMIN_IDS = {6962534443, 8761005192, 8428369446}
 LOG_CHANNEL_ID = -1004462990283
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CLAIM BROADCAST
+# Every successful /claim (whether triggered in DM or group)
+# broadcasts the full receipt message to this chat.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLAIM_BROADCAST_CHAT_ID = -1004462990283
+
 # Middle segment allows letters AND digits so keys like
 # CARDERX-6H-XXX, CARDERX-12H-XXX, CARDERX-3D-XXX all match.
 KEY_PATTERN = re.compile(r'CARDERX-[A-Z0-9]+-[A-Z0-9]+')
@@ -32,21 +39,15 @@ KEY_PATTERN = re.compile(r'CARDERX-[A-Z0-9]+-[A-Z0-9]+')
 # PLAN PRESETS + DURATION HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-# format: (display_name, duration_hours, credits, amount_usd)
 PLAN_PRESETS = {
-    "trial": ("Trail 🛠️",       1 * 24,  999999999, 0),
-    "core":  ("Core 🛠️",        7 * 24,  999999999, 5),
-    "elite": ("Elite ⭐",        15 * 24, 999999999, 7),
-    "root":  ("Root 👑",        30 * 24, 999999999, 15),
+    "trial": ("Trail <tg-emoji emoji-id='5042274086332400375'>🛠️</tg-emoji>",  1 * 24,  999999999, 0),
+    "core":  ("Core <tg-emoji emoji-id='5042274086332400375'>🛠️</tg-emoji>",   7 * 24,  999999999, 5),
+    "elite": ("Elite <tg-emoji emoji-id='5278751923338490157'>⭐</tg-emoji>",   15 * 24, 999999999, 7),
+    "root":  ("Root <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>",   30 * 24, 999999999, 15),
 }
 
 
 def parse_duration(s: str):
-    """
-    Parse a duration string into hours.
-    Accepts: 1h, 6h, 12h, 24h, 1d, 3d, 7d, 30d
-    Returns int (hours) or None if invalid.
-    """
     if not s:
         return None
     s = s.strip().lower()
@@ -65,7 +66,6 @@ def parse_duration(s: str):
 
 
 def format_duration(hours: int) -> str:
-    """Human-readable duration string."""
     if hours < 24:
         return f"{hours} Hour{'s' if hours != 1 else ''}"
     if hours % 24 == 0:
@@ -77,10 +77,6 @@ def format_duration(hours: int) -> str:
 
 
 def resolve_plan_arg(plan_arg: str, custom_name: str = None):
-    """
-    Given a plan argument, return (display_name, duration_hours, credits, amount)
-    or None if invalid.
-    """
     if not plan_arg:
         return None
     key = plan_arg.lower().strip()
@@ -474,11 +470,6 @@ def _revokeall_db_sync():
 
 
 def _revoke_user_db_sync(target_id):
-    """
-    Revoke premium from a single user.
-    Clears is_premium and premium_expiry but KEEPS credits (unlike /rsub).
-    Returns dict with user info on success, None if user does not exist.
-    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -947,28 +938,22 @@ async def rsub_command(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMAND: /revoke — revoke premium from a single user (keeps credits)
+# SHARED HELPER: revoke a single user's plan
 # ═══════════════════════════════════════════════════════════════
 
-@router.message(F.text.regexp(r'^/revoke(?:\s|$)'))
-async def revoke_command(message: types.Message):
+async def _do_single_revoke(message: types.Message, notify_user: bool):
     user = message.from_user
-    if user.id not in ADMIN_IDS:
-        await message.reply(
-            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
-            "𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝘁𝗼 𝘂𝘀𝗲 𝘁𝗵𝗶𝘀."
-        )
-        return
 
     args = message.text.split()[1:]
     if not args:
         await message.reply(
             "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>𝗨𝘀𝗮𝗴𝗲:</b>\n"
-            "<code>/revoke &lt;user_id | @username&gt;</code>\n\n"
+            "<code>/revoke &lt;user_id | @username&gt;</code>\n"
+            "<code>/revokeuser &lt;user_id | @username&gt;</code>\n\n"
             "<b>𝗘𝘅𝗮𝗺𝗽𝗹𝗲:</b>\n"
-            "<code>/revoke 123456789</code>\n"
-            "<code>/revoke @username</code>\n\n"
-            "<i>Clears the user's plan but keeps their credits.</i>",
+            "<code>/revokeuser 123456789</code>\n"
+            "<code>/revokeuser @username</code>\n\n"
+            "<i>/revoke: silent · /revokeuser: DMs the user.</i>",
             parse_mode="HTML"
         )
         return
@@ -985,7 +970,7 @@ async def revoke_command(message: types.Message):
     try:
         result = await asyncio.to_thread(_revoke_user_db_sync, target_id)
     except Exception as e:
-        logging.error(f"Error in /revoke: {e}")
+        logging.error(f"Error in single revoke: {e}")
         await message.reply(
             "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
             "𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲 𝗘𝗿𝗿𝗼𝗿."
@@ -1010,26 +995,30 @@ async def revoke_command(message: types.Message):
     display_name = result.get("first_name") or result.get("username") or "User"
     user_link = f'<a href="tg://user?id={target_id}">{display_name}</a>'
 
-    dm_text = (
-        f"⚠️ 𝗬𝗼𝘂𝗿 𝗽𝗹𝗮𝗻 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.\n\n"
-        f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {display_name}\n"
-        f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{target_id}</code>\n"
-        f"👑 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ <b>Trial</b>\n"
-        f"<i>Your credits remain unchanged.</i>"
-    )
-    buy_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="𝗕𝘂𝘆 𝗡𝗼𝘄", callback_data="show_buy_plans")]
-    ])
-
-    try:
-        await message.bot.send_message(
-            chat_id=target_id,
-            text=dm_text,
-            parse_mode="HTML",
-            reply_markup=buy_kb
+    dm_status = "not sent" if not notify_user else "sent"
+    if notify_user:
+        dm_text = (
+            "⚠️ <b>𝗬𝗼𝘂𝗿 𝗽𝗹𝗮𝗻 𝗵𝗮𝘀 𝗯𝗲𝗲𝗻 𝗿𝗲𝘃𝗼𝗸𝗲𝗱</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {display_name}\n"
+            f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{target_id}</code>\n"
+            "👑 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ <b>Trial</b>\n\n"
+            "<i>Your credits remain unchanged.</i>\n"
+            "You can purchase a new plan using /buy."
         )
-    except Exception as e:
-        logging.warning(f"[revoke] Could not DM user {target_id}: {e}")
+        buy_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="𝗕𝘂𝘆 𝗡𝗼𝘄", callback_data="show_buy_plans")]
+        ])
+        try:
+            await message.bot.send_message(
+                chat_id=target_id,
+                text=dm_text,
+                parse_mode="HTML",
+                reply_markup=buy_kb,
+            )
+        except Exception as e:
+            dm_status = "failed"
+            logging.warning(f"[revoke] Could not DM user {target_id}: {e}")
 
     admin_name = user.first_name or "Admin"
     if user.username:
@@ -1043,6 +1032,7 @@ async def revoke_command(message: types.Message):
         f"<b>👤 𝗔𝗱𝗺𝗶𝗻 ➛</b> {admin_link}\n"
         f"<b>🎯 𝗧𝗮𝗿𝗴𝗲𝘁 ➛</b> {user_link}\n"
         f"<b>🆔 𝗧𝗮𝗿𝗴𝗲𝘁 𝗜𝗗 ➛</b> <code>{target_id}</code>\n"
+        f"<b>📬 𝗗𝗠 ➛</b> <code>{dm_status}</code>\n"
         f"<b>⏰ 𝗧𝗶𝗺𝗲 ➛</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
     )
     try:
@@ -1050,12 +1040,49 @@ async def revoke_command(message: types.Message):
     except Exception:
         pass
 
+    if notify_user:
+        tail = "\n<i>The user has been notified.</i>"
+        if dm_status == "failed":
+            tail = "\n<i>⚠️ Could not notify the user (they may have blocked the bot).</i>"
+    else:
+        tail = "\n<i>Silent revoke — user was not notified.</i>"
+
     await message.reply(
         f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> "
-        f"𝗣𝗹𝗮𝗻 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 𝗳𝗿𝗼𝗺 {user_link}.\n"
-        f"<i>Credits preserved.</i>",
+        f"𝗣𝗹𝗮𝗻 𝗿𝗲𝘃𝗼𝗸𝗲𝗱 𝗳𝗿𝗼𝗺 {user_link}."
+        f"{tail}",
         parse_mode="HTML"
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMMAND: /revoke — silent single-user revoke
+# ═══════════════════════════════════════════════════════════════
+
+@router.message(F.text.regexp(r'^/revoke(?:\s|$)'))
+async def revoke_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply(
+            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
+            "𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝘁𝗼 𝘂𝘀𝗲 𝘁𝗵𝗶𝘀."
+        )
+        return
+    await _do_single_revoke(message, notify_user=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMMAND: /revokeuser — revoke AND notify the user
+# ═══════════════════════════════════════════════════════════════
+
+@router.message(F.text.regexp(r'^/revokeuser(?:\s|$)'))
+async def revokeuser_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply(
+            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
+            "𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝘁𝗼 𝘂𝘀𝗲 𝘁𝗵𝗶𝘀."
+        )
+        return
+    await _do_single_revoke(message, notify_user=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1396,7 +1423,8 @@ async def claim_command(message: types.Message):
 
         final_status = None
         final_data = None
-        skipped_count = 0
+        claimed_count = 0   # keys that were already claimed by someone
+        invalid_count = 0   # keys that are invalid / errored
 
         for code in codes_to_try:
             status, result_data = await asyncio.to_thread(
@@ -1413,8 +1441,11 @@ async def claim_command(message: types.Message):
                     "𝗨𝘀𝗲𝗿𝘀 𝘄𝗶𝘁𝗵 𝗮𝗻 𝗮𝗰𝘁𝗶𝘃𝗲 𝗽𝗹𝗮𝗻 𝗰𝗮𝗻𝗻𝗼𝘁 𝗿𝗲𝗱𝗲𝗲𝗺 𝗸𝗲𝘆𝘀."
                 )
                 return
+            elif status == "claimed":
+                claimed_count += 1
+                continue
             else:
-                skipped_count += 1
+                invalid_count += 1
                 continue
 
         if final_status == "plan_ok":
@@ -1448,14 +1479,39 @@ async def claim_command(message: types.Message):
             except Exception:
                 pass
 
-        elif skipped_count > 0:
+            # ── Broadcast the full receipt message to the group chat ──
+            broadcast_caption = (
+                "<b>🎁 𝗞𝗘𝗬 𝗖𝗟𝗔𝗜𝗠𝗘𝗗</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"{caption}"
+            )
+            try:
+                await message.bot.send_message(
+                    chat_id=CLAIM_BROADCAST_CHAT_ID,
+                    text=broadcast_caption,
+                    parse_mode="HTML",
+                    reply_markup=support_kb,
+                )
+            except Exception as e:
+                logging.warning(f"[claim] broadcast to group failed: {e}")
+
+        elif claimed_count == len(codes_to_try) and len(codes_to_try) > 1:
+            # Every key in the replied message is already claimed
+            await message.reply(
+                f"<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
+                f"𝗔𝗹𝗹 <b>{len(codes_to_try)}</b> 𝗸𝗲𝘆𝘀 𝗶𝗻 𝘁𝗵𝗶𝘀 𝗺𝗲𝘀𝘀𝗮𝗴𝗲 𝗵𝗮𝘃𝗲 "
+                f"𝗮𝗹𝗿𝗲𝗮𝗱𝘆 𝗯𝗲𝗲𝗻 𝗰𝗹𝗮𝗶𝗺𝗲𝗱.",
+                parse_mode="HTML"
+            )
+        elif claimed_count > 0:
+            # At least one key was already claimed (single-key case, or
+            # partial claim where the remaining keys were invalid).
             await message.reply(
                 "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
-                "𝗔𝗹𝗹 𝗸𝗲𝘆𝘀 𝗶𝗻 𝘁𝗵𝗶𝘀 𝗺𝗲𝘀𝘀𝗮𝗴𝗲 𝗵𝗮𝘃𝗲 𝗮𝗹𝗿𝗲𝗮𝗱𝘆 𝗯𝗲𝗲𝗻 "
-                "𝗰𝗹𝗮𝗶𝗺𝗲𝗱 𝗼𝗿 𝗮𝗿𝗲 𝗶𝗻𝘃𝗮𝗹𝗶𝗱."
+                "𝗧𝗵𝗶𝘀 𝗸𝗲𝘆 𝗵𝗮𝘀 𝗮𝗹𝗿𝗲𝗮𝗱𝘆 𝗯𝗲𝗲𝗻 𝗰𝗹𝗮𝗶𝗺𝗲𝗱."
             )
         else:
-            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗖𝗼𝗱𝗲.")
+            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗜𝗻𝘃𝗮𝗹𝗶𝗱 𝗞𝗲𝘆.")
 
 
 # ═══════════════════════════════════════════════════════════════
