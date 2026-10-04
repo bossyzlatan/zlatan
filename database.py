@@ -167,6 +167,7 @@ _SQLITE_TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
     "plan_keys": [
         ("key", "TEXT PRIMARY KEY"),
         ("duration_days", "INTEGER"),
+        ("duration_hours", "INTEGER"),
         ("max_uses", "INTEGER DEFAULT 1"),
         ("claimed_by", "INTEGER"),
         ("claimed_at", "TEXT"),
@@ -203,6 +204,10 @@ _SQLITE_TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
         ("url", "TEXT PRIMARY KEY"),
         ("added_at", "TEXT"),
     ],
+    "eren_generators": [
+        ("user_id", "INTEGER PRIMARY KEY"),
+        ("granted_at", "TEXT"),
+    ],
 }
 
 _STATS_TABLE_SCHEMA = [
@@ -221,7 +226,7 @@ def _sqlite_create_table(conn: sqlite3.Connection, name: str):
     else:
         cols = _SQLITE_TABLE_SCHEMAS.get(name)
     if cols is None:
-        # Unknown collection: create an empty default table with an INTEGER _id
+        # Unknown collection: create a default table with an INTEGER _id
         sql = f'CREATE TABLE IF NOT EXISTS "{name}" (_id INTEGER PRIMARY KEY AUTOINCREMENT)'
         conn.execute(sql)
         return
@@ -244,6 +249,18 @@ def _get_sqlite_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+
+    # Register Postgres-compat SQL functions so `DEFAULT NOW()` / `NOW()`
+    # in DDL and DML work without modification.
+    conn.create_function(
+        "NOW", 0,
+        lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    conn.create_function(
+        "CURRENT_TIMESTAMP_PG", 0,
+        lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
     with _SQLITE_LOCK:
         for name in list(_SQLITE_TABLE_SCHEMAS.keys()):
             _sqlite_create_table(conn, name)
@@ -346,16 +363,13 @@ def _filter_to_where(filter_dict: Optional[dict]) -> Tuple[str, list]:
                     clauses.append(f'("{key}" NOT IN ({ph}) OR "{key}" IS NULL)')
                     params.extend([_adapt_sqlite_value(v) for v in opval])
                 elif op == "$regex":
-                    # Very coarse translation, "%pattern%"-style
                     pattern = str(opval).strip("^$")
                     pattern = pattern.replace(".*", "%").replace(".", "_")
                     clauses.append(f'"{key}" LIKE ?')
                     params.append(pattern)
                 elif op == "$type":
-                    # Cannot faithfully translate; skip
                     continue
                 else:
-                    # Unknown operator: ignore
                     continue
         elif val is None:
             clauses.append(f'"{key}" IS NULL')
@@ -464,7 +478,6 @@ class SQLiteCollectionShim:
         existing = set(self._existing_columns())
         for col in doc.keys():
             if col not in existing and not col.startswith("$"):
-                # For arbitrary fields on pending_feedback we go through _data instead
                 if self.name == "pending_feedback" and col not in ("_id", "created_at", "_data"):
                     continue
                 try:
@@ -478,7 +491,6 @@ class SQLiteCollectionShim:
         doc: Dict[str, Any] = {}
         for c, v in zip(cols, row):
             doc[c] = _deadapt_sqlite_value(v)
-        # Unpack pending_feedback JSON blob
         if self.name == "pending_feedback" and "_data" in doc:
             blob = doc.pop("_data")
             if isinstance(blob, dict):
@@ -493,7 +505,6 @@ class SQLiteCollectionShim:
             if projection.get("_id", 1) and "_id" in doc:
                 out["_id"] = doc["_id"]
             return out
-        # exclusion-only projection
         out = dict(doc)
         for k, v in projection.items():
             if not v and k in out and k != "_id":
@@ -538,7 +549,6 @@ class SQLiteCollectionShim:
                 cur = self.conn.execute(sql, [row[c] for c in cols])
                 self.conn.commit()
             return _SQLiteInsertResult(inserted_id=cur.lastrowid)
-        # generic path
         self._ensure_columns(doc)
         cols = [k for k in doc.keys() if not k.startswith("$")]
         vals = [_adapt_sqlite_value(doc[k]) for k in cols]
@@ -563,7 +573,6 @@ class SQLiteCollectionShim:
 
         where, params = _filter_to_where(filter_dict)
 
-        # Try UPDATE first
         if set_dict or inc_dict:
             parts = []
             upd_params = []
@@ -584,13 +593,11 @@ class SQLiteCollectionShim:
         if not upsert:
             return _SQLiteUpdateResult(0)
 
-        # Insert path
         insert_doc: Dict[str, Any] = {}
         insert_doc.update(set_on_insert)
         insert_doc.update(set_dict)
         for k, v in inc_dict.items():
             insert_doc.setdefault(k, v)
-        # Copy simple equality parts of the filter
         for k, v in (filter_dict or {}).items():
             if k.startswith("$"):
                 continue
@@ -640,7 +647,6 @@ class SQLiteCollectionShim:
             self.conn.commit()
         return _SQLiteDeleteResult(cur.rowcount)
 
-    # ---- index / DDL no-ops -------------------------------------
     def create_index(self, *args, **kwargs):
         if not self._table_exists():
             _sqlite_create_table(self.conn, self.name)
@@ -670,7 +676,7 @@ class SQLiteDBShim:
 
 
 # ───────────────────────────────────────────────────────────────
-# SQLite raw cursor wrapper (for code using get_db_connection())
+# SQL placeholder + DDL normalization for the raw cursor path
 # ───────────────────────────────────────────────────────────────
 def _sqlite_convert_placeholders(sql: str) -> str:
     # %(name)s  → :name
@@ -678,6 +684,89 @@ def _sqlite_convert_placeholders(sql: str) -> str:
     # %s        → ?
     sql = sql.replace("%s", "?")
     return sql
+
+
+def _sqlite_column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    try:
+        cur = conn.execute(f'PRAGMA table_info("{table}")')
+        return any(row[1] == column for row in cur.fetchall())
+    except sqlite3.OperationalError:
+        return False
+
+
+def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    )
+    return cur.fetchone() is not None
+
+
+def _normalize_pg_type(fragment: str) -> str:
+    """Rewrite Postgres type names/keywords to SQLite equivalents."""
+    out = fragment
+    out = re.sub(r"\bBIGINT\b", "INTEGER", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bSMALLINT\b", "INTEGER", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bSERIAL\b", "INTEGER", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bBIGSERIAL\b", "INTEGER", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bVARCHAR\s*\(\s*\d+\s*\)", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bVARCHAR\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bCHARACTER\s+VARYING\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bTIMESTAMPTZ\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bTIMESTAMP\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bDATE\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bBOOLEAN\b", "INTEGER", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bBYTEA\b", "BLOB", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bJSONB\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bJSON\b", "TEXT", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bNOW\(\)", "CURRENT_TIMESTAMP", out, flags=re.IGNORECASE)
+    return out
+
+
+def _normalize_sqlite_sql(conn: sqlite3.Connection, sql: str):
+    """
+    Translate Postgres-flavoured DDL into SQLite.
+
+    Returns a string to run, or None if the statement should be a no-op,
+    or the sentinel "__ADD_COLUMN_SKIP__" if the column already exists
+    and the ALTER should be skipped silently.
+    """
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        return None
+    upper = s.upper()
+
+    # --- ALTER TABLE ... ALTER COLUMN ... TYPE ...  (no-op in SQLite) ---
+    if re.match(r"ALTER\s+TABLE\s+\w+\s+ALTER\s+COLUMN\s+", upper):
+        return None
+
+    # --- ALTER TABLE ... ADD COLUMN [IF NOT EXISTS] col TYPE [DEFAULT ...] ---
+    m = re.match(
+        r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+"
+        r"(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(\w+)\s+(.+)$",
+        s, re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        table, col, typedef = m.groups()
+        if not _sqlite_table_exists(conn, table):
+            return None
+        if _sqlite_column_exists(conn, table, col):
+            return "__ADD_COLUMN_SKIP__"
+        typedef = _normalize_pg_type(typedef)
+        return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typedef}'
+
+    # --- CREATE TABLE / CREATE INDEX / everything else ---
+    if upper.startswith("CREATE TABLE") or upper.startswith("CREATE INDEX"):
+        s = _normalize_pg_type(s)
+        # SQLite doesn't understand "IF NOT EXISTS" on some constraint forms,
+        # but the common forms are fine. Return as-is after type rewrite.
+        return s
+
+    # --- Fallback: still rewrite NOW() and unsupported types anywhere ---
+    s = re.sub(r"\bNOW\(\)", "CURRENT_TIMESTAMP", s, flags=re.IGNORECASE)
+    s = _normalize_pg_type(s)
+    return s
 
 
 class SQLiteCursorWrapper:
@@ -692,7 +781,25 @@ class SQLiteCursorWrapper:
     def execute(self, query: str, params=None):
         if self._closed:
             raise Exception("Cursor is closed")
+
+        # 1. Placeholder translation
         sql = _sqlite_convert_placeholders(query)
+
+        # 2. DDL normalization
+        normalized = _normalize_sqlite_sql(self._conn, sql)
+
+        # 3. Fast-exit cases
+        if normalized is None:
+            self._description = None
+            self._rowcount = 0
+            return self
+        if normalized == "__ADD_COLUMN_SKIP__":
+            self._description = None
+            self._rowcount = 0
+            return self
+        sql = normalized
+
+        # 4. Bind params
         if params is None:
             sql_params: Any = ()
         elif isinstance(params, dict):
@@ -701,12 +808,23 @@ class SQLiteCursorWrapper:
             sql_params = tuple(_adapt_sqlite_value(v) for v in params)
         else:
             sql_params = (_adapt_sqlite_value(params),)
+
+        # 5. Run
         with _SQLITE_LOCK:
             try:
                 self._cursor.execute(sql, sql_params)
                 self._description = self._cursor.description
                 self._rowcount = self._cursor.rowcount
                 self._conn.commit()
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column name" in msg or "already exists" in msg:
+                    logger.debug(f"[SQLite] benign DDL skip: {e}")
+                    self._description = None
+                    self._rowcount = 0
+                    return self
+                logger.error(f"[SQLite] ERROR: {e} | SQL: {sql[:200]}")
+                raise
             except Exception as e:
                 logger.error(f"[SQLite] ERROR: {e} | SQL: {sql[:200]}")
                 raise
@@ -796,7 +914,6 @@ def _get_db():
     if _DB_BACKEND == "mongodb":
         _, db = _get_mongo_client()
         return db
-    # First call: try MongoDB, else SQLite
     try:
         _, db = _get_mongo_client()
         _DB_BACKEND = "mongodb"
@@ -815,14 +932,13 @@ def _get_db():
 def get_db_connection():
     if _DB_BACKEND == "sqlite":
         return SQLiteConnectionWrapper(_get_sqlite_conn())
-    # Default / Mongo path
     try:
         db = _get_db()
         if _DB_BACKEND == "sqlite":
             return SQLiteConnectionWrapper(_get_sqlite_conn())
         return MongoConnectionWrapper(db)
     except Exception:
-        _get_db()  # force fallback
+        _get_db()
         return SQLiteConnectionWrapper(_get_sqlite_conn())
 
 
@@ -834,7 +950,6 @@ def health_check() -> bool:
         if _DB_BACKEND == "mongodb":
             _get_mongo_client()[0].admin.command("ping")
             return True
-        # Unknown — try mongo, else fall to sqlite
         try:
             _get_mongo_client()[0].admin.command("ping")
             return True
@@ -1164,7 +1279,6 @@ class MongoCursorWrapper:
                 if handled is not None:
                     return handled
 
-            # COUNT(*) shortcut
             count_match = re.match(
                 r"SELECT\s+COUNT\(\*\)(?:\s+AS\s+\w+)?\s+FROM\s+(\w+)"
                 r"(?:\s+WHERE\s+(.+?))?;?\s*$",
@@ -1177,7 +1291,6 @@ class MongoCursorWrapper:
                 self._last_result = [(cnt,)]
                 self._rowcount = 1
                 self._result_type = "many"
-                logger.info(f"[Mongo] COUNT(*) FROM {table} WHERE {filt} -> {cnt}")
                 return self
 
             select_match = re.match(
@@ -2683,7 +2796,7 @@ def cleanup_old_pending_feedback(hours: int = 48) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════
-# INITIALIZATION (triggers MongoDB → SQLite detection)
+# INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
 try:
     # Force backend detection now.
