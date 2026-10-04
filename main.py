@@ -126,12 +126,12 @@ dp.include_router(whop_router)
 router = Router()
 dp.include_router(router)
 
-ADMIN_IDS = {6962534443, 8428369446}
+ADMIN_IDS = {6962534443, 8428369446, 8761005192}
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
-    for chat_target in ["@zlatanchatxlogs", "@Zlatanchannel"]:
+    for chat_target in ["@xcarderxhub", "https://t.me/+-lxinzzcFU41ZDU0"]:
         try:
             m = await bot.get_chat_member(chat_target, user_id)
             if m.status in ["left", "kicked"]:
@@ -220,7 +220,7 @@ def _status_sync(user_id):
 async def _get_caption(user) -> str:
     access_str, joined_str = await asyncio.to_thread(_status_sync, user.id)
     ul = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    dl = '<a href="https://t.me/Lanxo2">Carder X</a>'
+    dl = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
     return (
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {ul}\n"
         f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{user.id}</code>\n"
@@ -232,7 +232,7 @@ async def _get_caption(user) -> str:
 
 def _loading_caption(user) -> str:
     ul = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    dl = '<a href="https://t.me/Lanxo2">Carder X</a>'
+    dl = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
     return (
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {ul}\n"
         f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{user.id}</code>\n"
@@ -259,7 +259,7 @@ _MAIN_KB = {
          {"text": " 𝗕𝘂𝘆 𝗡𝗼𝘄", "callback_data": "menu_payment_methods", "icon_custom_emoji_id": "5039727497143387500", "style": "success"}],
         [{"text": " 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", "url": CHANNEL_LINK, "icon_custom_emoji_id": "5424818078833715060", "style": "primary"},
          {"text": " 𝗚𝗿𝗼𝘂𝗽", "url": GROUP_LINK, "icon_custom_emoji_id": "6237927637906364256", "style": "success"}],
-        [{"text": " 𝗦𝘂𝗽𝗽𝗼𝗿𝘁", "url": "https://t.me/Lanxo2", "icon_custom_emoji_id": "5040030395416969985", "style": "danger"},
+        [{"text": " 𝗦𝘂𝗽𝗽𝗼𝗿𝘁", "url": "https://t.me/oozaruh", "icon_custom_emoji_id": "5040030395416969985", "style": "danger"},
          {"text": " 𝗣𝗿𝗼𝘅𝘆", "callback_data": "menu_proxy", "icon_custom_emoji_id": "5039895103947146186", "style": "primary"}]
     ]
 }
