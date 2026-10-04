@@ -529,7 +529,7 @@ async def send_user_hit_notification(bot: Bot, session, cc_formatted, cc_num, re
 
         gif_url = await get_anime_gif()
         user_link = build_user_link(user_obj)
-        dev_link = '<a href="https://t.me/Lanxo2">CARDER X</a>'
+        dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">CARDER X</a>'
         user_display = f"{user_link} ({plan_name})"
 
         if hit_type == "CHARGED":
@@ -764,7 +764,7 @@ async def update_progress_message(bot: Bot, session_id):
         f"<b>❌ 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
         f"<b>⚠️ 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
         f"<b>⚡ 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
-        f"<b>🐈‍⬛ 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
+        f"<b>🐈‍⬛ 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/+-lxinzzcFU41ZDU0'>Carder X</a>\n"
         f"<b>🆔 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
@@ -1191,7 +1191,7 @@ async def mst_command(message: types.Message):
         f"<b>❌ 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
         f"<b>⚠️ 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
         f"<b>⚡ 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
-        f"<b>🐈‍⬛ 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
+        f"<b>🐈‍⬛ 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/+-lxinzzcFU41ZDU0'>Carder X</a>\n"
         f"<b>🆔 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
