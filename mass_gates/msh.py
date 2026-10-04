@@ -998,7 +998,7 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
     user_link = build_user_link(user_obj)
     gateway_display = html_escape(f"Shopify {price} USD")
     safe_response = html_escape(str(response_msg))
-    dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
+    dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
     user_display = f"{user_link} ({plan_name})"
     safe_proxy = str(proxy_status_formatted)
 
@@ -1016,7 +1016,7 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="CARDER X", url="https://t.me/xcarderxbot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     await _safe_send_animation_or_text(
@@ -1037,7 +1037,7 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
     safe_proxy = str(proxy_status_formatted)
     gif_url = await get_anime_gif()
     user_link = build_user_link(user_obj)
-    dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
+    dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
     user_display = f"{user_link} ({plan_name})"
 
     caption = (
@@ -1053,7 +1053,7 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="CARDER X", url="https://t.me/xcarderxbot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     try:
@@ -1087,7 +1087,7 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
     safe_proxy = str(proxy_status_formatted)
     gif_url = await get_anime_gif()
     user_link = build_user_link(user_obj)
-    dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
+    dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
     user_display = f"{user_link} ({plan_name})"
 
     caption = (
@@ -1103,7 +1103,7 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Carder X", url="https://t.me/zlatanchecker_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="Carder X", url="https://t.me/xcarderxbot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     try:
@@ -1220,7 +1220,7 @@ async def update_progress_message(bot: Bot, session_id):
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/+-lxinzzcFU41ZDU0'>Carder X</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
@@ -2026,7 +2026,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/Lanxo2'>Carder X</a>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/+-lxinzzcFU41ZDU0'>Carder X</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
