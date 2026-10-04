@@ -1,13 +1,16 @@
 """
 MongoDB Database Module for Railway.com Deployment
-Drop-in replacement for database1.py with MongoDB backend.
+with automatic SQLite fallback when MongoDB is unavailable.
 """
 
 import os
 import sys
+import json
 import types
 import logging
 import re
+import sqlite3
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -19,14 +22,19 @@ logger = logging.getLogger(__name__)
 
 _IS_SQLITE_MODE = False
 _IS_MONGODB_MODE = True
+_DB_BACKEND = None  # "mongodb" or "sqlite"
 
+
+# ═══════════════════════════════════════════════════════════════
+# psycopg2 MOCKS (unchanged)
+# ═══════════════════════════════════════════════════════════════
 def _setup_psycopg2_mocks():
     try:
         import psycopg2, psycopg2.pool, psycopg2.extensions, psycopg2.extras
-        logger.info("psycopg2 found - using MongoDB backend (psycopg2 mocked)")
+        logger.info("psycopg2 found - using MongoDB/SQLite backend (psycopg2 mocked)")
         return False
     except ImportError:
-        logger.info("psycopg2 not found - injecting mocks for MongoDB compatibility")
+        logger.info("psycopg2 not found - injecting mocks for compatibility")
         class MockModule(types.ModuleType):
             def __getattr__(self, name):
                 if name == "RealDictCursor": return dict
@@ -49,6 +57,10 @@ def _setup_psycopg2_mocks():
 
 _setup_psycopg2_mocks()
 
+
+# ═══════════════════════════════════════════════════════════════
+# MONGODB CONFIG
+# ═══════════════════════════════════════════════════════════════
 DB_CONFIG = {
     "host": os.environ.get("MONGODB_HOST", "localhost"),
     "database": os.environ.get("MONGODB_DB", "freshbot"),
@@ -56,6 +68,7 @@ DB_CONFIG = {
     "password": os.environ.get("MONGODB_PASSWORD", ""),
     "port": int(os.environ.get("MONGODB_PORT", "27017")),
 }
+
 
 def _get_mongodb_uri() -> str:
     for env_var in ["MONGODB_URI", "MONGO_URL", "MONGODB_URL"]:
@@ -71,68 +84,780 @@ def _get_mongodb_uri() -> str:
     logger.warning(f"No MongoDB URI found in env, using fallback: {fallback}")
     return fallback
 
+
 def _get_db_name() -> str:
     uri = _get_mongodb_uri()
     match = re.search(r"/([^/?]+)(\?|$)", uri)
     return match.group(1) if match else "freshbot"
 
+
 _mongo_client = None
 _mongo_db = None
+
 
 def _get_mongo_client():
     global _mongo_client, _mongo_db
     if _mongo_client is not None:
         return _mongo_client, _mongo_db
-    try:
-        from pymongo import MongoClient
-        import certifi
-        uri = _get_mongodb_uri()
-        needs_tls = "mongodb+srv" in uri or "tls=true" in uri or "ssl=true" in uri
-        client = MongoClient(
-            uri,
-            maxPoolSize=100, minPoolSize=10, maxIdleTimeMS=45000,
-            serverSelectionTimeoutMS=5000,
-            tlsCAFile=certifi.where() if needs_tls else None
-        )
-        client.admin.command("ping")
-        db_name = _get_db_name()
-        db = client[db_name]
-        _mongo_client = client
-        _mongo_db = db
-        logger.info(f"MongoDB connected successfully to database: {db_name}")
-        return client, db
-    except ImportError:
-        logger.error("pymongo not installed. Add 'pymongo>=4.0' and 'certifi' to requirements.txt")
-        raise
-    except Exception as e:
-        logger.error(f"Failed to connect to MongoDB: {e}")
-        raise
+    from pymongo import MongoClient
+    import certifi
+    uri = _get_mongodb_uri()
+    needs_tls = "mongodb+srv" in uri or "tls=true" in uri or "ssl=true" in uri
+    client = MongoClient(
+        uri,
+        maxPoolSize=100, minPoolSize=10, maxIdleTimeMS=45000,
+        serverSelectionTimeoutMS=5000,
+        tlsCAFile=certifi.where() if needs_tls else None
+    )
+    client.admin.command("ping")
+    db_name = _get_db_name()
+    db = client[db_name]
+    _mongo_client = client
+    _mongo_db = db
+    logger.info(f"MongoDB connected successfully to database: {db_name}")
+    return client, db
 
+
+# ═══════════════════════════════════════════════════════════════
+# SQLITE BACKEND
+# ═══════════════════════════════════════════════════════════════
+_SQLITE_LOCK = threading.Lock()
+_sqlite_conn: Optional[sqlite3.Connection] = None
+_sqlite_db_shim: Optional["SQLiteDBShim"] = None
+
+
+# Column schemas: (col_name, sql_type)
+_SQLITE_TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
+    "users": [
+        ("user_id", "INTEGER PRIMARY KEY"),
+        ("username", "TEXT"),
+        ("first_name", "TEXT"),
+        ("credits", "INTEGER DEFAULT 150"),
+        ("is_premium", "INTEGER DEFAULT 0"),
+        ("premium_expiry", "TEXT"),
+        ("cc_checked", "INTEGER DEFAULT 0"),
+        ("cc_charged", "INTEGER DEFAULT 0"),
+        ("joined_at", "TEXT"),
+    ],
+    "proxies": [
+        ("user_id", "INTEGER"),
+        ("proxy", "TEXT"),
+        ("added_at", "TEXT"),
+        ("PRIMARY KEY (user_id, proxy)", ""),
+    ],
+    "receipts": [
+        ("receipt_id", "TEXT PRIMARY KEY"),
+        ("user_id", "INTEGER"),
+        ("amount", "REAL"),
+        ("currency", "TEXT"),
+        ("metadata", "TEXT"),
+        ("plan", "TEXT"),
+        ("purchased_on", "TEXT"),
+        ("expires_on", "TEXT"),
+        ("created_at", "TEXT"),
+    ],
+    "codes": [
+        ("code", "TEXT PRIMARY KEY"),
+        ("duration_days", "INTEGER"),
+        ("max_uses", "INTEGER DEFAULT 1"),
+        ("claimed_by", "INTEGER"),
+        ("claimed_at", "TEXT"),
+        ("created_at", "TEXT"),
+    ],
+    "plan_keys": [
+        ("key", "TEXT PRIMARY KEY"),
+        ("duration_days", "INTEGER"),
+        ("max_uses", "INTEGER DEFAULT 1"),
+        ("claimed_by", "INTEGER"),
+        ("claimed_at", "TEXT"),
+        ("created_at", "TEXT"),
+    ],
+    "gate_status": [
+        ("gate", "TEXT PRIMARY KEY"),
+        ("is_enabled", "INTEGER DEFAULT 1"),
+        ("updated_at", "TEXT"),
+    ],
+    "banned_users": [
+        ("user_id", "INTEGER PRIMARY KEY"),
+        ("reason", "TEXT"),
+        ("banned_at", "TEXT"),
+    ],
+    "user_sites": [
+        ("user_id", "INTEGER"),
+        ("url", "TEXT"),
+        ("price", "REAL DEFAULT 0"),
+        ("added_at", "TEXT"),
+        ("PRIMARY KEY (user_id, url)", ""),
+    ],
+    "pending_feedback": [
+        ("_id", "TEXT PRIMARY KEY"),
+        ("created_at", "TEXT"),
+        ("_data", "TEXT"),  # JSON blob for arbitrary fields
+    ],
+    "settings": [
+        ("key", "TEXT PRIMARY KEY"),
+        ("value", "TEXT"),  # JSON-encoded
+        ("updated_at", "TEXT"),
+    ],
+    "global_sites": [
+        ("url", "TEXT PRIMARY KEY"),
+        ("added_at", "TEXT"),
+    ],
+}
+
+_STATS_TABLE_SCHEMA = [
+    ("_id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("user_id", "INTEGER"),
+    ("status", "TEXT"),
+    ("timestamp", "TEXT"),
+    ("extra", "TEXT"),
+]
+
+
+def _sqlite_create_table(conn: sqlite3.Connection, name: str):
+    """Create a table if it doesn't exist yet."""
+    if name.endswith("_stats") and name not in _SQLITE_TABLE_SCHEMAS:
+        cols = _STATS_TABLE_SCHEMA
+    else:
+        cols = _SQLITE_TABLE_SCHEMAS.get(name)
+    if cols is None:
+        # Unknown collection: create an empty default table with an INTEGER _id
+        sql = f'CREATE TABLE IF NOT EXISTS "{name}" (_id INTEGER PRIMARY KEY AUTOINCREMENT)'
+        conn.execute(sql)
+        return
+    pieces = []
+    for cname, ctype in cols:
+        if cname.startswith("PRIMARY KEY") or cname.startswith("UNIQUE") or cname.startswith("FOREIGN"):
+            pieces.append(cname)
+        else:
+            pieces.append(f'"{cname}" {ctype}'.strip())
+    sql = f'CREATE TABLE IF NOT EXISTS "{name}" ({", ".join(pieces)})'
+    conn.execute(sql)
+
+
+def _get_sqlite_conn() -> sqlite3.Connection:
+    global _sqlite_conn
+    if _sqlite_conn is not None:
+        return _sqlite_conn
+    db_path = os.environ.get("SQLITE_PATH", "freshbot.db")
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    with _SQLITE_LOCK:
+        for name in list(_SQLITE_TABLE_SCHEMAS.keys()):
+            _sqlite_create_table(conn, name)
+        for gate in ["ST", "STR", "PF", "VBV", "FT", "BL", "PP", "AT", "PW", "PYU"]:
+            _sqlite_create_table(conn, f"{gate}_stats")
+        conn.commit()
+    _sqlite_conn = conn
+    logger.info(f"SQLite fallback connected: {db_path}")
+    return conn
+
+
+# ───────────────────────────────────────────────────────────────
+# MongoDB-filter → SQL WHERE translator (used by the shim)
+# ───────────────────────────────────────────────────────────────
+def _adapt_sqlite_value(val):
+    if isinstance(val, datetime):
+        return val.isoformat()
+    if isinstance(val, bool):
+        return 1 if val else 0
+    if isinstance(val, (dict, list)):
+        return json.dumps(val)
+    return val
+
+
+def _deadapt_sqlite_value(val):
+    if isinstance(val, str):
+        if len(val) >= 10 and val[4] == "-" and val[7] == "-" and "T" in val:
+            try:
+                return datetime.fromisoformat(val)
+            except Exception:
+                pass
+        if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
+            try:
+                return json.loads(val)
+            except Exception:
+                pass
+    return val
+
+
+def _filter_to_where(filter_dict: Optional[dict]) -> Tuple[str, list]:
+    """Convert a pymongo-style filter dict into a SQL WHERE clause + params."""
+    if not filter_dict:
+        return "1=1", []
+    clauses: List[str] = []
+    params: List[Any] = []
+    for key, val in filter_dict.items():
+        if key == "$or":
+            sub = []
+            for item in val:
+                sc, sp = _filter_to_where(item)
+                sub.append(f"({sc})")
+                params.extend(sp)
+            clauses.append("(" + " OR ".join(sub) + ")")
+            continue
+        if key == "$and":
+            sub = []
+            for item in val:
+                sc, sp = _filter_to_where(item)
+                sub.append(f"({sc})")
+                params.extend(sp)
+            clauses.append("(" + " AND ".join(sub) + ")")
+            continue
+        if isinstance(val, dict):
+            for op, opval in val.items():
+                if op == "$eq":
+                    if opval is None:
+                        clauses.append(f'"{key}" IS NULL')
+                    else:
+                        clauses.append(f'"{key}" = ?')
+                        params.append(_adapt_sqlite_value(opval))
+                elif op == "$ne":
+                    if opval is None:
+                        clauses.append(f'"{key}" IS NOT NULL')
+                    else:
+                        clauses.append(f'("{key}" != ? OR "{key}" IS NULL)')
+                        params.append(_adapt_sqlite_value(opval))
+                elif op == "$gt":
+                    clauses.append(f'"{key}" > ?')
+                    params.append(_adapt_sqlite_value(opval))
+                elif op == "$gte":
+                    clauses.append(f'"{key}" >= ?')
+                    params.append(_adapt_sqlite_value(opval))
+                elif op == "$lt":
+                    clauses.append(f'"{key}" < ?')
+                    params.append(_adapt_sqlite_value(opval))
+                elif op == "$lte":
+                    clauses.append(f'"{key}" <= ?')
+                    params.append(_adapt_sqlite_value(opval))
+                elif op == "$in":
+                    if not opval:
+                        clauses.append("0=1")
+                        continue
+                    ph = ",".join(["?"] * len(opval))
+                    clauses.append(f'"{key}" IN ({ph})')
+                    params.extend([_adapt_sqlite_value(v) for v in opval])
+                elif op == "$nin":
+                    if not opval:
+                        continue
+                    ph = ",".join(["?"] * len(opval))
+                    clauses.append(f'("{key}" NOT IN ({ph}) OR "{key}" IS NULL)')
+                    params.extend([_adapt_sqlite_value(v) for v in opval])
+                elif op == "$regex":
+                    # Very coarse translation, "%pattern%"-style
+                    pattern = str(opval).strip("^$")
+                    pattern = pattern.replace(".*", "%").replace(".", "_")
+                    clauses.append(f'"{key}" LIKE ?')
+                    params.append(pattern)
+                elif op == "$type":
+                    # Cannot faithfully translate; skip
+                    continue
+                else:
+                    # Unknown operator: ignore
+                    continue
+        elif val is None:
+            clauses.append(f'"{key}" IS NULL')
+        else:
+            clauses.append(f'"{key}" = ?')
+            params.append(_adapt_sqlite_value(val))
+    if not clauses:
+        return "1=1", []
+    return " AND ".join(clauses), params
+
+
+# ───────────────────────────────────────────────────────────────
+# SQLite result shims
+# ───────────────────────────────────────────────────────────────
+class _SQLiteUpdateResult:
+    def __init__(self, modified_count=0, upserted_id=None, matched_count=0):
+        self.modified_count = modified_count
+        self.matched_count = matched_count
+        self.upserted_id = upserted_id
+
+
+class _SQLiteInsertResult:
+    def __init__(self, inserted_id=None):
+        self.inserted_id = inserted_id
+
+
+class _SQLiteDeleteResult:
+    def __init__(self, deleted_count=0):
+        self.deleted_count = deleted_count
+
+
+class _SQLiteFindCursor:
+    """Minimal cursor mimicking pymongo's find() return value."""
+
+    def __init__(self, coll: "SQLiteCollectionShim", filter_dict, projection):
+        self._coll = coll
+        self._filter = filter_dict or {}
+        self._projection = projection
+        self._sort = None
+        self._limit = None
+        self._skip = None
+
+    def sort(self, spec):
+        self._sort = spec
+        return self
+
+    def limit(self, n):
+        self._limit = n
+        return self
+
+    def skip(self, n):
+        self._skip = n
+        return self
+
+    def _build_sql(self):
+        where, params = _filter_to_where(self._filter)
+        sql = f'SELECT * FROM "{self._coll.name}" WHERE {where}'
+        if self._sort:
+            order = ", ".join(
+                f'"{f}" {"DESC" if d == -1 else "ASC"}' for f, d in self._sort
+            )
+            sql += f" ORDER BY {order}"
+        if self._limit is not None:
+            sql += f" LIMIT {int(self._limit)}"
+        if self._skip is not None:
+            sql += f" OFFSET {int(self._skip)}"
+        return sql, params
+
+    def __iter__(self):
+        sql, params = self._build_sql()
+        with _SQLITE_LOCK:
+            cur = self._coll.conn.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+        for row in rows:
+            doc = self._coll._row_to_doc(cols, row)
+            if self._projection:
+                doc = self._coll._apply_projection(doc, self._projection)
+            yield doc
+
+
+# ───────────────────────────────────────────────────────────────
+# SQLite collection shim
+# ───────────────────────────────────────────────────────────────
+class SQLiteCollectionShim:
+    def __init__(self, conn: sqlite3.Connection, name: str):
+        self.conn = conn
+        self.name = name
+
+    # ---- helpers -------------------------------------------------
+    def _table_exists(self) -> bool:
+        cur = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (self.name,),
+        )
+        return cur.fetchone() is not None
+
+    def _existing_columns(self) -> List[str]:
+        if not self._table_exists():
+            _sqlite_create_table(self.conn, self.name)
+            self.conn.commit()
+        cur = self.conn.execute(f'PRAGMA table_info("{self.name}")')
+        return [row[1] for row in cur.fetchall()]
+
+    def _ensure_columns(self, doc: dict):
+        existing = set(self._existing_columns())
+        for col in doc.keys():
+            if col not in existing and not col.startswith("$"):
+                # For arbitrary fields on pending_feedback we go through _data instead
+                if self.name == "pending_feedback" and col not in ("_id", "created_at", "_data"):
+                    continue
+                try:
+                    self.conn.execute(
+                        f'ALTER TABLE "{self.name}" ADD COLUMN "{col}" TEXT'
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
+    def _row_to_doc(self, cols, row) -> Dict[str, Any]:
+        doc: Dict[str, Any] = {}
+        for c, v in zip(cols, row):
+            doc[c] = _deadapt_sqlite_value(v)
+        # Unpack pending_feedback JSON blob
+        if self.name == "pending_feedback" and "_data" in doc:
+            blob = doc.pop("_data")
+            if isinstance(blob, dict):
+                for k, v in blob.items():
+                    doc.setdefault(k, v)
+        return doc
+
+    def _apply_projection(self, doc: dict, projection: dict) -> dict:
+        include = [k for k, v in projection.items() if v and k != "_id"]
+        if include:
+            out = {k: doc[k] for k in include if k in doc}
+            if projection.get("_id", 1) and "_id" in doc:
+                out["_id"] = doc["_id"]
+            return out
+        # exclusion-only projection
+        out = dict(doc)
+        for k, v in projection.items():
+            if not v and k in out and k != "_id":
+                out.pop(k, None)
+        if projection.get("_id", 1) == 0:
+            out.pop("_id", None)
+        return out
+
+    # ---- CRUD ----------------------------------------------------
+    def find_one(self, filter_dict=None, projection=None, sort=None):
+        cur = self.find(filter_dict or {}, projection)
+        if sort:
+            cur = cur.sort(sort)
+        cur = cur.limit(1)
+        for doc in cur:
+            return doc
+        return None
+
+    def find(self, filter_dict=None, projection=None):
+        return _SQLiteFindCursor(self, filter_dict or {}, projection)
+
+    def count_documents(self, filter_dict=None):
+        where, params = _filter_to_where(filter_dict or {})
+        cur = self.conn.execute(
+            f'SELECT COUNT(*) FROM "{self.name}" WHERE {where}', params
+        )
+        return cur.fetchone()[0]
+
+    def insert_one(self, doc: dict):
+        doc = dict(doc)
+        if self.name == "pending_feedback":
+            data = {k: v for k, v in doc.items() if k not in ("_id", "created_at", "_data")}
+            row = {
+                "_id": doc.get("_id"),
+                "created_at": _adapt_sqlite_value(doc.get("created_at")),
+                "_data": json.dumps(data, default=str),
+            }
+            cols = list(row.keys())
+            ph = ",".join(["?"] * len(cols))
+            sql = f'INSERT OR REPLACE INTO "{self.name}" ({",".join(cols)}) VALUES ({ph})'
+            with _SQLITE_LOCK:
+                cur = self.conn.execute(sql, [row[c] for c in cols])
+                self.conn.commit()
+            return _SQLiteInsertResult(inserted_id=cur.lastrowid)
+        # generic path
+        self._ensure_columns(doc)
+        cols = [k for k in doc.keys() if not k.startswith("$")]
+        vals = [_adapt_sqlite_value(doc[k]) for k in cols]
+        ph = ",".join(["?"] * len(cols))
+        sql = f'INSERT INTO "{self.name}" ({",".join(chr(34)+c+chr(34) for c in cols)}) VALUES ({ph})'
+        with _SQLITE_LOCK:
+            cur = self.conn.execute(sql, vals)
+            self.conn.commit()
+        return _SQLiteInsertResult(inserted_id=cur.lastrowid)
+
+    def replace_one(self, filter_dict: dict, doc: dict, upsert: bool = False):
+        where, params = _filter_to_where(filter_dict)
+        with _SQLITE_LOCK:
+            self.conn.execute(f'DELETE FROM "{self.name}" WHERE {where}', params)
+            self.conn.commit()
+        return self.insert_one(doc)
+
+    def _apply_update(self, filter_dict, update_op, upsert: bool) -> _SQLiteUpdateResult:
+        set_dict = dict(update_op.get("$set", {}))
+        inc_dict = dict(update_op.get("$inc", {}))
+        set_on_insert = dict(update_op.get("$setOnInsert", {}))
+
+        where, params = _filter_to_where(filter_dict)
+
+        # Try UPDATE first
+        if set_dict or inc_dict:
+            parts = []
+            upd_params = []
+            for k, v in set_dict.items():
+                parts.append(f'"{k}" = ?')
+                upd_params.append(_adapt_sqlite_value(v))
+            for k, v in inc_dict.items():
+                parts.append(f'"{k}" = COALESCE("{k}", 0) + ?')
+                upd_params.append(_adapt_sqlite_value(v))
+            sql = f'UPDATE "{self.name}" SET {", ".join(parts)} WHERE {where}'
+            with _SQLITE_LOCK:
+                cur = self.conn.execute(sql, upd_params + params)
+                modified = cur.rowcount
+                self.conn.commit()
+            if modified > 0:
+                return _SQLiteUpdateResult(modified_count=modified, matched_count=modified)
+
+        if not upsert:
+            return _SQLiteUpdateResult(0)
+
+        # Insert path
+        insert_doc: Dict[str, Any] = {}
+        insert_doc.update(set_on_insert)
+        insert_doc.update(set_dict)
+        for k, v in inc_dict.items():
+            insert_doc.setdefault(k, v)
+        # Copy simple equality parts of the filter
+        for k, v in (filter_dict or {}).items():
+            if k.startswith("$"):
+                continue
+            if isinstance(v, dict):
+                continue
+            insert_doc.setdefault(k, v)
+
+        self._ensure_columns(insert_doc)
+        cols = [c for c in insert_doc.keys() if not c.startswith("$")]
+        vals = [_adapt_sqlite_value(insert_doc[c]) for c in cols]
+        ph = ",".join(["?"] * len(cols))
+        sql = (
+            f'INSERT OR IGNORE INTO "{self.name}" '
+            f'({",".join(chr(34)+c+chr(34) for c in cols)}) VALUES ({ph})'
+        )
+        with _SQLITE_LOCK:
+            cur = self.conn.execute(sql, vals)
+            self.conn.commit()
+        if cur.rowcount > 0:
+            return _SQLiteUpdateResult(modified_count=0, upserted_id="new")
+        return _SQLiteUpdateResult(0)
+
+    def update_one(self, filter_dict, update_op, upsert: bool = False):
+        return self._apply_update(filter_dict, update_op, upsert)
+
+    def update_many(self, filter_dict, update_op):
+        return self._apply_update(filter_dict, update_op, upsert=False)
+
+    def find_one_and_update(self, filter_dict, update_op, return_document=True, **kwargs):
+        res = self._apply_update(filter_dict, update_op, upsert=False)
+        if res.modified_count > 0:
+            simple = {k: v for k, v in (filter_dict or {}).items() if not isinstance(v, dict)}
+            return self.find_one(simple)
+        return None
+
+    def delete_one(self, filter_dict):
+        where, params = _filter_to_where(filter_dict)
+        with _SQLITE_LOCK:
+            cur = self.conn.execute(f'DELETE FROM "{self.name}" WHERE {where}', params)
+            self.conn.commit()
+        return _SQLiteDeleteResult(cur.rowcount)
+
+    def delete_many(self, filter_dict):
+        where, params = _filter_to_where(filter_dict)
+        with _SQLITE_LOCK:
+            cur = self.conn.execute(f'DELETE FROM "{self.name}" WHERE {where}', params)
+            self.conn.commit()
+        return _SQLiteDeleteResult(cur.rowcount)
+
+    # ---- index / DDL no-ops -------------------------------------
+    def create_index(self, *args, **kwargs):
+        if not self._table_exists():
+            _sqlite_create_table(self.conn, self.name)
+            self.conn.commit()
+        return None
+
+    def drop(self):
+        with _SQLITE_LOCK:
+            self.conn.execute(f'DROP TABLE IF EXISTS "{self.name}"')
+            self.conn.commit()
+
+
+class SQLiteDBShim:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+        self._collections: Dict[str, SQLiteCollectionShim] = {}
+
+    def __getitem__(self, name: str) -> SQLiteCollectionShim:
+        if name not in self._collections:
+            self._collections[name] = SQLiteCollectionShim(self.conn, name)
+        return self._collections[name]
+
+    def __getattr__(self, name: str) -> SQLiteCollectionShim:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self[name]
+
+
+# ───────────────────────────────────────────────────────────────
+# SQLite raw cursor wrapper (for code using get_db_connection())
+# ───────────────────────────────────────────────────────────────
+def _sqlite_convert_placeholders(sql: str) -> str:
+    # %(name)s  → :name
+    sql = re.sub(r"%\((\w+)\)s", r":\1", sql)
+    # %s        → ?
+    sql = sql.replace("%s", "?")
+    return sql
+
+
+class SQLiteCursorWrapper:
+    def __init__(self, conn: sqlite3.Connection, cursor_factory=None):
+        self._conn = conn
+        self._cursor = conn.cursor()
+        self.cursor_factory = cursor_factory
+        self._closed = False
+        self._description = None
+        self._rowcount = -1
+
+    def execute(self, query: str, params=None):
+        if self._closed:
+            raise Exception("Cursor is closed")
+        sql = _sqlite_convert_placeholders(query)
+        if params is None:
+            sql_params: Any = ()
+        elif isinstance(params, dict):
+            sql_params = {k: _adapt_sqlite_value(v) for k, v in params.items()}
+        elif isinstance(params, (list, tuple)):
+            sql_params = tuple(_adapt_sqlite_value(v) for v in params)
+        else:
+            sql_params = (_adapt_sqlite_value(params),)
+        with _SQLITE_LOCK:
+            try:
+                self._cursor.execute(sql, sql_params)
+                self._description = self._cursor.description
+                self._rowcount = self._cursor.rowcount
+                self._conn.commit()
+            except Exception as e:
+                logger.error(f"[SQLite] ERROR: {e} | SQL: {sql[:200]}")
+                raise
+        return self
+
+    @property
+    def description(self):
+        return self._description
+
+    @property
+    def rowcount(self):
+        return self._rowcount
+
+    def _row_to_dict(self, row):
+        return {k: _deadapt_sqlite_value(row[k]) for k in row.keys()}
+
+    def fetchone(self):
+        if self._closed:
+            raise Exception("Cursor is closed")
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        if self.cursor_factory:
+            return self._row_to_dict(row)
+        return tuple(row)
+
+    def fetchall(self):
+        if self._closed:
+            raise Exception("Cursor is closed")
+        rows = self._cursor.fetchall()
+        if self.cursor_factory:
+            return [self._row_to_dict(r) for r in rows]
+        return [tuple(r) for r in rows]
+
+    def close(self):
+        try:
+            self._cursor.close()
+        finally:
+            self._closed = True
+
+
+class SQLiteConnectionWrapper:
+    def __init__(self, conn: sqlite3.Connection, cursor_factory=None):
+        self._conn = conn
+        self.cursor_factory = cursor_factory
+        self._closed = False
+
+    @property
+    def closed(self):
+        return 1 if self._closed else 0
+
+    @property
+    def status(self):
+        return 0
+
+    def cursor(self, cursor_factory=None):
+        factory = cursor_factory or self.cursor_factory
+        return SQLiteCursorWrapper(self._conn, factory)
+
+    def commit(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def rollback(self):
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
+    def close(self):
+        # Do NOT actually close the shared SQLite connection — the pool
+        # owns it. Just mark this wrapper as closed.
+        self._closed = True
+
+
+# ───────────────────────────────────────────────────────────────
+# Unified DB accessor with MongoDB → SQLite fallback
+# ───────────────────────────────────────────────────────────────
 def _get_db():
-    _, db = _get_mongo_client()
-    return db
+    global _DB_BACKEND, _sqlite_db_shim, _IS_SQLITE_MODE, _IS_MONGODB_MODE
+    if _DB_BACKEND == "sqlite":
+        if _sqlite_db_shim is None:
+            _sqlite_db_shim = SQLiteDBShim(_get_sqlite_conn())
+        return _sqlite_db_shim
+    if _DB_BACKEND == "mongodb":
+        _, db = _get_mongo_client()
+        return db
+    # First call: try MongoDB, else SQLite
+    try:
+        _, db = _get_mongo_client()
+        _DB_BACKEND = "mongodb"
+        _IS_MONGODB_MODE = True
+        _IS_SQLITE_MODE = False
+        return db
+    except Exception as e:
+        logger.warning(f"MongoDB unavailable ({e}) - falling back to SQLite")
+        _DB_BACKEND = "sqlite"
+        _IS_MONGODB_MODE = False
+        _IS_SQLITE_MODE = True
+        _sqlite_db_shim = SQLiteDBShim(_get_sqlite_conn())
+        return _sqlite_db_shim
+
+
+def get_db_connection():
+    if _DB_BACKEND == "sqlite":
+        return SQLiteConnectionWrapper(_get_sqlite_conn())
+    # Default / Mongo path
+    try:
+        db = _get_db()
+        if _DB_BACKEND == "sqlite":
+            return SQLiteConnectionWrapper(_get_sqlite_conn())
+        return MongoConnectionWrapper(db)
+    except Exception:
+        _get_db()  # force fallback
+        return SQLiteConnectionWrapper(_get_sqlite_conn())
+
 
 def health_check() -> bool:
     try:
-        client, _ = _get_mongo_client()
-        client.admin.command("ping")
-        return True
+        if _DB_BACKEND == "sqlite":
+            _get_sqlite_conn().execute("SELECT 1")
+            return True
+        if _DB_BACKEND == "mongodb":
+            _get_mongo_client()[0].admin.command("ping")
+            return True
+        # Unknown — try mongo, else fall to sqlite
+        try:
+            _get_mongo_client()[0].admin.command("ping")
+            return True
+        except Exception:
+            _get_db()
+            _get_sqlite_conn().execute("SELECT 1")
+            return True
     except Exception as e:
-        logger.error(f"MongoDB health check failed: {e}")
+        logger.error(f"Health check failed: {e}")
         return False
 
-# ═══════════════════════════════════════════════════════════════
-# UTILITY: Convert ISO date strings to datetime objects in documents
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# Utility: convert ISO date strings to datetime objects
+# ═══════════════════════════════════════════════════════════════
 def _convert_dates_in_doc(doc):
     if isinstance(doc, dict):
         for key, value in doc.items():
             if isinstance(value, str):
                 try:
-                    if 'T' in value and ':' in value and '-' in value:
+                    if "T" in value and ":" in value and "-" in value:
                         doc[key] = datetime.fromisoformat(value)
-                except:
+                except Exception:
                     pass
             elif isinstance(value, dict):
                 _convert_dates_in_doc(value)
@@ -141,10 +866,10 @@ def _convert_dates_in_doc(doc):
                     _convert_dates_in_doc(item)
     return doc
 
-# ═══════════════════════════════════════════════════════════════
-# SQL PARAMETER SUBSTITUTION
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# SQL parameter substitution (used by MongoDB cursor)
+# ═══════════════════════════════════════════════════════════════
 def _substitute_params(query: str, params) -> str:
     if params is None:
         return query
@@ -170,6 +895,7 @@ def _substitute_params(query: str, params) -> str:
     logger.warning(f"Parameter count mismatch: {len(parts)-1} placeholders vs {len(params)} params")
     return query
 
+
 def _format_value(val) -> str:
     if val is None:
         return "NULL"
@@ -183,16 +909,18 @@ def _format_value(val) -> str:
         return f"'{val.replace(chr(39), chr(39)+chr(39))}'"
     return f"'{str(val).replace(chr(39), chr(39)+chr(39))}'"
 
-# ═══════════════════════════════════════════════════════════════
-# WHERE CLAUSE PARSER
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# WHERE clause parser (MongoDB side)
+# ═══════════════════════════════════════════════════════════════
 def _parse_where(where_clause: str) -> Dict[str, Any]:
     if not where_clause:
         return {}
     where_clause = where_clause.strip()
-    filt = {}
-    between_pattern = re.compile(r"(\w+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)(?:\s+AND|\s*$)", re.IGNORECASE)
+    filt: Dict[str, Any] = {}
+    between_pattern = re.compile(
+        r"(\w+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)(?:\s+AND|\s*$)", re.IGNORECASE
+    )
     between_matches = list(between_pattern.finditer(where_clause))
     if between_matches:
         for m in between_matches:
@@ -228,6 +956,7 @@ def _parse_where(where_clause: str) -> Dict[str, Any]:
             filt.update(parsed)
     return filt
 
+
 def _parse_single_condition(cond: str) -> Optional[Dict[str, Any]]:
     cond = cond.strip().strip("()").strip()
     if not cond:
@@ -250,7 +979,8 @@ def _parse_single_condition(cond: str) -> Optional[Dict[str, Any]]:
         return {m.group(1).strip(): {"$regex": f"^{pattern}$"}}
     m = re.match(r"(.+?)\s+BETWEEN\s+(.+?)\s+AND\s+(.+)", cond, re.IGNORECASE)
     if m:
-        return {m.group(1).strip(): {"$gte": _parse_sql_value(m.group(2).strip()), "$lte": _parse_sql_value(m.group(3).strip())}}
+        return {m.group(1).strip(): {"$gte": _parse_sql_value(m.group(2).strip()),
+                                     "$lte": _parse_sql_value(m.group(3).strip())}}
     m = re.match(r"(.+?)\s*>=\s*(.+)", cond)
     if m:
         return {m.group(1).strip(): {"$gte": _parse_sql_value(m.group(2).strip())}}
@@ -272,6 +1002,7 @@ def _parse_single_condition(cond: str) -> Optional[Dict[str, Any]]:
     logger.warning(f"Could not parse WHERE condition: '{cond}'")
     return None
 
+
 def _parse_sql_value(val_str: str):
     val_str = val_str.strip()
     if val_str.upper() == "NULL":
@@ -280,19 +1011,20 @@ def _parse_sql_value(val_str: str):
         return True
     if val_str.upper() == "FALSE":
         return False
-    if (val_str.startswith("'") and val_str.endswith("'")) or (val_str.startswith('"') and val_str.endswith('"')):
+    if (val_str.startswith("'") and val_str.endswith("'")) or \
+       (val_str.startswith('"') and val_str.endswith('"')):
         inner = val_str[1:-1].replace("''", "'").replace('""', '"')
         try:
-            if 'T' in inner and ':' in inner and '-' in inner:
+            if "T" in inner and ":" in inner and "-" in inner:
                 return datetime.fromisoformat(inner)
-        except:
+        except Exception:
             pass
         try:
-            if re.match(r'^-?\d+$', inner):
+            if re.match(r"^-?\d+$", inner):
                 return int(inner)
-            if re.match(r'^-?\d+\.\d+$', inner):
+            if re.match(r"^-?\d+\.\d+$", inner):
                 return float(inner)
-        except:
+        except Exception:
             pass
         return inner
     if val_str.upper() in ("CURRENT_TIMESTAMP", "NOW()"):
@@ -306,6 +1038,7 @@ def _parse_sql_value(val_str: str):
     except ValueError:
         pass
     return val_str
+
 
 def _parse_values_list(vals_str: str) -> List[Any]:
     vals = []
@@ -330,17 +1063,13 @@ def _parse_values_list(vals_str: str) -> List[Any]:
         vals.append(_parse_sql_value(current.strip()))
     return vals
 
+
 def _parse_columns(cols_str: str) -> List[str]:
     return [c.strip() for c in cols_str.split(",")]
 
+
 def _parse_set_clause(set_clause: str) -> Dict[str, Any]:
-    """
-    Parse a SET clause into a dict. Supports:
-      - literal assignments:        col = value
-      - arithmetic increments:      col = col + N   →  {"__inc__": +N}
-      - arithmetic decrements:      col = col - N   →  {"__inc__": -N}
-    """
-    result = {}
+    result: Dict[str, Any] = {}
     assignments = []
     current = ""
     in_quote = False
@@ -366,20 +1095,14 @@ def _parse_set_clause(set_clause: str) -> Dict[str, Any]:
         if m:
             col = m.group(1).strip()
             val_expr = m.group(2).strip()
-            # `col = col + N`
-            inc_m = re.match(
-                rf"^{re.escape(col)}\s*\+\s*(-?\d+(?:\.\d+)?)\s*$",
-                val_expr, re.IGNORECASE
-            )
+            inc_m = re.match(rf"^{re.escape(col)}\s*\+\s*(-?\d+(?:\.\d+)?)\s*$",
+                             val_expr, re.IGNORECASE)
             if inc_m:
                 num = inc_m.group(1)
                 result[col] = {"__inc__": float(num) if "." in num else int(num)}
                 continue
-            # `col = col - N`
-            dec_m = re.match(
-                rf"^{re.escape(col)}\s*-\s*(-?\d+(?:\.\d+)?)\s*$",
-                val_expr, re.IGNORECASE
-            )
+            dec_m = re.match(rf"^{re.escape(col)}\s*-\s*(-?\d+(?:\.\d+)?)\s*$",
+                             val_expr, re.IGNORECASE)
             if dec_m:
                 num = dec_m.group(1)
                 val = float(num) if "." in num else int(num)
@@ -388,10 +1111,10 @@ def _parse_set_clause(set_clause: str) -> Dict[str, Any]:
             result[col] = _parse_sql_value(val_expr)
     return result
 
-# ═══════════════════════════════════════════════════════════════
-# MONGODB CURSOR WRAPPER - Generic SQL Translator
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# MongoDB cursor wrapper
+# ═══════════════════════════════════════════════════════════════
 class MongoCursorWrapper:
     def __init__(self, db, cursor_factory=None):
         self.db = db
@@ -434,12 +1157,28 @@ class MongoCursorWrapper:
                 self._result_type = "many"
                 return self
 
-            # Route any SELECT containing JOIN / DISTINCT ON to the
-            # dedicated handler before attempting the plain SELECT regex.
-            if upper.startswith("SELECT") and (" JOIN " in upper or re.search(r"\bJOIN\b", upper) or "DISTINCT ON" in upper):
+            if upper.startswith("SELECT") and (
+                " JOIN " in upper or re.search(r"\bJOIN\b", upper) or "DISTINCT ON" in upper
+            ):
                 handled = self._execute_join_query(query)
                 if handled is not None:
                     return handled
+
+            # COUNT(*) shortcut
+            count_match = re.match(
+                r"SELECT\s+COUNT\(\*\)(?:\s+AS\s+\w+)?\s+FROM\s+(\w+)"
+                r"(?:\s+WHERE\s+(.+?))?;?\s*$",
+                query, re.IGNORECASE | re.DOTALL,
+            )
+            if count_match:
+                table, where = count_match.groups()
+                filt = _parse_where(where) if where else {}
+                cnt = self.db[table.lower()].count_documents(filt)
+                self._last_result = [(cnt,)]
+                self._rowcount = 1
+                self._result_type = "many"
+                logger.info(f"[Mongo] COUNT(*) FROM {table} WHERE {filt} -> {cnt}")
+                return self
 
             select_match = re.match(
                 r"SELECT\s+(.+?)\s+FROM\s+(\w+)"
@@ -449,7 +1188,7 @@ class MongoCursorWrapper:
                 r"(?:\s+LIMIT\s+(\d+))?"
                 r"(?:\s+OFFSET\s+(\d+))?"
                 r";?\s*$",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if select_match:
                 cols_str, table, where, order_by, limit_str, offset_str = select_match.groups()
@@ -467,7 +1206,6 @@ class MongoCursorWrapper:
                         self._last_result = []
                         self._rowcount = 0
                     self._result_type = "many"
-                    logger.info(f"[Mongo] SELECT 1 FROM {table} WHERE {filt} -> exists={self._rowcount > 0}")
                     return self
 
                 projection = None
@@ -506,13 +1244,12 @@ class MongoCursorWrapper:
                     self._rowcount = len(docs)
 
                 self._result_type = "many"
-                logger.info(f"[Mongo] SELECT FROM {table} WHERE {filt} ORDER={sort} LIMIT={limit} -> {self._rowcount} docs")
                 return self
 
             m = re.match(
                 r"INSERT\s+INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)"
                 r"\s+ON\s+CONFLICT\s*\((.+?)\)\s+DO\s+NOTHING",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if m:
                 table, cols_str, vals_str, conflict_cols = m.groups()
@@ -520,28 +1257,23 @@ class MongoCursorWrapper:
                 cols = _parse_columns(cols_str)
                 vals = _parse_values_list(vals_str)
                 doc = dict(zip(cols, vals))
-                if table in ('codes', 'plan_keys'):
-                    if 'claimed_by' not in doc:
-                        doc['claimed_by'] = None
-                    if 'claimed_at' not in doc:
-                        doc['claimed_at'] = None
+                if table in ("codes", "plan_keys"):
+                    doc.setdefault("claimed_by", None)
+                    doc.setdefault("claimed_at", None)
                 conflict = _parse_columns(conflict_cols)
                 filt = {k: doc[k] for k in conflict if k in doc}
                 result = collection.update_one(
-                    filt,
-                    {"$setOnInsert": doc},
-                    upsert=True
+                    filt, {"$setOnInsert": doc}, upsert=True
                 )
                 self._rowcount = 1 if result.upserted_id else 0
                 self._last_result = []
                 self._result_type = "insert"
-                logger.info(f"[Mongo] INSERT ... ON CONFLICT DO NOTHING INTO {table} -> {'inserted' if self._rowcount else 'skipped'}")
                 return self
 
             m = re.match(
                 r"INSERT\s+INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)"
                 r"\s+ON\s+CONFLICT\s*\((.+?)\)\s+DO\s+UPDATE\s+SET\s+(.+)",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if m:
                 table, cols_str, vals_str, conflict_cols, set_clause = m.groups()
@@ -549,46 +1281,37 @@ class MongoCursorWrapper:
                 cols = _parse_columns(cols_str)
                 vals = _parse_values_list(vals_str)
                 doc = dict(zip(cols, vals))
-                if table in ('codes', 'plan_keys'):
-                    if 'claimed_by' not in doc:
-                        doc['claimed_by'] = None
-                    if 'claimed_at' not in doc:
-                        doc['claimed_at'] = None
+                if table in ("codes", "plan_keys"):
+                    doc.setdefault("claimed_by", None)
+                    doc.setdefault("claimed_at", None)
                 conflict = _parse_columns(conflict_cols)
                 filt = {k: doc[k] for k in conflict if k in doc}
                 updates = _parse_set_clause(set_clause)
                 collection.update_one(
-                    filt,
-                    {"$set": updates, "$setOnInsert": doc},
-                    upsert=True
+                    filt, {"$set": updates, "$setOnInsert": doc}, upsert=True
                 )
                 self._rowcount = 1
                 self._last_result = []
                 self._result_type = "update"
-                logger.info(f"[Mongo] INSERT ... ON CONFLICT DO UPDATE INTO {table} WHERE {filt}")
                 return self
 
             m = re.match(
                 r"INSERT\s+OR\s+IGNORE\s+INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if m:
                 table, cols_str, vals_str = m.groups()
                 collection = self.db[table.lower()]
                 doc = dict(zip(_parse_columns(cols_str), _parse_values_list(vals_str)))
-                if table in ('codes', 'plan_keys'):
-                    if 'claimed_by' not in doc:
-                        doc['claimed_by'] = None
-                    if 'claimed_at' not in doc:
-                        doc['claimed_at'] = None
+                if table in ("codes", "plan_keys"):
+                    doc.setdefault("claimed_by", None)
+                    doc.setdefault("claimed_at", None)
                 try:
                     collection.insert_one(doc)
                     self._rowcount = 1
-                    logger.info(f"[Mongo] INSERT OR IGNORE INTO {table} -> inserted")
                 except Exception as e:
                     if "duplicate" in str(e).lower() or "E11000" in str(e):
                         self._rowcount = 0
-                        logger.info(f"[Mongo] INSERT OR IGNORE INTO {table} -> duplicate ignored")
                     else:
                         raise
                 self._last_result = []
@@ -597,27 +1320,24 @@ class MongoCursorWrapper:
 
             m = re.match(
                 r"INSERT\s+INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if m:
                 table, cols_str, vals_str = m.groups()
                 collection = self.db[table.lower()]
                 doc = dict(zip(_parse_columns(cols_str), _parse_values_list(vals_str)))
-                if table in ('codes', 'plan_keys'):
-                    if 'claimed_by' not in doc:
-                        doc['claimed_by'] = None
-                    if 'claimed_at' not in doc:
-                        doc['claimed_at'] = None
-                result = collection.insert_one(doc)
+                if table in ("codes", "plan_keys"):
+                    doc.setdefault("claimed_by", None)
+                    doc.setdefault("claimed_at", None)
+                collection.insert_one(doc)
                 self._rowcount = 1
                 self._last_result = []
                 self._result_type = "insert"
-                logger.info(f"[Mongo] INSERT INTO {table} -> _id={result.inserted_id}")
                 return self
 
             m = re.match(
                 r"UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+?))?;?\s*$",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if m:
                 table, set_clause, where = m.groups()
@@ -642,12 +1362,11 @@ class MongoCursorWrapper:
                 self._rowcount = result.modified_count
                 self._last_result = []
                 self._result_type = "update"
-                logger.info(f"[Mongo] UPDATE {table} WHERE {filt} op={list(update_op.keys())} -> modified {result.modified_count}")
                 return self
 
             m = re.match(
                 r"DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+?))?;?\s*$",
-                query, re.IGNORECASE | re.DOTALL
+                query, re.IGNORECASE | re.DOTALL,
             )
             if m:
                 table, where = m.groups()
@@ -657,33 +1376,20 @@ class MongoCursorWrapper:
                 self._rowcount = result.deleted_count
                 self._last_result = []
                 self._result_type = "delete"
-                logger.info(f"[Mongo] DELETE FROM {table} WHERE {filt} -> deleted {result.deleted_count}")
                 return self
 
             logger.error(f"[SQL] UNSUPPORTED QUERY: {query}")
             raise NotImplementedError(f"Unsupported SQL: {query[:200]}")
-
         except Exception as e:
             logger.error(f"[SQL] ERROR: {e} | Query: {query[:200]}")
             raise
 
-    # ───────────────────────────────────────────────────────────
-    # JOIN QUERY HANDLER
-    # Supports: SELECT ... FROM a JOIN b ON a.x = b.y [WHERE ...]
-    #           [ORDER BY ...] [LIMIT n]
-    #           SELECT DISTINCT ON (col) ... FROM a LEFT JOIN b ...
-    # ───────────────────────────────────────────────────────────
     def _execute_join_query(self, query: str):
-        """
-        Handle SELECT with JOIN and optional DISTINCT ON by doing manual
-        lookups against MongoDB collections and merging the results.
-        Returns self on success, or None if the query isn't a JOIN we can handle.
-        """
-        q_flat = re.sub(r'\s+', ' ', query.strip())
+        q_flat = re.sub(r"\s+", " ", query.strip())
 
         m = re.match(
             r"SELECT\s+(.+?)\s+FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?",
-            q_flat, re.IGNORECASE
+            q_flat, re.IGNORECASE,
         )
         if not m:
             return None
@@ -693,7 +1399,7 @@ class MongoCursorWrapper:
         distinct_on = None
         distinct_m = re.match(
             r"DISTINCT\s+ON\s*\(([^)]+)\)\s+(.+)",
-            cols_str.strip(), re.IGNORECASE
+            cols_str.strip(), re.IGNORECASE,
         )
         if distinct_m:
             distinct_on = distinct_m.group(1).strip()
@@ -707,12 +1413,12 @@ class MongoCursorWrapper:
             r"(?:\s+(?:AS\s+)?(\w+))?\s+ON\s+"
             r"(.+?)(?=\s+(?:LEFT|INNER|RIGHT|OUTER|FULL)?\s*JOIN"
             r"|\s+WHERE|\s+ORDER|\s+LIMIT|\s*$)",
-            rest, re.IGNORECASE
+            rest, re.IGNORECASE,
         ):
             join_parts.append({
-                'table': jm.group(1),
-                'alias': jm.group(2) or jm.group(1),
-                'on': jm.group(3).strip(),
+                "table": jm.group(1),
+                "alias": jm.group(2) or jm.group(1),
+                "on": jm.group(3).strip(),
             })
 
         where_m = re.search(r"WHERE\s+(.+?)(?=\s+ORDER\s+BY|\s+LIMIT|\s*$)", rest, re.IGNORECASE)
@@ -726,15 +1432,15 @@ class MongoCursorWrapper:
 
         aliases = {base_alias, base_table}
         for j in join_parts:
-            aliases.add(j['alias'])
-            aliases.add(j['table'])
+            aliases.add(j["alias"])
+            aliases.add(j["table"])
 
         base_filter = {}
         if where:
             where_stripped = re.sub(
-                r'\b(\w+)\.(\w+)',
+                r"\b(\w+)\.(\w+)",
                 lambda mm: mm.group(2) if mm.group(1) in aliases else mm.group(0),
-                where
+                where,
             )
             base_filter = _parse_where(where_stripped)
 
@@ -748,7 +1454,7 @@ class MongoCursorWrapper:
 
         join_indexes = []
         for j in join_parts:
-            on_m = re.match(r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", j['on'])
+            on_m = re.match(r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", j["on"])
             if not on_m:
                 join_indexes.append(None)
                 continue
@@ -759,8 +1465,7 @@ class MongoCursorWrapper:
             else:
                 base_col_name = right_col
                 joined_col_name = left_col
-
-            joined_docs = list(self.db[j['table'].lower()].find({}))
+            joined_docs = list(self.db[j["table"].lower()].find({}))
             index: Dict[Any, List[Dict[str, Any]]] = {}
             for doc in joined_docs:
                 key = doc.get(joined_col_name)
@@ -768,10 +1473,9 @@ class MongoCursorWrapper:
                     index.setdefault(key, []).append(doc)
             join_indexes.append((j, base_col_name, index))
 
-        # Merge
         merged_rows: List[Dict[str, Any]] = []
         for base_doc in base_docs:
-            bucket = [{'__base__': base_doc}]
+            bucket = [{"__base__": base_doc}]
             for join_info in join_indexes:
                 if join_info is None:
                     continue
@@ -788,45 +1492,43 @@ class MongoCursorWrapper:
                     bucket = new_bucket
             merged_rows.extend(bucket)
 
-        # Project
-        col_parts = [c.strip() for c in cols_str.split(',')]
+        col_parts = [c.strip() for c in cols_str.split(",")]
         parsed_cols = []
         for c in col_parts:
-            if c == '*':
-                parsed_cols.append(('*', None))
-            elif '.' in c:
-                a, col = c.split('.', 1)
+            if c == "*":
+                parsed_cols.append(("*", None))
+            elif "." in c:
+                a, col = c.split(".", 1)
                 parsed_cols.append((col, a))
             else:
                 parsed_cols.append((c, None))
 
         projected: List[Dict[str, Any]] = []
         for mrow in merged_rows:
-            base = mrow.get('__base__', {})
+            base = mrow.get("__base__", {})
             out: Dict[str, Any] = {}
             for col, alias in parsed_cols:
-                if col == '*' and alias is None:
+                if col == "*" and alias is None:
                     for k, v in base.items():
-                        if k != '_id':
+                        if k != "_id":
                             out[k] = v
-                elif col == '*' and alias:
-                    joined_doc = mrow.get(f'__{alias}__')
+                elif col == "*" and alias:
+                    joined_doc = mrow.get(f"__{alias}__")
                     if joined_doc:
                         for k, v in joined_doc.items():
-                            if k != '_id':
+                            if k != "_id":
                                 out[k] = v
                 elif alias is None:
                     if col in base:
                         out[col] = base[col]
                 else:
-                    joined_doc = mrow.get(f'__{alias}__')
+                    joined_doc = mrow.get(f"__{alias}__")
                     if joined_doc and col in joined_doc:
                         out[col] = joined_doc[col]
             projected.append(out)
 
-        # DISTINCT ON
         if distinct_on:
-            d = distinct_on.split('.', 1)[1] if '.' in distinct_on else distinct_on
+            d = distinct_on.split(".", 1)[1] if "." in distinct_on else distinct_on
             seen = set()
             dedup = []
             for p in projected:
@@ -836,13 +1538,12 @@ class MongoCursorWrapper:
                     dedup.append(p)
             projected = dedup
 
-        # ORDER BY
         if order_by:
             specs = []
-            for part in order_by.split(','):
+            for part in order_by.split(","):
                 part = part.strip()
                 bits = part.split()
-                col = bits[0].split('.', 1)[1] if '.' in bits[0] else bits[0]
+                col = bits[0].split(".", 1)[1] if "." in bits[0] else bits[0]
                 direction = -1 if len(bits) > 1 and bits[1].upper() == "DESC" else 1
                 specs.append((col, direction))
             for col, direction in reversed(specs):
@@ -857,7 +1558,6 @@ class MongoCursorWrapper:
         self._last_result = projected
         self._rowcount = len(projected)
         self._result_type = "many"
-        logger.info(f"[Mongo] JOIN SELECT base={base_table} joins={[j['table'] for j in join_parts]} -> {self._rowcount} rows")
         return self
 
     def fetchone(self):
@@ -895,9 +1595,6 @@ class MongoCursorWrapper:
     def close(self):
         self._closed = True
 
-# ═══════════════════════════════════════════════════════════════
-# MONGODB CONNECTION WRAPPER
-# ═══════════════════════════════════════════════════════════════
 
 class MongoConnectionWrapper:
     def __init__(self, db, cursor_factory=None):
@@ -920,11 +1617,9 @@ class MongoConnectionWrapper:
 
     def commit(self):
         self._in_transaction = False
-        logger.debug("commit (no-op for MongoDB)")
 
     def rollback(self):
         self._in_transaction = False
-        logger.debug("rollback (no-op for MongoDB)")
 
     def close(self):
         self._closed = True
@@ -933,6 +1628,7 @@ class MongoConnectionWrapper:
         self._closed = True
 
 
+# ─── psycopg2 mock helpers ─────────────────────────────────────
 class _MockConnection:
     def __init__(self):
         self._closed = False
@@ -944,14 +1640,17 @@ class _MockConnection:
     @property
     def closed(self): return 1 if self._closed else 0
 
+
 class _MockCursor:
     def execute(self, *a, **k): pass
     def fetchone(self): return None
     def fetchall(self): return []
     def close(self): pass
 
+
 def _create_mock_connection(*a, **k):
     return _MockConnection()
+
 
 psycopg2_mod = sys.modules.get("psycopg2")
 if psycopg2_mod and not hasattr(psycopg2_mod, "_is_real"):
@@ -962,18 +1661,20 @@ if psycopg2_mod and not hasattr(psycopg2_mod, "_is_real"):
 
 RealDictCursor = dict
 
+
+# ─── Pooled connection helpers (kept for compat) ───────────────
 class SQLiteThreadedPool:
     def __init__(self, minconn, maxconn, *a, **k):
         self.minconn = minconn
         self.maxconn = maxconn
-        logger.info("SQLiteThreadedPool mocked for MongoDB")
+        logger.info("ThreadedPool mocked (MongoDB/SQLite backend)")
+
 
 class PooledConn:
     def __init__(self):
         self.conn = None
     def __enter__(self):
-        db = _get_db()
-        self.conn = MongoConnectionWrapper(db)
+        self.conn = get_db_connection()
         return self.conn
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
@@ -984,28 +1685,23 @@ class PooledConn:
                 self.conn.close()
         return False
 
+
 class PooledConn2:
     pass
 
-def get_db_connection():
-    db = _get_db()
-    return MongoConnectionWrapper(db)
 
 def _release_connection(conn):
     if conn:
         conn.close()
 
+
 class NoOpCache(dict):
-    def get(self, key, default=None):
-        return None
-    def __getitem__(self, key):
-        raise KeyError(key)
-    def __setitem__(self, key, value):
-        pass
-    def pop(self, key, default=None):
-        return None
-    def clear(self):
-        pass
+    def get(self, key, default=None): return None
+    def __getitem__(self, key): raise KeyError(key)
+    def __setitem__(self, key, value): pass
+    def pop(self, key, default=None): return None
+    def clear(self): pass
+
 
 _gate_cache = NoOpCache()
 _gate_cache_ttl = 30
@@ -1014,10 +1710,10 @@ _credits_cache_ttl = 5
 _premium_cache = NoOpCache()
 _premium_cache_ttl = 60
 
+
 # ═══════════════════════════════════════════════════════════════
 # SCHEMA INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
-
 def ensure_users_table():
     try:
         db = _get_db()
@@ -1031,6 +1727,7 @@ def ensure_users_table():
         logger.error(f"Error initializing users collection: {e}")
         raise
 
+
 def ensure_proxy_table():
     try:
         db = _get_db()
@@ -1040,6 +1737,7 @@ def ensure_proxy_table():
     except Exception as e:
         logger.error(f"Error initializing proxies collection: {e}")
         raise
+
 
 def ensure_receipts_table():
     try:
@@ -1051,6 +1749,7 @@ def ensure_receipts_table():
         logger.error(f"Error initializing receipts collection: {e}")
         raise
 
+
 def ensure_codes_table():
     try:
         db = _get_db()
@@ -1060,6 +1759,7 @@ def ensure_codes_table():
     except Exception as e:
         logger.error(f"Error initializing codes collection: {e}")
         raise
+
 
 def ensure_plan_keys_table():
     try:
@@ -1071,6 +1771,7 @@ def ensure_plan_keys_table():
         logger.error(f"Error initializing plan_keys collection: {e}")
         raise
 
+
 def ensure_gate_status_table():
     try:
         db = _get_db()
@@ -1080,6 +1781,7 @@ def ensure_gate_status_table():
         logger.error(f"Error initializing gate_status collection: {e}")
         raise
 
+
 def ensure_banned_users_table():
     try:
         db = _get_db()
@@ -1088,6 +1790,7 @@ def ensure_banned_users_table():
     except Exception as e:
         logger.error(f"Error initializing banned_users collection: {e}")
         raise
+
 
 def ensure_user_sites_table():
     try:
@@ -1099,6 +1802,7 @@ def ensure_user_sites_table():
         logger.error(f"Error initializing user_sites collection: {e}")
         raise
 
+
 def ensure_pending_feedback_table():
     try:
         db = _get_db()
@@ -1108,8 +1812,8 @@ def ensure_pending_feedback_table():
         logger.error(f"Error initializing pending_feedback collection: {e}")
         raise
 
+
 def ensure_settings_table():
-    """Key/value settings store used by sitechk (max price, etc.)."""
     try:
         db = _get_db()
         db.settings.create_index("key", unique=True)
@@ -1118,6 +1822,7 @@ def ensure_settings_table():
         logger.error(f"Error initializing settings collection: {e}")
         raise
 
+
 def ensure_stats_table(gate_name: str):
     try:
         db = _get_db()
@@ -1125,64 +1830,55 @@ def ensure_stats_table(gate_name: str):
         collection.create_index("user_id")
         collection.create_index("timestamp")
         collection.create_index("status")
-        logger.debug(f"Stats collection {gate_name}_stats initialized")
     except Exception as e:
         logger.warning(f"Error initializing stats collection {gate_name}: {e}")
 
+
 def _migrate_numeric_and_date_fields():
-    """Convert string numeric and date fields to proper types."""
+    """Only meaningful for MongoDB; SQLite stores typed values already."""
+    if _DB_BACKEND != "mongodb":
+        return
     try:
         db = _get_db()
-        numeric_fields = ['credits', 'is_premium', 'cc_checked', 'cc_charged']
-        date_fields = ['joined_at', 'premium_expiry']
+        numeric_fields = ["credits", "is_premium", "cc_checked", "cc_charged"]
+        date_fields = ["joined_at", "premium_expiry"]
         for field in numeric_fields:
-            users = db.users.find({field: {"$type": "string"}})
-            for user in users:
+            for user in db.users.find({field: {"$type": "string"}}):
                 val = user[field]
                 try:
-                    if re.match(r'^-?\d+(\.\d+)?$', val):
-                        new_val = int(val) if '.' not in val else float(val)
-                    else:
-                        new_val = 0
-                    db.users.update_one({"_id": user["_id"]}, {"$set": {field: new_val}})
-                except Exception as e:
-                    logger.warning(f"Could not migrate {field} for user {user.get('user_id')}: {e}")
+                    new_val = int(val) if "." not in val else float(val)
+                except Exception:
+                    new_val = 0
+                db.users.update_one({"_id": user["_id"]}, {"$set": {field: new_val}})
         for field in date_fields:
-            users = db.users.find({field: {"$type": "string"}})
-            for user in users:
-                val = user[field]
+            for user in db.users.find({field: {"$type": "string"}}):
                 try:
-                    new_val = datetime.fromisoformat(val)
+                    new_val = datetime.fromisoformat(user[field])
                     db.users.update_one({"_id": user["_id"]}, {"$set": {field: new_val}})
-                except Exception as e:
-                    logger.warning(f"Could not migrate {field} for user {user.get('user_id')}: {e}")
-
-        for field in ['purchased_on', 'expires_on', 'created_at']:
-            receipts = db.receipts.find({field: {"$type": "string"}})
-            for receipt in receipts:
-                val = receipt[field]
+                except Exception:
+                    pass
+        for field in ["purchased_on", "expires_on", "created_at"]:
+            for receipt in db.receipts.find({field: {"$type": "string"}}):
                 try:
-                    new_val = datetime.fromisoformat(val)
+                    new_val = datetime.fromisoformat(receipt[field])
                     db.receipts.update_one({"_id": receipt["_id"]}, {"$set": {field: new_val}})
-                except Exception as e:
-                    logger.warning(f"Could not migrate {field} for receipt {receipt.get('receipt_id')}: {e}")
-
-        for coll_name in ['codes', 'plan_keys']:
+                except Exception:
+                    pass
+        for coll_name in ["codes", "plan_keys"]:
             coll = db[coll_name]
-            for doc in coll.find({'claimed_at': {"$type": "string"}}):
-                val = doc['claimed_at']
+            for doc in coll.find({"claimed_at": {"$type": "string"}}):
                 try:
-                    new_val = datetime.fromisoformat(val)
-                    coll.update_one({"_id": doc["_id"]}, {"$set": {'claimed_at': new_val}})
-                except Exception as e:
-                    logger.warning(f"Could not migrate claimed_at for {coll_name} {doc.get('_id')}: {e}")
-
+                    new_val = datetime.fromisoformat(doc["claimed_at"])
+                    coll.update_one({"_id": doc["_id"]}, {"$set": {"claimed_at": new_val}})
+                except Exception:
+                    pass
         logger.info("Numeric and date field migration completed")
     except Exception as e:
-        logger.error(f"Migration failed: {e}")
+        logger.warning(f"Migration skipped: {e}")
+
 
 def initialize_schema():
-    logger.info("Starting MongoDB schema initialization...")
+    logger.info(f"Starting schema initialization (backend={_DB_BACKEND or 'auto'})...")
     try:
         ensure_users_table()
         ensure_proxy_table()
@@ -1199,26 +1895,28 @@ def initialize_schema():
         for gate in ["ST", "STR", "PF", "VBV", "FT", "BL", "PP", "AT", "PW", "PYU"]:
             ensure_stats_table(gate)
         _migrate_numeric_and_date_fields()
-        logger.info("MongoDB schema initialization completed successfully")
+        logger.info(f"Schema initialization completed (backend={_DB_BACKEND})")
     except Exception as e:
         logger.error(f"Schema initialization failed: {e}")
         raise
 
-# ═══════════════════════════════════════════════════════════════
-# USER MANAGEMENT FUNCTIONS
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# USER MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
 def get_user(user_id: int) -> Optional[Dict[str, Any]]:
     try:
         db = _get_db()
         user = db.users.find_one({"user_id": user_id})
         if user:
             user = _convert_dates_in_doc(user)
-            user["_id"] = str(user["_id"])
+            if "_id" in user:
+                user["_id"] = str(user["_id"])
         return user
     except Exception as e:
         logger.error(f"Error fetching user {user_id}: {e}")
         return None
+
 
 def create_user(user_id: int, username: str, first_name: str = "User", initial_credits: int = 150):
     try:
@@ -1232,19 +1930,16 @@ def create_user(user_id: int, username: str, first_name: str = "User", initial_c
             "premium_expiry": None,
             "cc_checked": 0,
             "cc_charged": 0,
-            "joined_at": datetime.now()
+            "joined_at": datetime.now(),
         }
         result = db.users.update_one(
-            {"user_id": user_id},
-            {"$setOnInsert": user_doc},
-            upsert=True
+            {"user_id": user_id}, {"$setOnInsert": user_doc}, upsert=True
         )
-        if result.upserted_id:
+        if getattr(result, "upserted_id", None):
             logger.info(f"Created user {user_id} ({username})")
-        else:
-            logger.debug(f"User {user_id} already exists")
     except Exception as e:
         logger.error(f"Error creating user {user_id}: {e}")
+
 
 def get_user_credits(user_id: int) -> int:
     try:
@@ -1255,16 +1950,14 @@ def get_user_credits(user_id: int) -> int:
         logger.error(f"Error fetching credits for user {user_id}: {e}")
         return 0
 
+
 def update_credits(user_id: int, new_credits: int):
     try:
         db = _get_db()
-        db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"credits": new_credits}}
-        )
-        logger.debug(f"Updated credits for user {user_id} to {new_credits}")
+        db.users.update_one({"user_id": user_id}, {"$set": {"credits": new_credits}})
     except Exception as e:
         logger.error(f"Error updating credits for user {user_id}: {e}")
+
 
 def deduct_credits_atomic(user_id: int, amount: int) -> int:
     try:
@@ -1272,22 +1965,21 @@ def deduct_credits_atomic(user_id: int, amount: int) -> int:
         result = db.users.find_one_and_update(
             {"user_id": user_id, "credits": {"$gte": amount}},
             {"$inc": {"credits": -amount}},
-            return_document=True
+            return_document=True,
         )
         if result:
             return result.get("credits", 0)
-        else:
-            return -1
+        return -1
     except Exception as e:
         logger.error(f"Error deducting credits for user {user_id}: {e}")
         return -1
+
 
 def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
     try:
         db = _get_db()
         user = db.users.find_one(
-            {"user_id": user_id},
-            {"is_premium": 1, "premium_expiry": 1}
+            {"user_id": user_id}, {"is_premium": 1, "premium_expiry": 1}
         )
         if not user:
             return (False, None)
@@ -1297,20 +1989,20 @@ def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
             if isinstance(expiry, str):
                 try:
                     expiry = datetime.fromisoformat(expiry)
-                except:
+                except Exception:
                     expiry = None
             if expiry and datetime.now() < expiry:
                 return (True, expiry)
-            else:
-                db.users.update_one(
-                    {"user_id": user_id},
-                    {"$set": {"is_premium": 0, "premium_expiry": None, "credits": 150}}
-                )
-                return (False, None)
+            db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"is_premium": 0, "premium_expiry": None, "credits": 150}},
+            )
+            return (False, None)
         return (False, None)
     except Exception as e:
         logger.error(f"Error fetching premium status for user {user_id}: {e}")
         return (False, None)
+
 
 def set_premium(user_id: int, days: int) -> bool:
     try:
@@ -1319,7 +2011,7 @@ def set_premium(user_id: int, days: int) -> bool:
         db.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_premium": 1, "premium_expiry": expiry}},
-            upsert=True
+            upsert=True,
         )
         logger.info(f"Set premium for user {user_id} for {days} days")
         return True
@@ -1327,13 +2019,14 @@ def set_premium(user_id: int, days: int) -> bool:
         logger.error(f"Error setting premium for user {user_id}: {e}")
         return False
 
+
 def is_gate_enabled(gate: str) -> bool:
     try:
         db = _get_db()
         db.gate_status.update_one(
             {"gate": gate},
             {"$setOnInsert": {"gate": gate, "is_enabled": 1, "updated_at": datetime.now()}},
-            upsert=True
+            upsert=True,
         )
         status = db.gate_status.find_one({"gate": gate})
         return bool(status.get("is_enabled", 1)) if status else True
@@ -1341,19 +2034,21 @@ def is_gate_enabled(gate: str) -> bool:
         logger.error(f"Error checking gate status for {gate}: {e}")
         return True
 
+
 def set_gate_status(gate: str, enabled: bool) -> bool:
     try:
         db = _get_db()
         db.gate_status.update_one(
             {"gate": gate},
             {"$set": {"is_enabled": int(enabled), "updated_at": datetime.now()}},
-            upsert=True
+            upsert=True,
         )
         logger.info(f"Set gate {gate} to {'enabled' if enabled else 'disabled'}")
         return True
     except Exception as e:
         logger.error(f"Error setting gate {gate} status: {e}")
         return False
+
 
 def update_user_stats(user_id: int, is_charged: bool):
     try:
@@ -1362,41 +2057,37 @@ def update_user_stats(user_id: int, is_charged: bool):
         if not user:
             return
         updates = {}
-        for field in ['cc_checked', 'cc_charged']:
+        for field in ["cc_checked", "cc_charged"]:
             val = user.get(field)
             if isinstance(val, str):
                 try:
                     val = int(val)
-                except:
+                except Exception:
                     val = 0
                 updates[field] = val
         if updates:
             db.users.update_one({"user_id": user_id}, {"$set": updates})
         if is_charged:
             db.users.update_one(
-                {"user_id": user_id},
-                {"$inc": {"cc_checked": 1, "cc_charged": 1}}
+                {"user_id": user_id}, {"$inc": {"cc_checked": 1, "cc_charged": 1}}
             )
         else:
-            db.users.update_one(
-                {"user_id": user_id},
-                {"$inc": {"cc_checked": 1}}
-            )
-        logger.debug(f"Updated stats for user {user_id} (charged={is_charged})")
+            db.users.update_one({"user_id": user_id}, {"$inc": {"cc_checked": 1}})
     except Exception as e:
         logger.error(f"Error updating stats for user {user_id}: {e}")
+
 
 def get_user_sites_db(user_id: int) -> List[str]:
     try:
         db = _get_db()
         sites = db.user_sites.find(
-            {"user_id": int(user_id)},
-            {"url": 1, "_id": 0}
+            {"user_id": int(user_id)}, {"url": 1, "_id": 0}
         ).sort("_id", 1)
         return [s["url"] for s in sites]
     except Exception as e:
         logger.error(f"Error fetching user sites for {user_id}: {e}")
         return []
+
 
 def add_user_sites_db(user_id: int, sites: List[str]) -> int:
     added = 0
@@ -1406,9 +2097,9 @@ def add_user_sites_db(user_id: int, sites: List[str]) -> int:
             if not s:
                 continue
             url = str(s).strip()
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
-            url = url.lower().rstrip('/')
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            url = url.lower().rstrip("/")
             try:
                 result = db.user_sites.update_one(
                     {"user_id": int(user_id), "url": url},
@@ -1416,11 +2107,11 @@ def add_user_sites_db(user_id: int, sites: List[str]) -> int:
                         "user_id": int(user_id),
                         "url": url,
                         "price": 0.0,
-                        "added_at": datetime.now()
+                        "added_at": datetime.now(),
                     }},
-                    upsert=True
+                    upsert=True,
                 )
-                if result.upserted_id is not None:
+                if getattr(result, "upserted_id", None) is not None:
                     added += 1
             except Exception as e:
                 logger.error(f"Error inserting site {url} for user {user_id}: {e}")
@@ -1428,6 +2119,7 @@ def add_user_sites_db(user_id: int, sites: List[str]) -> int:
     except Exception as e:
         logger.error(f"Error adding sites for user {user_id}: {e}")
     return added
+
 
 def clear_user_sites_db(user_id: int) -> int:
     try:
@@ -1438,10 +2130,10 @@ def clear_user_sites_db(user_id: int) -> int:
         logger.error(f"Error clearing sites for {user_id}: {e}")
         return 0
 
-# ═══════════════════════════════════════════════════════════════
-# CODES MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# CODES / PLAN KEYS
+# ═══════════════════════════════════════════════════════════════
 def add_code(code: str, duration_days: int, max_uses: int = 1) -> bool:
     try:
         db = _get_db()
@@ -1451,13 +2143,13 @@ def add_code(code: str, duration_days: int, max_uses: int = 1) -> bool:
             "max_uses": max_uses,
             "claimed_by": None,
             "claimed_at": None,
-            "created_at": datetime.now()
+            "created_at": datetime.now(),
         })
-        logger.info(f"Added code {code} for {duration_days} days")
         return True
     except Exception as e:
         logger.error(f"Error adding code {code}: {e}")
         return False
+
 
 def get_code(code: str) -> Optional[Dict[str, Any]]:
     try:
@@ -1465,11 +2157,13 @@ def get_code(code: str) -> Optional[Dict[str, Any]]:
         code_doc = db.codes.find_one({"code": code})
         if code_doc:
             code_doc = _convert_dates_in_doc(code_doc)
-            code_doc["_id"] = str(code_doc["_id"])
+            if "_id" in code_doc:
+                code_doc["_id"] = str(code_doc["_id"])
         return code_doc
     except Exception as e:
         logger.error(f"Error fetching code {code}: {e}")
         return None
+
 
 def claim_code(user_id: int, code: str) -> Tuple[bool, str]:
     try:
@@ -1481,20 +2175,20 @@ def claim_code(user_id: int, code: str) -> Tuple[bool, str]:
             return False, "Code already claimed."
         db.codes.update_one(
             {"code": code, "claimed_by": None},
-            {"$set": {"claimed_by": user_id, "claimed_at": datetime.now()}}
+            {"$set": {"claimed_by": user_id, "claimed_at": datetime.now()}},
         )
         duration = code_doc.get("duration_days", 0)
         expiry = datetime.now() + timedelta(days=duration)
         db.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_premium": 1, "premium_expiry": expiry}},
-            upsert=True
+            upsert=True,
         )
-        logger.info(f"User {user_id} claimed code {code}")
         return True, f"Code redeemed! Premium extended by {duration} days."
     except Exception as e:
         logger.error(f"Error claiming code {code} for user {user_id}: {e}")
         return False, "Database error during code redemption."
+
 
 def add_plan_key(key: str, duration_days: int, max_uses: int = 1) -> bool:
     try:
@@ -1505,13 +2199,13 @@ def add_plan_key(key: str, duration_days: int, max_uses: int = 1) -> bool:
             "max_uses": max_uses,
             "claimed_by": None,
             "claimed_at": None,
-            "created_at": datetime.now()
+            "created_at": datetime.now(),
         })
-        logger.info(f"Added plan key {key}")
         return True
     except Exception as e:
         logger.error(f"Error adding plan key {key}: {e}")
         return False
+
 
 def get_plan_key(key: str) -> Optional[Dict[str, Any]]:
     try:
@@ -1519,11 +2213,13 @@ def get_plan_key(key: str) -> Optional[Dict[str, Any]]:
         key_doc = db.plan_keys.find_one({"key": key})
         if key_doc:
             key_doc = _convert_dates_in_doc(key_doc)
-            key_doc["_id"] = str(key_doc["_id"])
+            if "_id" in key_doc:
+                key_doc["_id"] = str(key_doc["_id"])
         return key_doc
     except Exception as e:
         logger.error(f"Error fetching plan key {key}: {e}")
         return None
+
 
 def claim_plan_key(user_id: int, key: str) -> Tuple[bool, str]:
     try:
@@ -1535,20 +2231,20 @@ def claim_plan_key(user_id: int, key: str) -> Tuple[bool, str]:
             return False, "Key already claimed."
         db.plan_keys.update_one(
             {"key": key, "claimed_by": None},
-            {"$set": {"claimed_by": user_id, "claimed_at": datetime.now()}}
+            {"$set": {"claimed_by": user_id, "claimed_at": datetime.now()}},
         )
         duration = key_doc.get("duration_days", key_doc.get("days", 0))
         expiry = datetime.now() + timedelta(days=duration)
         db.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_premium": 1, "premium_expiry": expiry}},
-            upsert=True
+            upsert=True,
         )
-        logger.info(f"User {user_id} claimed plan key {key}")
         return True, f"Key redeemed! Premium extended by {duration} days."
     except Exception as e:
         logger.error(f"Error claiming plan key {key} for user {user_id}: {e}")
         return False, "Database error during key redemption."
+
 
 def get_latest_receipt_plan(user_id: int) -> Optional[str]:
     try:
@@ -1556,18 +2252,19 @@ def get_latest_receipt_plan(user_id: int) -> Optional[str]:
         receipt = db.receipts.find_one(
             {"user_id": user_id},
             sort=[("purchased_on", -1)],
-            projection={"plan": 1, "_id": 0}
+            projection={"plan": 1, "_id": 0},
         )
         return receipt.get("plan") if receipt else None
     except Exception as e:
         logger.error(f"Error fetching latest receipt plan for user {user_id}: {e}")
         return None
 
-# ═══════════════════════════════════════════════════════════════
-# RECEIPTS MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
 
-def save_receipt(user_id: int, receipt_id: str, amount: float, currency: str = "USD", metadata: dict = None) -> bool:
+# ═══════════════════════════════════════════════════════════════
+# RECEIPTS
+# ═══════════════════════════════════════════════════════════════
+def save_receipt(user_id: int, receipt_id: str, amount: float,
+                 currency: str = "USD", metadata: dict = None) -> bool:
     try:
         db = _get_db()
         db.receipts.insert_one({
@@ -1576,13 +2273,13 @@ def save_receipt(user_id: int, receipt_id: str, amount: float, currency: str = "
             "amount": amount,
             "currency": currency,
             "metadata": metadata or {},
-            "created_at": datetime.now()
+            "created_at": datetime.now(),
         })
-        logger.info(f"Saved receipt {receipt_id} for user {user_id}")
         return True
     except Exception as e:
         logger.error(f"Error saving receipt {receipt_id}: {e}")
         return False
+
 
 def get_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
     try:
@@ -1590,44 +2287,40 @@ def get_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
         receipt = db.receipts.find_one({"receipt_id": receipt_id})
         if receipt:
             receipt = _convert_dates_in_doc(receipt)
-            receipt["_id"] = str(receipt["_id"])
+            if "_id" in receipt:
+                receipt["_id"] = str(receipt["_id"])
         return receipt
     except Exception as e:
         logger.error(f"Error fetching receipt {receipt_id}: {e}")
         return None
 
-# ═══════════════════════════════════════════════════════════════
-# PROXIES MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# PROXIES
+# ═══════════════════════════════════════════════════════════════
 def add_proxy(user_id: int, proxy: str) -> bool:
     try:
         db = _get_db()
         result = db.proxies.update_one(
             {"user_id": user_id, "proxy": proxy},
-            {"$setOnInsert": {
-                "user_id": user_id,
-                "proxy": proxy,
-                "added_at": datetime.now()
-            }},
-            upsert=True
+            {"$setOnInsert": {"user_id": user_id, "proxy": proxy, "added_at": datetime.now()}},
+            upsert=True,
         )
-        return result.upserted_id is not None
+        return getattr(result, "upserted_id", None) is not None
     except Exception as e:
         logger.error(f"Error adding proxy for user {user_id}: {e}")
         return False
 
+
 def get_proxies(user_id: int) -> List[str]:
     try:
         db = _get_db()
-        proxies = db.proxies.find(
-            {"user_id": user_id},
-            {"proxy": 1, "_id": 0}
-        ).sort("_id", 1)
+        proxies = db.proxies.find({"user_id": user_id}, {"proxy": 1, "_id": 0}).sort("_id", 1)
         return [p["proxy"] for p in proxies]
     except Exception as e:
         logger.error(f"Error fetching proxies for user {user_id}: {e}")
         return []
+
 
 def remove_proxy(user_id: int, proxy: str) -> bool:
     try:
@@ -1638,6 +2331,7 @@ def remove_proxy(user_id: int, proxy: str) -> bool:
         logger.error(f"Error removing proxy for user {user_id}: {e}")
         return False
 
+
 def clear_proxies(user_id: int) -> int:
     try:
         db = _get_db()
@@ -1646,6 +2340,7 @@ def clear_proxies(user_id: int) -> int:
     except Exception as e:
         logger.error(f"Error clearing proxies for user {user_id}: {e}")
         return 0
+
 
 def count_proxies(user_id: int) -> int:
     try:
@@ -1657,42 +2352,31 @@ def count_proxies(user_id: int) -> int:
 
 
 def get_all_proxies_with_users() -> List[Dict[str, Any]]:
-    """Return every proxy in the database along with the user_id that owns it.
-    Sorted by user_id for a clean output."""
     try:
         db = _get_db()
-        cursor = db.proxies.find(
-            {},
-            {"user_id": 1, "proxy": 1, "_id": 0}
-        ).sort("user_id", 1)
-        result = []
-        for p in cursor:
-            result.append({
-                "user_id": p.get("user_id"),
-                "proxy": p.get("proxy"),
-            })
-        return result
+        cursor = db.proxies.find({}, {"user_id": 1, "proxy": 1, "_id": 0}).sort("user_id", 1)
+        return [{"user_id": p.get("user_id"), "proxy": p.get("proxy")} for p in cursor]
     except Exception as e:
         logger.error(f"Error fetching all proxies with users: {e}")
         return []
 
-# ═══════════════════════════════════════════════════════════════
-# BANNED USERS MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# BANNED USERS
+# ═══════════════════════════════════════════════════════════════
 def ban_user(user_id: int, reason: str = "") -> bool:
     try:
         db = _get_db()
         db.banned_users.update_one(
             {"user_id": user_id},
             {"$set": {"reason": reason, "banned_at": datetime.now()}},
-            upsert=True
+            upsert=True,
         )
-        logger.info(f"Banned user {user_id}")
         return True
     except Exception as e:
         logger.error(f"Error banning user {user_id}: {e}")
         return False
+
 
 def unban_user(user_id: int) -> bool:
     try:
@@ -1703,6 +2387,7 @@ def unban_user(user_id: int) -> bool:
         logger.error(f"Error unbanning user {user_id}: {e}")
         return False
 
+
 def is_banned(user_id: int) -> bool:
     try:
         db = _get_db()
@@ -1711,68 +2396,62 @@ def is_banned(user_id: int) -> bool:
         logger.error(f"Error checking ban status for user {user_id}: {e}")
         return False
 
-# ═══════════════════════════════════════════════════════════════
-# STATS MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# STATS
+# ═══════════════════════════════════════════════════════════════
 def log_stat(gate: str, user_id: int, status: str, extra: dict = None) -> bool:
     try:
         db = _get_db()
-        collection = db[f"{gate}_stats"]
-        collection.insert_one({
+        db[f"{gate}_stats"].insert_one({
             "user_id": user_id,
             "status": status,
             "timestamp": datetime.now(),
-            "extra": extra or {}
+            "extra": extra or {},
         })
-        logger.debug(f"Logged stat for gate {gate}, user {user_id}")
         return True
     except Exception as e:
         logger.error(f"Error logging stat for gate {gate}, user {user_id}: {e}")
         return False
 
+
 def get_stats(gate: str, user_id: int = None, limit: int = 100) -> List[Dict[str, Any]]:
     try:
         db = _get_db()
-        collection = db[f"{gate}_stats"]
         filt = {}
         if user_id is not None:
             filt["user_id"] = user_id
-        stats = collection.find(filt).sort("timestamp", -1).limit(limit)
+        stats = db[f"{gate}_stats"].find(filt).sort("timestamp", -1).limit(limit)
         result = []
         for s in stats:
             s = _convert_dates_in_doc(s)
-            s["_id"] = str(s["_id"])
+            if "_id" in s:
+                s["_id"] = str(s["_id"])
             result.append(s)
         return result
     except Exception as e:
         logger.error(f"Error fetching stats for gate {gate}: {e}")
         return []
 
+
 # ═══════════════════════════════════════════════════════════════
 # CHARGE LEADERBOARD
 # ═══════════════════════════════════════════════════════════════
-
 def get_charge_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
-    """Return the top N users sorted by cc_charged (descending).
-    Only users with at least 1 charged hit are included."""
     try:
         db = _get_db()
         users = db.users.find(
             {"cc_charged": {"$gt": 0}},
-            {"user_id": 1, "username": 1, "first_name": 1, "cc_checked": 1, "cc_charged": 1}
+            {"user_id": 1, "username": 1, "first_name": 1, "cc_checked": 1, "cc_charged": 1},
         ).sort("cc_charged", -1).limit(limit)
-
         result = []
         for u in users:
-            charged = u.get("cc_charged", 0)
-            hits = u.get("cc_checked", 0)
             try:
-                charged = int(charged)
+                charged = int(u.get("cc_charged", 0))
             except (ValueError, TypeError):
                 charged = 0
             try:
-                hits = int(hits)
+                hits = int(u.get("cc_checked", 0))
             except (ValueError, TypeError):
                 hits = 0
             result.append({
@@ -1787,85 +2466,61 @@ def get_charge_leaderboard(limit: int = 10) -> List[Dict[str, Any]]:
         logger.error(f"Error fetching charge leaderboard: {e}")
         return []
 
+
 def get_user_charge_rank(user_id: int) -> Optional[Dict[str, Any]]:
-    """Return the user's rank, charged count, hits, and rate.
-    Returns None only if the user has zero hits (no activity at all).
-    If the user has hits but 0 charged, `rank` is None so they can be
-    shown without a rank."""
     try:
         db = _get_db()
         user = db.users.find_one(
             {"user_id": user_id},
-            {"cc_checked": 1, "cc_charged": 1, "username": 1, "first_name": 1}
+            {"cc_checked": 1, "cc_charged": 1, "username": 1, "first_name": 1},
         )
         if not user:
             return None
-
-        charged = user.get("cc_charged", 0)
-        hits = user.get("cc_checked", 0)
         try:
-            charged = int(charged)
+            charged = int(user.get("cc_charged", 0))
         except (ValueError, TypeError):
             charged = 0
         try:
-            hits = int(hits)
+            hits = int(user.get("cc_checked", 0))
         except (ValueError, TypeError):
             hits = 0
-
         if hits == 0:
-            return None   # no activity at all
-
+            return None
         rate = (charged / hits * 100) if hits > 0 else 0.0
-
+        total = db.users.count_documents({"cc_charged": {"$gt": 0}})
         if charged == 0:
             return {
-                "rank": None,
-                "total": db.users.count_documents({"cc_charged": {"$gt": 0}}),
-                "charged": 0,
-                "hits": hits,
-                "rate": rate,
-                "username": user.get("username"),
+                "rank": None, "total": total, "charged": 0, "hits": hits,
+                "rate": rate, "username": user.get("username"),
                 "first_name": user.get("first_name"),
             }
-
         higher = db.users.count_documents({"cc_charged": {"$gt": charged}})
-        total = db.users.count_documents({"cc_charged": {"$gt": 0}})
-
         return {
-            "rank": higher + 1,
-            "total": total,
-            "charged": charged,
-            "hits": hits,
-            "rate": rate,
-            "username": user.get("username"),
+            "rank": higher + 1, "total": total, "charged": charged, "hits": hits,
+            "rate": rate, "username": user.get("username"),
             "first_name": user.get("first_name"),
         }
     except Exception as e:
         logger.error(f"Error fetching user rank for {user_id}: {e}")
         return None
 
+
 def clear_all_charge_stats() -> int:
-    """Reset cc_checked and cc_charged to 0 for ALL users.
-    Returns the number of users affected."""
     try:
         db = _get_db()
         result = db.users.update_many(
-            {"$or": [
-                {"cc_checked": {"$ne": 0}},
-                {"cc_charged": {"$ne": 0}},
-            ]},
-            {"$set": {"cc_checked": 0, "cc_charged": 0}}
+            {"$or": [{"cc_checked": {"$ne": 0}}, {"cc_charged": {"$ne": 0}}]},
+            {"$set": {"cc_checked": 0, "cc_charged": 0}},
         )
-        logger.info(f"Cleared charge stats for {result.modified_count} users")
         return result.modified_count
     except Exception as e:
         logger.error(f"Error clearing charge stats: {e}")
         return 0
 
-# ═══════════════════════════════════════════════════════════════
-# GET ALL USER IDs (for broadcast)
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# USER LISTING
+# ═══════════════════════════════════════════════════════════════
 def get_all_user_ids() -> List[int]:
     try:
         db = _get_db()
@@ -1875,6 +2530,7 @@ def get_all_user_ids() -> List[int]:
         logger.error(f"Error fetching all user IDs: {e}")
         return []
 
+
 def get_all_users() -> List[Dict[str, Any]]:
     try:
         db = _get_db()
@@ -1882,38 +2538,41 @@ def get_all_users() -> List[Dict[str, Any]]:
         result = []
         for u in users:
             u = _convert_dates_in_doc(u)
-            u["_id"] = str(u["_id"])
+            if "_id" in u:
+                u["_id"] = str(u["_id"])
             result.append(u)
         return result
     except Exception as e:
         logger.error(f"Error fetching all users: {e}")
         return []
 
-# ═══════════════════════════════════════════════════════════════
-# GLOBAL SITES MANAGEMENT (replaces sites.txt)
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL SITES
+# ═══════════════════════════════════════════════════════════════
 def get_global_sites() -> List[str]:
     try:
         db = _get_db()
-        sites = db.global_sites.find({}, {"url": 1, "_id": 0})
-        return [s["url"] for s in sites]
+        return [s["url"] for s in db.global_sites.find({}, {"url": 1, "_id": 0})]
     except Exception as e:
         logger.error(f"Error fetching global sites: {e}")
         return []
+
 
 def set_global_sites(sites: List[str]) -> int:
     try:
         db = _get_db()
         db.global_sites.drop()
+        docs = []
         if sites:
             docs = [{"url": s.strip(), "added_at": datetime.now()} for s in sites if s and s.strip()]
-            if docs:
-                db.global_sites.insert_many(docs)
-        return len(docs) if sites else 0
+            for d in docs:
+                db.global_sites.insert_one(d)
+        return len(docs)
     except Exception as e:
         logger.error(f"Error setting global sites: {e}")
         return 0
+
 
 def add_global_sites(sites: List[str]) -> int:
     added = 0
@@ -1923,37 +2582,35 @@ def add_global_sites(sites: List[str]) -> int:
             s = str(s).strip()
             if not s:
                 continue
-            if not s.startswith(('http://', 'https://')):
-                s = 'https://' + s
-            s = s.rstrip('/').lower()
+            if not s.startswith(("http://", "https://")):
+                s = "https://" + s
+            s = s.rstrip("/").lower()
             result = db.global_sites.update_one(
                 {"url": s},
                 {"$setOnInsert": {"url": s, "added_at": datetime.now()}},
-                upsert=True
+                upsert=True,
             )
-            if result.upserted_id:
+            if getattr(result, "upserted_id", None):
                 added += 1
-        logger.info(f"Added {added} global sites")
         return added
     except Exception as e:
         logger.error(f"Error adding global sites: {e}")
         return 0
 
+
 def clear_global_sites() -> int:
     try:
         db = _get_db()
-        result = db.global_sites.delete_many({})
-        return result.deleted_count
+        return db.global_sites.delete_many({}).deleted_count
     except Exception as e:
         logger.error(f"Error clearing global sites: {e}")
         return 0
 
-# ═══════════════════════════════════════════════════════════════
-# SETTINGS MANAGEMENT (key/value runtime config, used by /setprice)
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# SETTINGS
+# ═══════════════════════════════════════════════════════════════
 def get_setting(key: str, default=None):
-    """Return the value of a setting, or `default` if not set."""
     try:
         db = _get_db()
         doc = db.settings.find_one({"key": key})
@@ -1966,7 +2623,6 @@ def get_setting(key: str, default=None):
 
 
 def set_setting(key: str, value) -> bool:
-    """Upsert a setting value. Returns True on success."""
     try:
         db = _get_db()
         db.settings.update_one(
@@ -1974,30 +2630,29 @@ def set_setting(key: str, value) -> bool:
             {"$set": {"key": key, "value": value, "updated_at": datetime.now()}},
             upsert=True,
         )
-        logger.info(f"Setting '{key}' updated to {value!r}")
         return True
     except Exception as e:
         logger.error(f"Error setting '{key}': {e}")
         return False
 
-# ═══════════════════════════════════════════════════════════════
-# PENDING FEEDBACK MANAGEMENT (persists across restarts)
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# PENDING FEEDBACK
+# ═══════════════════════════════════════════════════════════════
 def save_pending_feedback(pid: str, data: dict) -> bool:
-    """Store a pending feedback entry."""
     try:
         db = _get_db()
-        data["_id"] = pid
-        data["created_at"] = datetime.now()
-        db.pending_feedback.replace_one({"_id": pid}, data, upsert=True)
+        payload = dict(data)
+        payload["_id"] = pid
+        payload["created_at"] = datetime.now()
+        db.pending_feedback.replace_one({"_id": pid}, payload, upsert=True)
         return True
     except Exception as e:
         logger.error(f"Error saving pending feedback {pid}: {e}")
         return False
 
+
 def get_pending_feedback(pid: str) -> Optional[dict]:
-    """Retrieve a pending feedback entry."""
     try:
         db = _get_db()
         return db.pending_feedback.find_one({"_id": pid})
@@ -2005,8 +2660,8 @@ def get_pending_feedback(pid: str) -> Optional[dict]:
         logger.error(f"Error fetching pending feedback {pid}: {e}")
         return None
 
+
 def delete_pending_feedback(pid: str) -> bool:
-    """Delete a pending feedback entry (after approve/reject)."""
     try:
         db = _get_db()
         result = db.pending_feedback.delete_one({"_id": pid})
@@ -2015,8 +2670,8 @@ def delete_pending_feedback(pid: str) -> bool:
         logger.error(f"Error deleting pending feedback {pid}: {e}")
         return False
 
+
 def cleanup_old_pending_feedback(hours: int = 48) -> int:
-    """Remove pending feedback older than N hours. Returns count deleted."""
     try:
         db = _get_db()
         cutoff = datetime.now() - timedelta(hours=hours)
@@ -2026,13 +2681,18 @@ def cleanup_old_pending_feedback(hours: int = 48) -> int:
         logger.error(f"Error cleaning up old pending feedback: {e}")
         return 0
 
-# ═══════════════════════════════════════════════════════════════
-# INITIALIZATION
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# INITIALIZATION (triggers MongoDB → SQLite detection)
+# ═══════════════════════════════════════════════════════════════
 try:
+    # Force backend detection now.
+    _get_db()
     initialize_schema()
-    logger.info("MongoDB database module initialized successfully")
+    if _DB_BACKEND == "sqlite":
+        logger.warning("Running with SQLite fallback (MongoDB unavailable)")
+    else:
+        logger.info("MongoDB database module initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize MongoDB database: {e}")
+    logger.error(f"Failed to initialize database: {e}")
     raise
