@@ -374,7 +374,7 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         # ── BUILD THE RESULT MESSAGE ───────────────────────────────
         user_name_safe = html.escape(user.first_name or "User")
         user_link = f'<a href="tg://user?id={user.id}">{user_name_safe}</a>'
-        dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
+        dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
         user_display = f"{user_link} ({plan_name})"
 
         proxy_indicator = "Admin Proxy (Default)" if is_admin_fallback else "User Proxy"
