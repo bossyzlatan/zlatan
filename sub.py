@@ -21,14 +21,14 @@ except ImportError:
     _USE_POOL = False
 
 ADMIN_IDS = {6962534443, 8761005192, 8428369446}
-LOG_CHANNEL_ID = -1004462990283
+LOG_CHANNEL_ID = -5447284969
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CLAIM BROADCAST
 # Every successful /claim (whether triggered in DM or group)
 # broadcasts the full receipt message to this chat.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CLAIM_BROADCAST_CHAT_ID = -1004462990283
+CLAIM_BROADCAST_CHAT_ID = -5447284969
 
 # Middle segment allows letters AND digits so keys like
 # CARDERX-6H-XXX, CARDERX-12H-XXX, CARDERX-3D-XXX all match.
