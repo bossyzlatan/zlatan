@@ -9,15 +9,15 @@ from typing import Optional, Dict, Any
 # ADMIN & WALLET CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-ADMIN_CONTACT_USERNAME = "Lanxo2"
-ADMIN_CONTACT_URL = "https://t.me/Lanxo2"
+ADMIN_CONTACT_USERNAME = "oozaruh"
+ADMIN_CONTACT_URL = "https://t.me/oozaruh"
 
 USDT_ADDRESSES: Dict[str, Dict[str, str]] = {
     "BEP20": {
         "name": "USDT (BEP20)",
         "network": "BSC BNB Smart Chain (BEP20)",
         "currency": "USDT",
-        "address": "0x905b510ecca97f903edb7455d250f2ecc1854be1"
+        "address": "0xdcbe3d7db8edfc996f409f1932ea2a6a3bf0ed67"
     }
 }
 
