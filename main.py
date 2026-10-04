@@ -83,10 +83,10 @@ WEBHOST = "0.0.0.0"
 WEBPORT = 8080
 
 LOG_CHANNEL_ID = -1004479507133
-BOT_LINK = "https://t.me/zlatanchecker_bot"
-CHANNEL_LINK = "https://t.me/+93nNDkmK2PRjZjg8"
-GROUP_LINK = "https://t.me/+KrM3-0iNKrRjNWJk"
-DEV_LINK = "https://t.me/Lanxo2"
+BOT_LINK = "https://t.me/xcarderxbot"
+CHANNEL_LINK = "https://t.me/xcarderxhub"
+GROUP_LINK = "https://t.me/+-lxinzzcFU41ZDU0"
+DEV_LINK = "https://t.me/oozaruh"
 
 PRICING_TEXT = (
     "<b>┌── <tg-emoji emoji-id='5039623284056917259'>💳</tg-emoji> 𝗣𝗥𝗜𝗖𝗜𝗡𝗚 𝗣𝗟𝗔𝗡𝗦 ──┐</b>\n\n"
