@@ -127,9 +127,9 @@ async def binn_command(message: types.Message):
     user_link = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
     user_display = f"{user_link} ({plan_name})"
 
-    dev_link = '<a href="https://t.me/Lanxo2">Carder X</a>'
+    dev_link = '<a href="https://t.me/oozaruh">Carder X</a>'
     button = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Carder x", url="https://t.me/zlatanchecker_bot", style="primary")]
+        [InlineKeyboardButton(text="Carder x", url="https://t.me/xcarderxbot", style="primary")]
     ])
 
     # 8. Format Response
