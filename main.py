@@ -77,15 +77,15 @@ from whop import whop_command, router as whop_router
 import payments as pay_sys
 import shopify_api
 
-BOT_TOKEN = "8244813830:AAGtHxLSEooI1f1lnh_cALWZasb7KG7pLbc"
+BOT_TOKEN = "8854418593:AAG1XUIPMq6Oaoj_5YDxFP8ArOUm0Rbetc8"
 WEBHOOK_URL = f""
 WEBHOST = "0.0.0.0"
 WEBPORT = 8080
 
-LOG_CHANNEL_ID = -1004479507133
-BOT_LINK = "https://t.me/xcarderxbot"
-CHANNEL_LINK = "https://t.me/xcarderxhub"
-GROUP_LINK = "https://t.me/+-lxinzzcFU41ZDU0"
+LOG_CHANNEL_ID = -1003965699487
+BOT_LINK = "https://t.me/StarkzchkBot"
+CHANNEL_LINK = "https://t.me/starkzhub"
+GROUP_LINK = "https://t.me/+qflz6s3YwPozMjgx"
 DEV_LINK = "https://t.me/oozaruh"
 
 PRICING_TEXT = (
@@ -131,7 +131,7 @@ ADMIN_IDS = {6962534443, 8428369446, 8761005192}
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
-    for chat_target in ["@xcarderxhub", "https://t.me/+-lxinzzcFU41ZDU0"]:
+    for chat_target in ["@starkzhub", "https://t.me/+qflz6s3YwPozMjgx"]:
         try:
             m = await bot.get_chat_member(chat_target, user_id)
             if m.status in ["left", "kicked"]:
@@ -208,11 +208,11 @@ def _status_sync(user_id):
     finally:
         conn.close()
     bold_map = {
-        'a':'𝗮','b':'𝗯','c':'𝗰','d':'𝗱','e':'𝗲','f':'𝗳','g':'𝗴','h':'𝗵','i':'𝗶','j':'𝗷','k':'𝗸','l':'𝗹','m':'𝗺','n':'𝗻','o':'𝗼','p':'𝗽','q':'𝗾','r':'𝗿','s':'𝘀','t':'𝘁','u':'𝘂','v':'𝘃','w':'𝘄','x':'𝗅','y':'𝘆','z':'𝘇',
+        'a':'𝗮','b':'𝗯','c':'𝗰','d':'𝗱','e':'𝗲','f':'𝗳','g':'𝗴','h':'𝗵','i':'𝗶','j':'𝗷','k':'𝗸','l':'𝗹','m':'𝗺','n':'𝗻','o':'𝗼','p':'𝗽','q':'𝗾','r':'𝗿','s':'𝘀','t':'𝘁','u':'𝘂','v':'𝘃','w':'𝘄','x':'𝘅','y':'𝘆','z':'𝘇',
         'A':'𝗔','B':'𝗕','C':'𝗖','D':'𝗗','E':'𝗘','F':'𝗙','G':'𝗚','H':'𝗛','I':'𝗜','J':'𝗝','K':'𝗞','L':'𝗟','M':'𝗠','N':'𝗡','O':'𝗢','P':'𝗣','Q':'𝗤','R':'𝗥','S':'𝗦','T':'𝗧','U':'𝗨','V':'𝗩','W':'𝗪','X':'𝗫','Y':'𝗬','Z':'𝗭'
     }
-    if plan.lower() in ("kashim", "chirag", "darkanon"):
-        plan_formatted = "Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
+    if plan.lower() in ("kashim", "chirag", "darkanon", "starkz"):
+        plan_formatted = "Starkz <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
     else:
         plan_formatted = "".join(bold_map.get(c, c) for c in plan)
     return plan_formatted, joined_str
@@ -220,7 +220,7 @@ def _status_sync(user_id):
 async def _get_caption(user) -> str:
     access_str, joined_str = await asyncio.to_thread(_status_sync, user.id)
     ul = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    dl = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
+    dl = '<a href="https://t.me/oozaruh">Starkz</a>'
     return (
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {ul}\n"
         f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{user.id}</code>\n"
@@ -232,7 +232,7 @@ async def _get_caption(user) -> str:
 
 def _loading_caption(user) -> str:
     ul = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    dl = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
+    dl = '<a href="https://t.me/oozaruh">Starkz</a>'
     return (
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {ul}\n"
         f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗨𝘀𝗲𝗿 𝗜𝗗 ➛ <code>{user.id}</code>\n"
@@ -274,9 +274,9 @@ _FSUB_KB = {
 
 FSUB_TEXT = (
     "<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗠𝗲𝗺𝗯𝗲𝗿𝘀𝗵𝗶𝗽 𝗥𝗲𝗾𝘂𝗶𝗿𝗲𝗱</b>\n\n"
-    "To access <b>Carder X</b>, you must join our official Channel and Group:\n\n"
-    "<b><tg-emoji emoji-id='5424818078833715060'>📢</tg-emoji> 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ➛</b> <a href='https://t.me/+93nNDkmK2PRjZjg8'>Carder X Channel</a>\n"
-    "<b><tg-emoji emoji-id='6237927637906364256'>👥</tg-emoji> 𝗚𝗿𝗼𝘂𝗽 ➛</b> <a href='https://t.me/+KrM3-0iNKrRjNWJk'>Carder X Chats</a>\n\n"
+    "To access <b>Starkz</b>, you must join our official Channel and Group:\n\n"
+    "<b><tg-emoji emoji-id='5424818078833715060'>📢</tg-emoji> 𝗖𝗵𝗮𝗻𝗻𝗲𝗹 ➛</b> <a href='https://t.me/starkzhub'>Starkz Channel</a>\n"
+    "<b><tg-emoji emoji-id='6237927637906364256'>👥</tg-emoji> 𝗚𝗿𝗼𝘂𝗽 ➛</b> <a href='https://t.me/+qflz6s3YwPozMjgx'>Starkz Chats</a>\n\n"
     "<i>Join both links above, then tap <b>Verify Membership</b> below!</i>"
 )
 
@@ -296,7 +296,7 @@ _KB_BACK_CHARGE = _back("menu_charge")
 _KB_PRICING = {
     "inline_keyboard": [
         [{"text": " 𝗣𝗮𝘆 𝗩𝗶𝗮", "callback_data": "menu_payment_methods", "icon_custom_emoji_id": "5039539210072097557", "style": "success"},
-         {"text": "Contact Admin", "url": "https://t.me/Lanxo2", "icon_custom_emoji_id": "5042329873662609701", "style": "primary"}],
+         {"text": "Contact Admin", "url": "https://t.me/oozaruh", "icon_custom_emoji_id": "5042329873662609701", "style": "primary"}],
         _KB_BACK_MAIN["inline_keyboard"][0]
     ]
 }
@@ -311,7 +311,7 @@ _KB_GATES = {
 
 _KB_MASS = {
     "inline_keyboard": [
-        [{"text": " 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 𝗠𝗮𝘀𝘀", "callback_data": "info_msh_gate", "icon_custom_emoji_id": "5039531487720899631", "style": "success"},
+        [{"text": " 𝗦𝘁𝗼𝗽𝗶𝗳𝘆 𝗠𝗮𝘀𝘀", "callback_data": "info_msh_gate", "icon_custom_emoji_id": "5039531487720899631", "style": "success"},
          {"text": " 𝗦𝘁𝗿𝗶𝗽𝗲 𝗠𝗮𝘀𝘀 𝟭$", "callback_data": "info_mst_gate", "icon_custom_emoji_id": "5042297717242463211", "style": "primary"}],
         _KB_BACK_GATES["inline_keyboard"][0]
     ]
@@ -319,7 +319,7 @@ _KB_MASS = {
 
 _KB_CHARGE = {
     "inline_keyboard": [
-        [{"text": " 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 𝗦𝗶𝗻𝗴𝗹𝗲", "callback_data": "info_charge_shopify", "icon_custom_emoji_id": "5039544445637231745", "style": "success"},
+        [{"text": " 𝗦𝘁𝗼𝗽𝗶𝗳𝘆 𝗦𝗶𝗻𝗴𝗹𝗲", "callback_data": "info_charge_shopify", "icon_custom_emoji_id": "5039544445637231745", "style": "success"},
          {"text": " 𝗦𝘁𝗿𝗶𝗽𝗲 𝟭$", "callback_data": "info_charge_stripe", "icon_custom_emoji_id": "5042334757040423886", "style": "primary"}],
         _KB_BACK_GATES["inline_keyboard"][0]
     ]
@@ -342,7 +342,7 @@ STATIC_MENU_MAP: dict = {
     "menu_mass_in_gates": ("<b><tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗦𝗲𝗹𝗲𝗰𝘁 𝗮 𝗠𝗮𝘀𝘀 𝗚𝗮𝘁𝗲</b>", _KB_MASS),
     "menu_charge":        ("<b><tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗦𝗲𝗹𝗲𝗰𝘁 𝗖𝗵𝗮𝗿𝗴𝗲 𝗠𝗲𝘁𝗵𝗼𝗱</b>", _KB_CHARGE),
     "menu_proxy": (
-        "<b>┌── <tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗣𝗥𝗢𝘅𝗬 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧 ──┐</b>\n\n"
+        "<b>┌── <tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗣𝗥𝗢𝗫𝗬 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧 ──┐</b>\n\n"
         "<b><tg-emoji emoji-id='5271604874419647061'>🔧</tg-emoji> 𝗦𝗲𝘁 𝗣𝗿𝗼𝘅𝘆</b>\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/proxy</code>\n"
         "<b>└ 𝗧𝘆𝗽𝗲 ➛</b> 𝗙𝗿𝗲𝗲\n\n"
@@ -373,7 +373,7 @@ STATIC_MENU_MAP: dict = {
         "<b>└ 𝗦𝘁𝗼𝗽 ➛</b> <tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> Button\n"
         "<b>└────────────────┘</b>", _KB_BACK_MASS),
     "info_mstr_gate": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> Stripe Multi Mass\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/mstr</code>\n"
         "<b>├ 𝗟𝗶𝗺𝗶𝘁 ➛</b> 2,000\n"
@@ -422,21 +422,21 @@ STATIC_MENU_MAP: dict = {
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_AUTH),
     "info_charge_stripe": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> Stripe 1$ Charge (Atoti)\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/st</code> or <code>/ffc</code>\n"
         "<b>├ 𝗟𝗶𝗺𝗶𝘁 ➛</b> 1 Card\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_str": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> Stripe Multi\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/str</code>\n"
         "<b>├ 𝗦𝗶𝘁𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱 ➛</b> 6\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_paypal": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> PayPal 0.10$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/pp</code>\n"
         "<b>├ 𝗦𝗶𝘁𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱 ➛</b> 7\n"
@@ -450,58 +450,58 @@ STATIC_MENU_MAP: dict = {
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_payfast": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> PayFast 0.30$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/pf</code>\n"
         "<b>├ 𝗦𝗶𝘁𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱 ➛</b> 1\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_fatzebra": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> FatZebra 4$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/ft</code>\n"
         "<b>├ 𝗦𝗶𝘁𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱 ➛</b> 1\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_nmi": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> NMI 1$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/nmi</code>\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>\n"
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> NMI2 1$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/nmi2</code>\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_bluepay": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> BluePay 20$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/bl</code>\n"
         "<b>├ 𝗦𝗶𝘁𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱 ➛</b> 1\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_authnet": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> Authorize.net 1$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/at</code>\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_payway": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> PayWay 1$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/pw</code>\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_razorpay": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> Razorpay 1₹\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/rz</code>\n"
         "<b>├ 𝗦𝗶𝘁𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱 ➛</b> 5\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
         "<b>└────────────────┘</b>", _KB_BACK_CHARGE),
     "info_charge_payu": (
-        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧Ｅ 𝗜𝗡𝗙𝗢 ──┐</b>\n"
+        "<b>┌── <tg-emoji emoji-id='5341715473882955310'>⚙️</tg-emoji> 𝗚𝗔𝗧𝗘 𝗜𝗡𝗙𝗢 ──┐</b>\n"
         "<b>├ 𝗚𝗮𝘁𝗲 ➛</b> PayU 1$\n"
         "<b>├ 𝗖𝗼𝗺𝗺𝗮𝗻𝗱 ➛</b> <code>/pyu</code>\n"
         "<b>└ 𝗚𝗮𝘁𝗲 𝗛𝗲𝗮𝗹𝘁𝗵 ➛</b> 100%\n"
@@ -642,7 +642,7 @@ async def button_handler(callback: types.CallbackQuery):
 
     if data == "verify_fsub":
         if await is_subscribed(callback.bot, user_id):
-            await _safe_answer(callback, "✅ Membership verified! Welcome to Carder X.", show_alert=True)
+            await _safe_answer(callback, "✅ Membership verified! Welcome to Starkz.", show_alert=True)
             user = callback.from_user
             quick = _loading_caption(user)
             caption_task = asyncio.create_task(_get_caption(user))
