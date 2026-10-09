@@ -26,8 +26,8 @@ API_SERVERS = [
 ]
 
 # Primary API Key configured across the replicas
-SHOPIFY_API_KEY = "DARKANONSHO!!!"
-ALT_API_KEY     = "AnonShopii2026!"
+SHOPIFY_API_KEY = "oozaruhshop"
+ALT_API_KEY     = "oozaruhshop"
 
 # Active servers pool (updated automatically by health checker)
 ACTIVE_API_SERVERS: List[str] = API_SERVERS.copy()
@@ -266,7 +266,7 @@ async def check_site(
 
     try:
         server = get_active_server()
-        key = ALT_API_KEY if ("angelic" in server or "a26f" in server) else SHOPIFY_API_KEY
+        key = SHOPIFY_API_KEY
         params = {"site": site, "key": key}
         if card:
             params["card"] = card
@@ -284,7 +284,7 @@ async def check_site(
         for alt_server in API_SERVERS:
             if alt_server == server:
                 continue
-            alt_key = ALT_API_KEY if ("angelic" in alt_server or "a26f" in alt_server) else SHOPIFY_API_KEY
+            alt_key = SHOPIFY_API_KEY
             alt_params = {"site": site, "key": alt_key}
             if card:
                 alt_params["card"] = card
