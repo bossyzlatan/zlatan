@@ -7,6 +7,8 @@ import re
 import logging
 import io
 import json
+import urllib.parse
+import traceback
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AIogram Imports
@@ -17,7 +19,7 @@ from aiogram.types import FSInputFile, BufferedInputFile
 from database import (
     get_db_connection, get_user_sites_db, add_user_sites_db, clear_user_sites_db,
     get_setting, set_setting,
-    # ── NEW: stripe-site DB helpers ──
+    # ── stripe-site DB helpers ──
     get_global_stripe_sites, set_global_stripe_sites, add_global_stripe_sites,
     clear_global_stripe_sites, get_user_stripe_sites_db, add_user_stripe_sites_db,
     clear_user_stripe_sites_db,
@@ -51,6 +53,14 @@ PROXY_LIST = []
 BAD_PROXIES = set()
 
 DEFAULT_MAX_PRICE = 5.0
+
+
+# ── Logging helper — always flushes so systemd sees output immediately ──
+def _log(msg: str):
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
 
 
 def _get_max_price() -> float:
@@ -139,7 +149,7 @@ STRIPE_DEAD_SITE_ERRORS = [
     'no stripe', 'no_intent', 'no_intent_endpoint', 'no_stripe_pk',
     'site_requires_login', 'site_http_4', 'site_http_5',
     'site_empty', 'site_fetch_error',
-    'not a stripe site', 'not_stripe', 'not shopify!',  # last one – some sites report shopify responses
+    'not a stripe site', 'not_stripe', 'not shopify!',
 ]
 
 router = Router()
@@ -775,6 +785,8 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     global BAD_PROXIES
     BAD_PROXIES.clear()
 
+    _log(f"[SITECHK] run_site_checker START: cmd={command_name} sites={len(sites_to_check)} user={user_id} proxies={len(PROXY_LIST)}")
+
     # Snapshot the price label once — every message in this run uses the same value
     price_label = _price_range_label()
 
@@ -793,12 +805,20 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
     existing_sites = set()
     if command_name == "Adding":
-        existing_sites = set(await asyncio.to_thread(read_sites))
-        print(f"[SITECHK] Found {len(existing_sites)} existing sites for duplicate check")
+        try:
+            existing_sites = set(await asyncio.to_thread(read_sites))
+            _log(f"[SITECHK] Found {len(existing_sites)} existing sites for duplicate check")
+        except Exception as e:
+            _log(f"[SITECHK] Failed to read existing sites: {e}")
 
     async def worker(site):
         async with sem:
-            return await check_site_status(site)
+            try:
+                return await check_site_status(site)
+            except Exception as e:
+                logging.error(f"[SITECHK] check_site_status crashed for {site}: {e}")
+                traceback.print_exc()
+                return site, "ERROR", {"Price": -1.0}, f"Exception: {e}"
 
     tasks = [worker(site) for site in sites_to_check]
 
@@ -808,11 +828,12 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
         except Exception as e:
             checked_count += 1
             dead_count += 1
-            print(f"[LOG] {site} | Error: {e}")
+            _log(f"[LOG] <unknown> | Outer loop error: {e}")
+            traceback.print_exc()
             continue
 
         checked_count += 1
-        print(f"[LOG] {site} | {resp_msg}")
+        _log(f"[LOG] {site} | {resp_msg}")
 
         if status == "KEEP":
             normalized_site = normalize_url(site)
@@ -820,12 +841,12 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                 normalized_existing = {normalize_url(s) for s in existing_sites}
                 if normalized_site in normalized_existing:
                     duplicate_count += 1
-                    print(f"[DUPLICATE SKIPPED] {site} already exists!")
+                    _log(f"[DUPLICATE SKIPPED] {site} already exists!")
                     continue
                 normalized_valid = {normalize_url(s) for s in valid_sites}
                 if normalized_site in normalized_valid:
                     duplicate_count += 1
-                    print(f"[DUPLICATE SKIPPED] {site} duplicate in batch!")
+                    _log(f"[DUPLICATE SKIPPED] {site} duplicate in batch!")
                     continue
 
             live_count += 1
@@ -871,7 +892,9 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
     removed_dupes = len(valid_sites) - len(final_unique_sites)
     if removed_dupes > 0:
-        print(f"[SITECHK] Removed {removed_dupes} internal duplicates before saving")
+        _log(f"[SITECHK] Removed {removed_dupes} internal duplicates before saving")
+
+    _log(f"[SITECHK] Run complete: checked={checked_count} live={live_count} dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
     # ── Save results ────────────────────────────────────────────────────────
     if command_name == "Audit":
@@ -881,9 +904,10 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
         if user_id:
             try:
                 await asyncio.to_thread(add_user_sites_db, user_id, final_unique_sites)
-                print(f"[SITECHK] Saved {len(final_unique_sites)} sites to custom pool for user {user_id}")
+                _log(f"[SITECHK] Saved {len(final_unique_sites)} sites to custom pool for user {user_id}")
             except Exception as ue:
                 logging.error(f"Error saving to user_sites DB: {ue}")
+                traceback.print_exc()
 
     # Report file
     filename = f"report_{command_name.lower()}_{int(time.time())}.txt"
@@ -931,7 +955,10 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
         except:
             pass
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -941,6 +968,8 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Adding", status_message_id=None, user_id=None):
     global BAD_PROXIES
     BAD_PROXIES.clear()
+
+    _log(f"[STRIPECHK] run_stripe_site_checker START: cmd={command_name} sites={len(sites_to_check)} user={user_id} proxies={len(PROXY_LIST)}")
 
     total_sites = len(sites_to_check)
     valid_sites = []
@@ -957,12 +986,20 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
 
     existing_sites = set()
     if command_name == "Adding":
-        existing_sites = set(await asyncio.to_thread(read_stripe_sites))
-        print(f"[STRIPECHK] Found {len(existing_sites)} existing stripe sites for duplicate check")
+        try:
+            existing_sites = set(await asyncio.to_thread(read_stripe_sites))
+            _log(f"[STRIPECHK] Found {len(existing_sites)} existing stripe sites for duplicate check")
+        except Exception as e:
+            _log(f"[STRIPECHK] Failed to read existing stripe sites: {e}")
 
     async def worker(site):
         async with sem:
-            return await check_stripe_site_status(site)
+            try:
+                return await check_stripe_site_status(site)
+            except Exception as e:
+                logging.error(f"[STRIPECHK] check_stripe_site_status crashed for {site}: {e}")
+                traceback.print_exc()
+                return site, "ERROR", {}, f"Exception: {e}"
 
     tasks = [worker(site) for site in sites_to_check]
 
@@ -972,11 +1009,12 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
         except Exception as e:
             checked_count += 1
             dead_count += 1
-            print(f"[STRIPELOG] {site} | Error: {e}")
+            _log(f"[STRIPELOG] <unknown> | Outer loop error: {e}")
+            traceback.print_exc()
             continue
 
         checked_count += 1
-        print(f"[STRIPELOG] {site} | {resp_msg}")
+        _log(f"[STRIPELOG] {site} | {resp_msg}")
 
         if status == "KEEP":
             normalized_site = normalize_url(site)
@@ -984,7 +1022,7 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
                 normalized_existing = {normalize_url(s) for s in existing_sites}
                 if normalized_site in normalized_existing:
                     duplicate_count += 1
-                    print(f"[STRIPE DUP] {site} already exists!")
+                    _log(f"[STRIPE DUP] {site} already exists!")
                     continue
                 normalized_valid = {normalize_url(s) for s in valid_sites}
                 if normalized_site in normalized_valid:
@@ -1031,15 +1069,18 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
 
     removed_dupes = len(valid_sites) - len(final_unique_sites)
 
+    _log(f"[STRIPECHK] Run complete: checked={checked_count} live={live_count} dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
+
     # Save results to STRIPE pool only
     if command_name == "Adding":
         await asyncio.to_thread(add_stripe_sites, final_unique_sites)
         if user_id:
             try:
                 await asyncio.to_thread(add_user_stripe_sites_db, user_id, final_unique_sites)
-                print(f"[STRIPECHK] Saved {len(final_unique_sites)} stripe sites to user {user_id}")
+                _log(f"[STRIPECHK] Saved {len(final_unique_sites)} stripe sites to user {user_id}")
             except Exception as ue:
                 logging.error(f"Error saving stripe sites to user DB: {ue}")
+                traceback.print_exc()
 
     # Report file
     filename = f"stripe_report_{int(time.time())}.txt"
@@ -1086,7 +1127,10 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
         except:
             pass
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
+        except Exception:
+            pass
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1186,6 +1230,8 @@ async def addsite_command(message: types.Message):
             await message.answer("<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> <b>No valid sites found in file.</b>", parse_mode="HTML")
             return
 
+        _log(f"[ADDSITE] Parsed {len(new_sites)} unique sites from uploaded file (user={user_id})")
+
     except Exception as e:
         logging.error(f"Error downloading file: {e}", exc_info=True)
         await message.answer(f"<tg-emoji emoji-id='6234166879663987'>❌</tg-emoji> <b>Error reading file:</b> {e}", parse_mode="HTML")
@@ -1270,6 +1316,8 @@ async def stripesite_command(message: types.Message):
                 parse_mode="HTML"
             )
             return
+
+        _log(f"[STRIPESITE] Parsed {len(new_sites)} unique stripe sites from uploaded file (user={user_id})")
 
     except Exception as e:
         logging.error(f"Error downloading stripe sites file: {e}", exc_info=True)
