@@ -19,10 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 # HOSTED API SERVERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 API_SERVERS = [
-    "https://api-production-d12e.up.railway.app",
-    "https://api-production-62e5.up.railway.app",
-    "https://api-production-9ff0.up.railway.app",
-    "https://api-production-2dfa1.up.railway.app",
+    "https://starkz-shopi.duckdns.org",
 ]
 
 # Primary API Key configured across the replicas
