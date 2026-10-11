@@ -204,6 +204,17 @@ _SQLITE_TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
         ("url", "TEXT PRIMARY KEY"),
         ("added_at", "TEXT"),
     ],
+    "global_stripe_sites": [
+        ("url", "TEXT PRIMARY KEY"),
+        ("added_at", "TEXT"),
+    ],
+    "user_stripe_sites": [
+        ("user_id", "INTEGER"),
+        ("url", "TEXT"),
+        ("price", "REAL DEFAULT 0"),
+        ("added_at", "TEXT"),
+        ("PRIMARY KEY (user_id, url)", ""),
+    ],
     "eren_generators": [
         ("user_id", "INTEGER PRIMARY KEY"),
         ("granted_at", "TEXT"),
@@ -2005,6 +2016,9 @@ def initialize_schema():
         ensure_settings_table()
         db = _get_db()
         db.global_sites.create_index("url", unique=True)
+        db.global_stripe_sites.create_index("url", unique=True)
+        db.user_stripe_sites.create_index([("user_id", 1), ("url", 1)], unique=True)
+        db.user_stripe_sites.create_index("user_id")
         for gate in ["ST", "STR", "PF", "VBV", "FT", "BL", "PP", "AT", "PW", "PYU"]:
             ensure_stats_table(gate)
         _migrate_numeric_and_date_fields()
@@ -2717,6 +2731,124 @@ def clear_global_sites() -> int:
         return db.global_sites.delete_many({}).deleted_count
     except Exception as e:
         logger.error(f"Error clearing global sites: {e}")
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL STRIPE SITES (mirror of global_sites, separate pool)
+# ═══════════════════════════════════════════════════════════════
+def get_global_stripe_sites() -> List[str]:
+    try:
+        db = _get_db()
+        return [s["url"] for s in db.global_stripe_sites.find({}, {"url": 1, "_id": 0})]
+    except Exception as e:
+        logger.error(f"Error fetching global stripe sites: {e}")
+        return []
+
+
+def set_global_stripe_sites(sites: List[str]) -> int:
+    try:
+        db = _get_db()
+        db.global_stripe_sites.drop()
+        docs = []
+        if sites:
+            docs = [{"url": s.strip(), "added_at": datetime.now()}
+                    for s in sites if s and s.strip()]
+            for d in docs:
+                db.global_stripe_sites.insert_one(d)
+        return len(docs)
+    except Exception as e:
+        logger.error(f"Error setting global stripe sites: {e}")
+        return 0
+
+
+def add_global_stripe_sites(sites: List[str]) -> int:
+    added = 0
+    try:
+        db = _get_db()
+        for s in sites:
+            s = str(s).strip()
+            if not s:
+                continue
+            if not s.startswith(("http://", "https://")):
+                s = "https://" + s
+            s = s.rstrip("/").lower()
+            result = db.global_stripe_sites.update_one(
+                {"url": s},
+                {"$setOnInsert": {"url": s, "added_at": datetime.now()}},
+                upsert=True,
+            )
+            if getattr(result, "upserted_id", None):
+                added += 1
+        return added
+    except Exception as e:
+        logger.error(f"Error adding global stripe sites: {e}")
+        return 0
+
+
+def clear_global_stripe_sites() -> int:
+    try:
+        db = _get_db()
+        return db.global_stripe_sites.delete_many({}).deleted_count
+    except Exception as e:
+        logger.error(f"Error clearing global stripe sites: {e}")
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# USER STRIPE SITES (mirror of user_sites, separate pool)
+# ═══════════════════════════════════════════════════════════════
+def get_user_stripe_sites_db(user_id: int) -> List[str]:
+    try:
+        db = _get_db()
+        sites = db.user_stripe_sites.find(
+            {"user_id": int(user_id)}, {"url": 1, "_id": 0}
+        ).sort("_id", 1)
+        return [s["url"] for s in sites]
+    except Exception as e:
+        logger.error(f"Error fetching user stripe sites for {user_id}: {e}")
+        return []
+
+
+def add_user_stripe_sites_db(user_id: int, sites: List[str]) -> int:
+    added = 0
+    try:
+        db = _get_db()
+        for s in sites:
+            if not s:
+                continue
+            url = str(s).strip()
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            url = url.lower().rstrip("/")
+            try:
+                result = db.user_stripe_sites.update_one(
+                    {"user_id": int(user_id), "url": url},
+                    {"$setOnInsert": {
+                        "user_id": int(user_id),
+                        "url": url,
+                        "price": 0.0,
+                        "added_at": datetime.now(),
+                    }},
+                    upsert=True,
+                )
+                if getattr(result, "upserted_id", None) is not None:
+                    added += 1
+            except Exception as e:
+                logger.error(f"Error inserting stripe site {url} for user {user_id}: {e}")
+        logger.info(f"Added {added} stripe sites for user {user_id} (input: {len(sites)})")
+    except Exception as e:
+        logger.error(f"Error adding stripe sites for user {user_id}: {e}")
+    return added
+
+
+def clear_user_stripe_sites_db(user_id: int) -> int:
+    try:
+        db = _get_db()
+        result = db.user_stripe_sites.delete_many({"user_id": int(user_id)})
+        return result.deleted_count
+    except Exception as e:
+        logger.error(f"Error clearing stripe sites for {user_id}: {e}")
         return 0
 
 
