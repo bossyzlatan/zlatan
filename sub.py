@@ -21,18 +21,14 @@ except ImportError:
     _USE_POOL = False
 
 ADMIN_IDS = {6962534443, 8761005192, 8428369446}
-LOG_CHANNEL_ID = -5447284969
+LOG_CHANNEL_ID = -1003965699487
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CLAIM BROADCAST
-# Every successful /claim (whether triggered in DM or group)
-# broadcasts the full receipt message to this chat.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CLAIM_BROADCAST_CHAT_ID = -5447284969
+CLAIM_BROADCAST_CHAT_ID = -1003965699487
 
-# Middle segment allows letters AND digits so keys like
-# CARDERX-6H-XXX, CARDERX-12H-XXX, CARDERX-3D-XXX all match.
-KEY_PATTERN = re.compile(r'CARDERX-[A-Z0-9]+-[A-Z0-9]+')
+KEY_PATTERN = re.compile(r'STARKZ-[A-Z0-9]+-[A-Z0-9]+')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -308,7 +304,7 @@ def revoke_generator_rights(user_id):
 
 def generate_receipt_id():
     random_str = "".join(random.choices(string.digits, k=6))
-    return f"CARDERX-{random_str}-CHK"
+    return f"STARKZ-{random_str}-CHK"
 
 
 def mask_receipt_id(receipt_id):
@@ -555,7 +551,7 @@ def _g_code_db_sync(amount):
     try:
         cursor = conn.cursor()
         for _ in range(amount):
-            code = "CARDERX-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            code = "STARKZ-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
             cursor.execute("INSERT INTO codes (code, credits) VALUES (%s, %s)", (code, 100))
             generated.append(code)
         conn.commit()
@@ -574,7 +570,7 @@ def _gen_plan_keys_db_sync(plan, plan_name, duration_hours, amount):
     try:
         cursor = conn.cursor()
         for _ in range(amount):
-            key = f"CARDERX-{plan.upper()}-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+            key = f"STARKZ-{plan.upper()}-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
             cursor.execute(
                 "INSERT INTO plan_keys (key, plan, plan_name, days, duration_hours, credits) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",
@@ -673,7 +669,7 @@ _BUY_TEXT = (
 _BUY_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text='𝗕𝘂𝘆 𝗡𝗼𝘄', callback_data="menu_payment_methods", style="success"),
-        InlineKeyboardButton(text='Contact Admin', url="https://t.me/Lanxo2", style="primary")
+        InlineKeyboardButton(text='Contact Admin', url="https://t.me/oozaruh", style="primary")
     ]
 ])
 
@@ -733,13 +729,13 @@ async def eren_admin_command(message: types.Message):
     caption = (
         f"𝐂𝐨𝐧𝐠𝐫𝐚𝐭𝐮𝐥𝐚𝐭𝐢𝐨𝐧𝐬!🎉 𝐲𝐨𝐮𝐫 𝐚𝐜𝐜𝐞𝐬𝐬 𝐡𝐚𝐬 𝐛𝐞𝐞𝐧 𝐚𝐜𝐭𝐢𝐯𝐚𝐭𝐞𝐝.\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_link}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> (UNLIMITED)\n"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ Starkz <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> (UNLIMITED)\n"
         f"𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ➛ {format_duration(duration_hours)}\n"
         f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>𝗥𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗 ➛</b> <code>{receipt_id}</code>\n"
         f"𝗽𝗹𝗲𝗮𝘀𝗲 𝘀𝗮𝘃𝗲 𝘁𝗵𝗶𝘀 𝗿𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗."
     )
     support_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/Lanxo2", style="primary")]
+        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/oozaruh", style="primary")]
     ])
 
     try:
@@ -819,7 +815,7 @@ async def sub_command(message: types.Message):
     masked_id = mask_receipt_id(receipt_id)
 
     caption = (
-        f"𝐂𝐨𝐧𝐠𝐫𝐚𝐭𝐮𝐥𝐚𝐭𝐢𝐨𝐧𝐬!🎉 𝐲𝐨𝐮𝐫 𝐚𝐜𝐜𝐞𝐬𝘀 𝐡𝐚𝐬 𝐛𝐞𝐞𝐧 𝐚𝐜𝐭𝐢𝐯𝐚𝐭𝐞𝐝.\n"
+        f"𝐂𝐨𝐧𝐠𝐫𝐚𝐭𝐮𝐥𝐚𝐭𝐢𝐨𝐧𝐬!🎉 𝐲𝐨𝐮𝐫 𝐚𝐜𝐜𝐞𝐬𝐬 𝐡𝐚𝐬 𝐛𝐞𝐞𝐧 𝐚𝐜𝐭𝐢𝐯𝐚𝐭𝐞𝐝.\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_link}\n"
         f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗔𝗰𝗰𝗲𝘀𝘀 ➛ {plan_name}\n"
         f"𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ➛ {format_duration(duration_hours)}\n"
@@ -827,7 +823,7 @@ async def sub_command(message: types.Message):
         f"𝗽𝗹𝗲𝗮𝘀𝗲 𝘀𝗮𝘃𝗲 𝘁𝗵𝗶𝘀 𝗿𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗."
     )
     support_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/Lanxo2", style="primary")]
+        [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/oozaruh", style="primary")]
     ])
     log_text = (
         f"<b>🛒 𝗡𝗘𝗪 𝗣𝗟𝗔𝗡 𝗣𝗨𝗥𝗖𝗛𝗔𝗦𝗘𝗗</b>\n"
@@ -1277,7 +1273,7 @@ async def rc_command(message: types.Message):
         f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗥𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗 ➛ <code>{row['receipt_id']}</code>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", style="primary")]
+        [InlineKeyboardButton(text="STARKZ", url="https://t.me/StarkzchkBot", style="primary")]
     ])
     await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -1328,7 +1324,7 @@ async def info_command(message: types.Message):
         f"𝗝𝗼𝗶𝗻𝗲𝗱 ➛ <b>{joined_disp}</b>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="CARDER X", url="https://t.me/zlatanchecker_bot", style="primary")]
+        [InlineKeyboardButton(text="STARKZ", url="https://t.me/StarkzchkBot", style="primary")]
     ])
     await message.reply(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -1423,8 +1419,8 @@ async def claim_command(message: types.Message):
 
         final_status = None
         final_data = None
-        claimed_count = 0   # keys that were already claimed by someone
-        invalid_count = 0   # keys that are invalid / errored
+        claimed_count = 0
+        invalid_count = 0
 
         for code in codes_to_try:
             status, result_data = await asyncio.to_thread(
@@ -1461,7 +1457,7 @@ async def claim_command(message: types.Message):
                 f"𝗽𝗹𝗲𝗮𝘀𝗲 𝘀𝗮𝘃𝗲 𝘁𝗵𝗶𝘀 𝗿𝗲𝗰𝗲𝗶𝗽𝘁 𝗜𝗗."
             )
             support_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/Lanxo2", style="primary")]
+                [InlineKeyboardButton(text="𝗦𝘂𝗽𝗽𝗼𝗿𝘁", url="https://t.me/oozaruh", style="primary")]
             ])
             await message.reply(caption, parse_mode="HTML", reply_markup=support_kb)
 
@@ -1479,7 +1475,6 @@ async def claim_command(message: types.Message):
             except Exception:
                 pass
 
-            # ── Broadcast the full receipt message to the group chat ──
             broadcast_caption = (
                 "<b>🎁 𝗞𝗘𝗬 𝗖𝗟𝗔𝗜𝗠𝗘𝗗</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1496,7 +1491,6 @@ async def claim_command(message: types.Message):
                 logging.warning(f"[claim] broadcast to group failed: {e}")
 
         elif claimed_count == len(codes_to_try) and len(codes_to_try) > 1:
-            # Every key in the replied message is already claimed
             await message.reply(
                 f"<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
                 f"𝗔𝗹𝗹 <b>{len(codes_to_try)}</b> 𝗸𝗲𝘆𝘀 𝗶𝗻 𝘁𝗵𝗶𝘀 𝗺𝗲𝘀𝘀𝗮𝗴𝗲 𝗵𝗮𝘃𝗲 "
@@ -1504,8 +1498,6 @@ async def claim_command(message: types.Message):
                 parse_mode="HTML"
             )
         elif claimed_count > 0:
-            # At least one key was already claimed (single-key case, or
-            # partial claim where the remaining keys were invalid).
             await message.reply(
                 "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> "
                 "𝗧𝗵𝗶𝘀 𝗸𝗲𝘆 𝗵𝗮𝘀 𝗮𝗹𝗿𝗲𝗮𝗱𝘆 𝗯𝗲𝗲𝗻 𝗰𝗹𝗮𝗶𝗺𝗲𝗱."
@@ -1635,4 +1627,4 @@ async def eren_command(message: types.Message):
                 parse_mode="HTML"
             )
         else:
-            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Error revoking generator rights.")
+            await message.reply("<tg-emoji emoji-id='6237864167869663987'>❌</tg-emoji> Error revoking generator rights.")
