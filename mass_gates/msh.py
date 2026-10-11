@@ -58,9 +58,9 @@ BTN_LIVE_EMOJI_ID = "5039844895779455925"
 BTN_STOP_EMOJI_ID = "5040042498634810056"
 BTN_ALL_EMOJI_ID = "5447602197439218445"
 
-HIT_LOG_GROUP_ID = -1004479507133
+HIT_LOG_GROUP_ID = -1003965699487
 
-EXTRA_CHARGED_GROUP_IDS = [-1004437051761, -1003934518771]
+EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 
 BUTTON_LOCK_SECONDS = 30
 
@@ -664,6 +664,8 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
+                    if any(k in p for k in ["kashim", "chirag", "darkanon", "starkz"]):
+                        return 'Starkz <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p: return "𝗘𝗹𝗶𝘁𝗲 <tg-emoji emoji-id='5278751923338490157'>⭐</tg-emoji>"
                     if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
@@ -932,13 +934,13 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
     lines = []
     lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃          CARDER X              ┃")
+    lines.append("┃           STARKZ               ┃")
     lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
     lines.append("")
     lines.append(f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {type_label} {type_emoji}")
     lines.append(f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ {total_count}")
-    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗜𝗙𝘆 𝗠𝗮𝘀𝘀")
-    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Carder X")
+    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗜𝗳𝘆 𝗠𝗮𝘀𝘀")
+    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Starkz")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
 
@@ -974,7 +976,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             lines.append(f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ {bank}")
             lines.append(f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ {country_display}")
             lines.append(f"👤 𝗨𝘀𝗲𝗿 ➛ {user_display}")
-            lines.append(f"🐈‍⬛ 𝗗𝗲𝘃 ➛ Carder X")
+            lines.append(f"🐈‍⬛ 𝗗𝗲𝘃 ➛ Starkz")
             lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             lines.append("")
 
@@ -985,7 +987,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     type_map = {"charged": "CHARGED", "live": "LIVE", "dead": "DEAD", "all": "ALL"}
-    filename = f"CARDERX_{type_map.get(result_type, 'ALL')}_{timestamp}.txt"
+    filename = f"STARKZ_{type_map.get(result_type, 'ALL')}_{timestamp}.txt"
 
     return file_buffer, filename, total_count
 
@@ -998,7 +1000,7 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
     user_link = build_user_link(user_obj)
     gateway_display = html_escape(f"Shopify {price} USD")
     safe_response = html_escape(str(response_msg))
-    dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
+    dev_link = '<a href="https://t.me/oozaruh">Starkz</a>'
     user_display = f"{user_link} ({plan_name})"
     safe_proxy = str(proxy_status_formatted)
 
@@ -1016,7 +1018,7 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="CARDER X", url="https://t.me/xcarderxbot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="STARKZ", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     await _safe_send_animation_or_text(
@@ -1037,7 +1039,7 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
     safe_proxy = str(proxy_status_formatted)
     gif_url = await get_anime_gif()
     user_link = build_user_link(user_obj)
-    dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
+    dev_link = '<a href="https://t.me/oozaruh">Starkz</a>'
     user_display = f"{user_link} ({plan_name})"
 
     caption = (
@@ -1053,7 +1055,7 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="CARDER X", url="https://t.me/xcarderxbot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="STARKZ", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     try:
@@ -1087,7 +1089,7 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
     safe_proxy = str(proxy_status_formatted)
     gif_url = await get_anime_gif()
     user_link = build_user_link(user_obj)
-    dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
+    dev_link = '<a href="https://t.me/oozaruh">Starkz</a>'
     user_display = f"{user_link} ({plan_name})"
 
     caption = (
@@ -1103,7 +1105,7 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
     )
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Carder X", url="https://t.me/xcarderxbot", icon_custom_emoji_id="5042097984083330584", style="primary")]
+        [InlineKeyboardButton(text="Starkz", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     try:
@@ -1220,7 +1222,7 @@ async def update_progress_message(bot: Bot, session_id):
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/+-lxinzzcFU41ZDU0'>Carder X</a>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/oozaruh'>Starkz</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
@@ -2026,7 +2028,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/+-lxinzzcFU41ZDU0'>Carder X</a>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/oozaruh'>Starkz</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
