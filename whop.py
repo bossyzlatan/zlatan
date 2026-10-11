@@ -6,24 +6,14 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-def _safe_print(*args, **kwargs):
-    try:
-        sys.stdout.write(" ".join(str(a) for a in args) + kwargs.get("end", "\n"))
-        sys.stdout.flush()
-    except Exception:
-        pass
-
-print = _safe_print
-
-import asyncio
+import os
 import re
 import html
 import logging
+import asyncio
 import time
 import psycopg2.extras
-import json
 import random
-import urllib.parse
 from datetime import datetime
 
 from aiogram import types, F, Router
@@ -78,8 +68,8 @@ user_last_command_time = {}
 
 ADMIN_IDS = {6962534443, 8428369446, 8761005192}
 
-CHARGED_GROUP_CHAT_ID = -1004384293344
-SUMMARY_GROUP_CHAT_ID = -5447284969
+CHARGED_GROUP_CHAT_ID = -5447284969
+SUMMARY_GROUP_CHAT_ID = -1003965699487
 
 DEFAULT_ADMIN_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
@@ -147,8 +137,8 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "zlatan", "darkanon", "carderx"]):
-                        return 'Carder X <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
+                    if any(k in p for k in ["kashim", "chirag", "zlatan", "darkanon", "carderx", "starkz"]):
+                        return 'Starkz <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "root" in p:
                         return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p:
@@ -374,7 +364,7 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
         # ── BUILD THE RESULT MESSAGE ───────────────────────────────
         user_name_safe = html.escape(user.first_name or "User")
         user_link = f'<a href="tg://user?id={user.id}">{user_name_safe}</a>'
-        dev_link = '<a href="https://t.me/+-lxinzzcFU41ZDU0">Carder X</a>'
+        dev_link = '<a href="https://t.me/oozaruh">Starkz</a>'
         user_display = f"{user_link} ({plan_name})"
 
         proxy_indicator = "Admin Proxy (Default)" if is_admin_fallback else "User Proxy"
@@ -404,14 +394,14 @@ async def process_whop_check(message, proc_msg, user, user_id, formatted_cc, cc,
 
         reply_markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="CARDER X",
-                url="https://t.me/zlatanchecker_bot",
+                text="STARKZ",
+                url="https://t.me/StarkzchkBot",
                 icon_custom_emoji_id="5042097984083330584",
                 style="primary"
             )]
         ])
 
-        # ── SEND RESULT (flat, no deep nesting) ────────────────────
+        # ── SEND RESULT ────────────────────────────────────────────
         edited_ok = False
         try:
             await proc_msg.edit_text(
