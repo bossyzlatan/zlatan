@@ -441,7 +441,7 @@ async def rtvproxy_command(message: types.Message):
 
         lines = []
         lines.append("════════════════════════════════════════")
-        lines.append("         ALL PROXIES — CARDER X")
+        lines.append("         ALL PROXIES — STARKZ")
         lines.append("════════════════════════════════════════")
         lines.append(f"Total Users   : {total_users}")
         lines.append(f"Total Proxies : {total_proxies}")
