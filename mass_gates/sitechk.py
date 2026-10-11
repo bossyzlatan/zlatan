@@ -83,6 +83,12 @@ DEAD_ERRORS = [
     'error processing card', 'failed to get token', 'failed to get checkout',
     'failed to add to cart', 'site overloaded', 'site rate limited',
     'failed to get session token', 'unable to get payment token', 'no valid products',
+    # ── NEW: proper classification of NO_PRODUCT responses ──
+    'no_product',
+    'no products found',
+    'no products under',
+    'throttled',
+    # ─────────────────────────────────────────────────────────
     'site error! status: 403', 'payment method is not shopify!', 'not shopify!',
     'site error! status: 401', 'site requires login!',
     'site error! status: 429', 'cart failed with status 429', 'returned status 429',
@@ -460,23 +466,47 @@ def normalize_url(url: str) -> str:
 
 
 def normalize_proxy(proxy: str) -> str:
+    """
+    Normalize any of these formats into a single URL form
+    "http://user:pass@host:port":
+
+        user pass host port       (space-separated)
+        ip:port
+        ip:port:user:pass
+        user:pass@host:port
+        http://... / https://... / socks5://...
+    """
     if not proxy or not proxy.strip():
         return ""
     proxy = proxy.strip()
+
+    # Already has a scheme
     if proxy.startswith(('http://', 'https://')):
         return proxy
     if proxy.startswith('socks5://'):
         return 'http://' + proxy[9:]
-    if '@' in proxy and ':' in proxy.split('@')[0]:
-        return f'http://{proxy}'
-    parts = proxy.split()
-    if len(parts) == 4:
-        user, pwd, host, port = parts
+
+    # Space-separated:  user pass host port
+    parts_ws = proxy.split()
+    if len(parts_ws) == 4:
+        user, pwd, host, port = parts_ws
         return f'http://{user}:{pwd}@{host}:{port}'
-    if ':' in proxy and '@' not in proxy:
-        parts = proxy.split(':')
-        if len(parts) == 2 and parts[1].isdigit():
-            return f'http://{proxy}'
+
+    # URL form without scheme:  user:pass@host:port
+    if '@' in proxy:
+        return f'http://{proxy}'
+
+    # Colon-separated
+    parts = proxy.split(':')
+    if len(parts) == 2 and parts[1].isdigit():
+        # host:port
+        return f'http://{proxy}'
+    if len(parts) == 4:
+        # ip:port:user:pass
+        ip, port, user, password = parts
+        return f'http://{user}:{password}@{ip}:{port}'
+
+    # Fallback — best effort
     return f'http://{proxy}'
 
 
@@ -512,13 +542,15 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str) -> d
     try:
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
         api_proxy = normalize_proxy(proxy)
+
+        # ── FIX: keep the "http://" scheme intact. ──────────────────
+        # The API's _parse_proxy() needs "://" to recognise URL-form
+        # proxies like "http://user:pass@host:port". Stripping the
+        # scheme caused the API to silently fall back to its own IP,
+        # which gets throttled by Shopify → every site returned
+        # "NO_PRODUCT: THROTTLED".
         api_proxy_clean = api_proxy
-        if api_proxy_clean.startswith("http://"):
-            api_proxy_clean = api_proxy_clean[7:]
-        elif api_proxy_clean.startswith("https://"):
-            api_proxy_clean = api_proxy_clean[8:]
-        elif api_proxy_clean.startswith("socks5://"):
-            api_proxy_clean = api_proxy_clean[9:]
+        # ─────────────────────────────────────────────────────────────
 
         servers_to_try = [get_active_server()]
         for s in API_SERVERS:
@@ -687,20 +719,16 @@ async def check_stripe_site_status(site_url: str) -> tuple:
         status = result.get("status", "")
         combined = f"{response_msg} {message} {status}".lower()
 
-        # Site is dead / not a Stripe site
         for err in STRIPE_DEAD_SITE_ERRORS:
             if err in combined:
                 return site_url, "REMOVE", {}, f"Not a Stripe site: {message or response_msg}"
 
-        # If we got any recognizable Stripe response, keep the site
         if any(k in combined for k in STRIPE_SUCCESS_RESPONSES):
             return site_url, "KEEP", {}, f"Stripe OK: {message or response_msg or status}"
 
-        # If API returned a valid card response of any kind, keep the site
         if result.get("charged") or result.get("approved"):
             return site_url, "KEEP", {}, f"Stripe OK: {status or response_msg}"
 
-        # Generic response – keep but flag
         return site_url, "KEEP", {}, f"Unclassified: {message or response_msg or status}"
 
     return site_url, "ERROR", {}, "Max retries reached"
@@ -710,7 +738,6 @@ async def check_stripe_site_status(site_url: str) -> tuple:
 
 async def check_site_status(site_url: str) -> tuple:
     MAX_RETRIES = 3
-    # Snapshot the max price once per site so it can't change mid-run
     max_price = _get_max_price()
     for attempt in range(MAX_RETRIES):
         proxy = get_random_proxy()
@@ -787,7 +814,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
     _log(f"[SITECHK] run_site_checker START: cmd={command_name} sites={len(sites_to_check)} user={user_id} proxies={len(PROXY_LIST)}")
 
-    # Snapshot the price label once — every message in this run uses the same value
     price_label = _price_range_label()
 
     total_sites = len(sites_to_check)
@@ -881,7 +907,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             except Exception:
                 pass
 
-    # Final dedup
     final_unique_sites = []
     seen_normalized = set()
     for site in valid_sites:
@@ -896,7 +921,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
     _log(f"[SITECHK] Run complete: checked={checked_count} live={live_count} dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
-    # ── Save results ────────────────────────────────────────────────────────
     if command_name == "Audit":
         await asyncio.to_thread(write_sites, final_unique_sites)
     elif command_name == "Adding":
@@ -909,7 +933,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                 logging.error(f"Error saving to user_sites DB: {ue}")
                 traceback.print_exc()
 
-    # Report file
     filename = f"report_{command_name.lower()}_{int(time.time())}.txt"
     file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     file_content += f"TOTAL CHECKED: {total_sites}\n"
@@ -962,7 +985,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
 
 # ══════════════════════════════════════════════════════════════════
-# BACKGROUND WORKER — STRIPE SITES (separate from Shopify)
+# BACKGROUND WORKER — STRIPE SITES
 # ══════════════════════════════════════════════════════════════════
 
 async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Adding", status_message_id=None, user_id=None):
@@ -1058,7 +1081,6 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
             except Exception:
                 pass
 
-    # Final dedup
     final_unique_sites = []
     seen_normalized = set()
     for site in valid_sites:
@@ -1071,7 +1093,6 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
 
     _log(f"[STRIPECHK] Run complete: checked={checked_count} live={live_count} dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
-    # Save results to STRIPE pool only
     if command_name == "Adding":
         await asyncio.to_thread(add_stripe_sites, final_unique_sites)
         if user_id:
@@ -1082,7 +1103,6 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
                 logging.error(f"Error saving stripe sites to user DB: {ue}")
                 traceback.print_exc()
 
-    # Report file
     filename = f"stripe_report_{int(time.time())}.txt"
     file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     file_content += f"TOTAL STRIPE SITES CHECKED: {total_sites}\n"
@@ -1134,7 +1154,7 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /sitechk — Audit & Clean (DB first, txt fallback)
+# /sitechk — Audit & Clean
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("sitechk"))
@@ -1257,12 +1277,11 @@ async def addsite_command(message: types.Message):
 
 
 # ══════════════════════════════════════════════════════════════════
-# ── /stripesite — Add & Verify Stripe Sites (separate pool) ──
+# ── /stripesite — Add & Verify Stripe Sites
 # ══════════════════════════════════════════════════════════════════
 
 @router.message(Command("stripesite"))
 async def stripesite_command(message: types.Message):
-    """Admin-only: upload a .txt file with Stripe sites to validate and add."""
     user_id = message.from_user.id
     if not is_admin(user_id):
         await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
@@ -1347,18 +1366,12 @@ async def stripesite_command(message: types.Message):
 
 
 # ══════════════════════════════════════════════════════════════════
-# ── /mystripesite — Download all Stripe sites as a .txt file ──
+# ── /mystripesite
 # ══════════════════════════════════════════════════════════════════
 
 @router.message(Command("mystripesite"))
 async def mystripesite_command(message: types.Message):
-    """
-    Sends the user's Stripe sites (or the global pool if the user has none)
-    as a .txt file. Users can also pass 'global' to force the global pool.
-    """
     user_id = message.from_user.id
-
-    # Optional arg: /mystripesite global → force global pool
     args = message.text.split()[1:] if message.text else []
     force_global = bool(args and args[0].lower() == "global")
 
@@ -1400,7 +1413,6 @@ async def mystripesite_command(message: types.Message):
 @router.message(Command("clearstripesites"))
 @router.message(Command("clearstripesite"))
 async def clearstripesites_command(message: types.Message):
-    """Clear the user's custom Stripe sites pool."""
     user_id = message.from_user.id
     deleted = await asyncio.to_thread(clear_user_stripe_sites_db, user_id)
     await message.reply(
@@ -1411,7 +1423,7 @@ async def clearstripesites_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /mysites — Custom user pool (SHOPIFY)
+# /mysites
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("mysites"))
@@ -1454,7 +1466,7 @@ async def clearsites_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /siteall — Download global sites
+# /siteall
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("siteall"))
@@ -1488,7 +1500,7 @@ async def siteall_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /removeall — Clear every global site
+# /removeall
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("removeall"))
@@ -1511,7 +1523,7 @@ async def removeall_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /dedupe — Force deduplicate global pool
+# /dedupe
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("dedupe"))
@@ -1554,7 +1566,7 @@ async def dedupe_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /proxyinfo — Proxy diagnostics
+# /proxyinfo
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("proxyinfo"))
@@ -1585,7 +1597,7 @@ async def proxyinfo_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /resetproxy — Clear bad list
+# /resetproxy
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("resetproxy"))
@@ -1608,7 +1620,7 @@ async def resetproxy_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /remsite — Remove & ban a single site
+# /remsite
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("remsite"))
@@ -1653,12 +1665,11 @@ async def remsite_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /setprice — Change the max accepted price for site checks
+# /setprice
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("setprice"))
 async def setprice_command(message: types.Message):
-    """Admin-only: set the maximum accepted price for /sitechk and /addsite."""
     user_id = message.from_user.id
     if not is_admin(user_id):
         await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
