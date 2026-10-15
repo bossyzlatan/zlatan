@@ -799,6 +799,9 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
         _http = _get_msh_http_session()
         for server in servers_to_try:
             current_api = f"{server}/shopify"
+            _fallbacks = [s for s in sites_list if s != site]
+            random.shuffle(_fallbacks)
+            fallback_str = ",".join(_fallbacks[:2]
             for key in [SHOPIFY_API_KEY, ALT_API_KEY]:
                 params = {
                     "site": site,
@@ -806,6 +809,8 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
                     "proxy": api_proxy,
                     "key": key
                 }
+                if fallback_str:
+                    params["fallback_sites"] = fallback_str
                 try:
                     async with _http.get(current_api, params=params) as response:
                         http_status = response.status
