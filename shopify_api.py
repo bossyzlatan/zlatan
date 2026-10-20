@@ -20,6 +20,8 @@ from typing import Optional, Dict, Any, List, Tuple
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 API_SERVERS = [
     "https://starkz-shopi.duckdns.org",
+    "https://starkz-shopi1.duckdns.org",
+    "https://starkz-shopi2.duckdns.org",
 ]
 
 # Primary API Key configured across the replicas
