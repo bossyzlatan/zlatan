@@ -792,7 +792,7 @@ async def process_card_api(
     if fallback_sites:
         alts = [s for s in fallback_sites if s and s != site]
         random.shuffle(alts)
-        fallback_str = ",".join(alts[:2])
+        fallback_str = ",".join(alts[:20])
 
     try:
         _http = _get_msh_http_session()
@@ -1495,8 +1495,17 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 break
 
             # ── v3.8.1: pool exhausted → no point retrying the same API
-            elif ("SITE_ERROR" in message_upper and "exhausted" in message_lower):
-                logging.info(f"[MSH] Pool exhausted for {cc_formatted}: {message}")
+                       # ── Pool exhausted or empty → no point retrying the same API
+            elif (
+                "SITE_ERROR" in message_upper
+                and (
+                    "exhausted" in message_lower
+                    or "pool is empty" in message_lower
+                    or "no sites" in message_lower
+                    or "all sites excluded" in message_lower
+                )
+            ):
+                logging.info(f"[MSH] Pool unavailable for {cc_formatted}: {message}")
                 result_status = "ERROR"
                 response_msg = "Pool Exhausted"
                 break
