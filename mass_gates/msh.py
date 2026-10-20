@@ -358,6 +358,12 @@ class ProxyManager:
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
 
+        # ═══ FIX #1 ═══ The API now returns Response:"PROXY_ERROR" over HTTP 200
+        # when the transport fails. Detect this before the http_status check
+        # below (which would otherwise force False for any 200 response).
+        if "proxy_error" in response_lower or "proxy error" in response_lower:
+            return True
+
         for success_indicator in self.SUCCESS_RESPONSES:
             if success_indicator.lower() in response_lower:
                 return False
@@ -555,7 +561,8 @@ RETRY_ERRORS = [
     '504', 'server error', 'client error', 'failed',
     'token not found', 'invalid_response', 'resolve', 'item', 'curl error',
     'could not resolve host', 'connect tunnel failed',
-    'timeout', 'proxy error', 'http 429', '429', 'too many requests',
+    'timeout', 'proxy error', 'proxy_error',           # ═══ FIX #2 ═══
+    'http 429', '429', 'too many requests',
     'payment method not available', 'site not supported', 'captcha_required',
     'payments_credit_card_brand_not_supported', 'delivery_delivery_line_detail_changed',
     'delivery_no_delivery_strategy_available_for_mercha', 'delivery_no_delivery_strategy_available',
@@ -1494,8 +1501,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
-            # ── v3.8.1: pool exhausted → no point retrying the same API
-                       # ── Pool exhausted or empty → no point retrying the same API
+            # ── Pool exhausted or empty → no point retrying the same API
             elif (
                 "SITE_ERROR" in message_upper
                 and (
