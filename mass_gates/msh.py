@@ -59,7 +59,6 @@ BTN_STOP_EMOJI_ID = "5040042498634810056"
 BTN_ALL_EMOJI_ID = "5447602197439218445"
 
 HIT_LOG_GROUP_ID = -1003965699487
-
 EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 
 BUTTON_LOCK_SECONDS = 30
@@ -68,6 +67,7 @@ MSH_SESSIONS = {}
 SESSION_LOCKS = {}
 
 _MSH_HTTP_SESSION = None
+
 
 def _get_msh_http_session():
     global _MSH_HTTP_SESSION
@@ -358,9 +358,8 @@ class ProxyManager:
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
 
-        # ═══ FIX #1 ═══ The API now returns Response:"PROXY_ERROR" over HTTP 200
-        # when the transport fails. Detect this before the http_status check
-        # below (which would otherwise force False for any 200 response).
+        # ═══ FIX ═══ The API returns Response:"PROXY_ERROR" over HTTP 200.
+        # Must be detected BEFORE the http_status==200 early-return below.
         if "proxy_error" in response_lower or "proxy error" in response_lower:
             return True
 
@@ -561,7 +560,7 @@ RETRY_ERRORS = [
     '504', 'server error', 'client error', 'failed',
     'token not found', 'invalid_response', 'resolve', 'item', 'curl error',
     'could not resolve host', 'connect tunnel failed',
-    'timeout', 'proxy error', 'proxy_error',           # ═══ FIX #2 ═══
+    'timeout', 'proxy error', 'proxy_error',          # ═══ FIX ═══
     'http 429', '429', 'too many requests',
     'payment method not available', 'site not supported', 'captcha_required',
     'payments_credit_card_brand_not_supported', 'delivery_delivery_line_detail_changed',
@@ -1501,7 +1500,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
-            # ── Pool exhausted or empty → no point retrying the same API
             elif (
                 "SITE_ERROR" in message_upper
                 and (
@@ -1530,8 +1528,14 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 else:
                     session.setdefault('_blacklisted_sites', set()).add(site)
 
-                    is_rate_limit = any(rl in message_lower for rl in ["429", "too many requests", "http 429", "generic_error", "generic error", "throttled"])
-                    if is_rate_limit:
+                    # ═══ FIX ═══ Only decrement attempt for API-level 429s.
+                    # Site-level throttled/generic errors must increment the
+                    # retry counter, otherwise an empty pool loops forever.
+                    is_api_rate_limit = (
+                        "api error: http 429" in message_lower
+                        or "api rate limit" in message_lower
+                    )
+                    if is_api_rate_limit:
                         attempt = max(0, attempt - 1)
                         await asyncio.sleep(0.3)
 
