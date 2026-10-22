@@ -29,7 +29,7 @@ from typing import Optional, Dict, Any, List
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 API_SERVERS = [
-    "shopi-production-8424.up.railway.app",
+    "https://shopi-production-8424.up.railway.app",
 ]
 
 SHOPIFY_API_KEY = "oozaruhshop"
