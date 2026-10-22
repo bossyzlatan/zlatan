@@ -10,35 +10,26 @@ import json
 import urllib.parse
 import traceback
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AIogram Imports
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from aiogram import types, F, Router, Bot
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, BufferedInputFile
 from database import (
     get_db_connection, get_user_sites_db, add_user_sites_db, clear_user_sites_db,
     get_setting, set_setting,
-    # ── stripe-site DB helpers ──
     get_global_stripe_sites, set_global_stripe_sites, add_global_stripe_sites,
     clear_global_stripe_sites, get_user_stripe_sites_db, add_user_stripe_sites_db,
     clear_user_stripe_sites_db,
 )
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 ADMIN_IDS = [6962534443, 8428369446, 8761005192]
 
 TEST_CARD = "4023961988369649|09|27|335"
 
-# ── Stripe gate config (used by /stripesite validation) ──────────
 STRIPE_PRIMARY_API = "https://atoti-production.up.railway.app/charge"
 STRIPE_PRIMARY_KEY = "DARKANONSHO!!!"
 STRIPE_FALLBACK_API = "https://stripeapi-production-76a7.up.railway.app/stripe/check"
 STRIPE_FALLBACK_KEY = "darkanon"
-STRIPE_TEST_CARD = "4023961988369649|09|27|335"   # same as TEST_CARD
+STRIPE_TEST_CARD = "4023961988369649|09|27|335"
 
 try:
     from shopify_api import get_active_server, SHOPIFY_API_KEY, ALT_API_KEY, API_SERVERS
@@ -54,8 +45,10 @@ BAD_PROXIES = set()
 
 DEFAULT_MAX_PRICE = 5.0
 
+# ═══ SPEED FIX: parallel fake-check + faster add mode ═══
+MAX_CONCURRENT_CHECKS = int(os.environ.get("SITECHK_CONCURRENCY", 100))
 
-# ── Logging helper — always flushes so systemd sees output immediately ──
+
 def _log(msg: str):
     try:
         print(msg, flush=True)
@@ -64,7 +57,6 @@ def _log(msg: str):
 
 
 def _get_max_price() -> float:
-    """Read the current max price from settings (falls back to 5.0)."""
     try:
         return float(get_setting("sitechk_max_price", DEFAULT_MAX_PRICE))
     except Exception:
@@ -72,7 +64,6 @@ def _get_max_price() -> float:
 
 
 def _price_range_label() -> str:
-    """Human-friendly label like '0–5.00' for use in status text."""
     return f"$0-{_get_max_price():.2f}"
 
 
@@ -83,12 +74,7 @@ DEAD_ERRORS = [
     'error processing card', 'failed to get token', 'failed to get checkout',
     'failed to add to cart', 'site overloaded', 'site rate limited',
     'failed to get session token', 'unable to get payment token', 'no valid products',
-    # ── NEW: proper classification of NO_PRODUCT responses ──
-    'no_product',
-    'no products found',
-    'no products under',
-    'throttled',
-    # ─────────────────────────────────────────────────────────
+    'no_product', 'no products found', 'no products under', 'throttled',
     'site error! status: 403', 'payment method is not shopify!', 'not shopify!',
     'site error! status: 401', 'site requires login!',
     'site error! status: 429', 'cart failed with status 429', 'returned status 429',
@@ -102,20 +88,13 @@ DEAD_ERRORS = [
     'step 1 failed', 'step 0 failed', 'step 2 failed', 'step 3 failed', 'step 4 failed',
     'step 5 failed', 'step 6 failed', 'step 7 failed', 'step 9 failed', 'step 10 failed',
     'missing stableid', 'missing buildid', 'missing sourcetoken',
-    'could not extract private_access_token',
-    'could not find actions js url',
-    'missing proposal', 'missing submit id',
-    'retryable: inventory reservation failure',
-    'exceeded 30 poll attempts',
-    'could not extract queuetoken',
-    'could not extract identification signature',
-    'could not extract session id',
-    'could not extract delivery handle',
-    'could not extract signedhandles',
-    'could not extract shipping amount',
-    'could not extract total amount',
-    'could not extract receiptid',
-    'could not extract sessiontoken',
+    'could not extract private_access_token', 'could not find actions js url',
+    'missing proposal', 'missing submit id', 'retryable: inventory reservation failure',
+    'exceeded 30 poll attempts', 'could not extract queuetoken',
+    'could not extract identification signature', 'could not extract session id',
+    'could not extract delivery handle', 'could not extract signedhandles',
+    'could not extract shipping amount', 'could not extract total amount',
+    'could not extract receiptid', 'could not extract sessiontoken',
     'errstoreincompatible', 'errmissingreceiptid', 'fetch products',
     'payments_credit_card_brand_not_supported', 'delivery_delivery_line_detail_changed',
     'delivery_no_delivery_strategy_available_for_mercha', 'delivery_address',
@@ -126,24 +105,23 @@ DEAD_ERRORS = [
     'Unknown Response: no shipping handle obtained', 'no shipping handle obtained',
     'Unknown Response: NO_PRODUCT_FOUND', 'NO_PRODUCT_FOUND',
     'Unknown Response: session token not found in HTML', 'session token not found in HTML',
-    'TAX_NEW_TAX_MUST_BE_ACCEPTED',
-    'Unknown Response: TAX_NEW_TAX_MUST_BE_ACCEPTED',
+    'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'Unknown Response: TAX_NEW_TAX_MUST_BE_ACCEPTED',
     'Unknown Response: DELIVERY_INVALID_POSTAL_CODE_FOR_COUNTRY', 'DELIVERY_INVALID_POSTAL_CODE_FOR_COUNTRY',
     'Unknown Response: Error parsing submit: value', 'Error parsing submit: value',
     'Unknown Response: FRAUD_SUSPECTED', 'FRAUD_SUSPECTED',
     'DECISION_RULE_BLOCK', 'Unknown Response: Cart failed with status 422',
     'Unknown Response: DECISION_RULE_BLOCK',
-    'Unknown Response: ARTIFACT_DISSATISFACTION', 'ARTIFACT_DISSATISFACTION'
+    'Unknown Response: ARTIFACT_DISSATISFACTION', 'ARTIFACT_DISSATISFACTION',
 ]
 
 SUCCESS_RESPONSES = [
     'CARD_DECLINED', 'INVALID_CVC', 'INCORRECT_CVV', 'INSUFFICIENT_FUNDS',
     '3DS_REQUIRED', 'AMOUNT_TOO_SMALL',
     'ORDER_PAID', 'OTP_REQUIRED', 'ORDER_PLACED',
-    'insufficient_funds', 'invalid_cvc'
+    'insufficient_funds', 'invalid_cvc',
+    'SITE_VALIDATED',
 ]
 
-# ── Stripe-specific responses ────────────────────────────────────
 STRIPE_SUCCESS_RESPONSES = [
     'charged', 'approved', 'declined', 'insufficient',
     'card_declined', 'expired_card', 'incorrect_cvc', 'invalid_cvc',
@@ -154,33 +132,22 @@ STRIPE_SUCCESS_RESPONSES = [
 STRIPE_DEAD_SITE_ERRORS = [
     'no stripe', 'no_intent', 'no_intent_endpoint', 'no_stripe_pk',
     'site_requires_login', 'site_http_4', 'site_http_5',
-    'site_empty', 'site_fetch_error',
-    'not a stripe site', 'not_stripe', 'not shopify!',
+    'site_empty', 'site_fetch_error', 'not a stripe site', 'not_stripe', 'not shopify!',
 ]
 
 router = Router()
 
 
 async def _push_sites_after_change(label: str = "sitechk"):
-    """
-    Push global_sites from MongoDB to all API replicas after any mutation
-    (addsite / removeall / remsite / dedupe / audit). Runs in the
-    background — never blocks the command handler.
-
-    Also invalidates the msh.py site cache so the next /msh run picks up
-    the new pool immediately.
-    """
     try:
         from mass_gates.msh import invalidate_sites_cache
         from shopify_api import push_sites_to_all_replicas
         from database import get_global_sites
-
         invalidate_sites_cache()
         fresh = await asyncio.to_thread(get_global_sites)
         if not fresh:
-            logging.warning(f"[{label}] pool empty after mutation — nothing to push")
+            logging.warning(f"[{label}] pool empty after mutation")
             return
-
         result = await push_sites_to_all_replicas(fresh)
         ok = sum(1 for r in result["results"].values() if r.get("ok"))
         detail = {
@@ -188,9 +155,8 @@ async def _push_sites_after_change(label: str = "sitechk"):
                 (r.get("pool_size") if r.get("ok") else r.get("error"))
             for host, r in result["results"].items()
         }
-        logging.info(
-            f"[{label}] pushed {result['pushed']} sites to {ok}/{len(result['results'])} replicas: {detail}"
-        )
+        logging.info(f"[{label}] pushed {result['pushed']} sites to "
+                     f"{ok}/{len(result['results'])} replicas: {detail}")
     except Exception as e:
         logging.error(f"[{label}] push failed: {e}", exc_info=True)
 
@@ -199,16 +165,13 @@ SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sites.txt
 STRIPE_SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stripe_sites.txt")
 BANNED_SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banned_sites.json")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DB-FIRST SITE MANAGEMENT (txt fallback only if DB is down)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _db_read_global_sites():
     try:
         from database import get_global_sites
         return get_global_sites()
     except Exception as e:
-        logging.warning(f"[SITECHK] DB read failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB read failed: {e}")
         return None
 
 
@@ -218,7 +181,7 @@ def _db_write_global_sites(sites_list):
         set_global_sites(sites_list)
         return True
     except Exception as e:
-        logging.warning(f"[SITECHK] DB write failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB write failed: {e}")
         return False
 
 
@@ -227,7 +190,7 @@ def _db_add_global_sites(new_sites):
         from database import add_global_sites
         return add_global_sites(new_sites)
     except Exception as e:
-        logging.warning(f"[SITECHK] DB add failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB add failed: {e}")
         return None
 
 
@@ -239,7 +202,7 @@ def _db_remove_global_site(site_url):
         result = db.global_sites.delete_one({"url": normalized})
         return result.deleted_count > 0
     except Exception as e:
-        logging.warning(f"[SITECHK] DB remove failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB remove failed: {e}")
         return None
 
 
@@ -248,17 +211,15 @@ def _db_clear_global_sites():
         from database import clear_global_sites
         return clear_global_sites()
     except Exception as e:
-        logging.warning(f"[SITECHK] DB clear failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB clear failed: {e}")
         return None
 
-
-# ── Stripe-site DB helpers ──────────────────────────────────────
 
 def _db_read_global_stripe_sites():
     try:
         return get_global_stripe_sites()
     except Exception as e:
-        logging.warning(f"[SITECHK] DB stripe read failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB stripe read failed: {e}")
         return None
 
 
@@ -267,7 +228,7 @@ def _db_write_global_stripe_sites(sites_list):
         set_global_stripe_sites(sites_list)
         return True
     except Exception as e:
-        logging.warning(f"[SITECHK] DB stripe write failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB stripe write failed: {e}")
         return False
 
 
@@ -275,7 +236,7 @@ def _db_add_global_stripe_sites(new_sites):
     try:
         return add_global_stripe_sites(new_sites)
     except Exception as e:
-        logging.warning(f"[SITECHK] DB stripe add failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB stripe add failed: {e}")
         return None
 
 
@@ -283,11 +244,9 @@ def _db_clear_global_stripe_sites():
     try:
         return clear_global_stripe_sites()
     except Exception as e:
-        logging.warning(f"[SITECHK] DB stripe clear failed, will fallback to txt: {e}")
+        logging.warning(f"[SITECHK] DB stripe clear failed: {e}")
         return None
 
-
-# ── txt file helpers (fallback only) ────────────────────────────
 
 def _txt_read_sites():
     if not os.path.exists(SITES_FILE):
@@ -353,8 +312,6 @@ def _txt_add_stripe_sites(new_sites):
     return added
 
 
-# ── Unified API (used by all commands) ──────────────────────────
-
 def read_sites():
     db_sites = _db_read_global_sites()
     if db_sites is not None:
@@ -362,18 +319,16 @@ def read_sites():
             return db_sites
         legacy = _txt_read_sites()
         if legacy:
-            logging.info(f"[SITECHK] Migrating {len(legacy)} legacy sites from txt → DB")
+            logging.info(f"[SITECHK] Migrating {len(legacy)} legacy sites txt → DB")
             _db_write_global_sites(legacy)
             return legacy
         return []
-    logging.warning("[SITECHK] Using txt fallback for read_sites()")
     return _txt_read_sites()
 
 
 def write_sites(sites_list):
     if _db_write_global_sites(sites_list):
         return len(set(sites_list))
-    logging.warning("[SITECHK] Using txt fallback for write_sites()")
     return _txt_write_sites(sites_list)
 
 
@@ -381,13 +336,11 @@ def add_sites(new_sites):
     db_added = _db_add_global_sites(new_sites)
     if db_added is not None:
         return db_added
-    logging.warning("[SITECHK] Using txt fallback for add_sites()")
     return _txt_add_sites(new_sites)
 
 
 def remove_site(site_url):
     normalized = normalize_url(site_url)
-
     db_result = _db_remove_global_site(site_url)
     if db_result is not None:
         try:
@@ -398,8 +351,6 @@ def remove_site(site_url):
         except Exception:
             pass
         return db_result
-
-    logging.warning("[SITECHK] Using txt fallback for remove_site()")
     txt_sites = _txt_read_sites()
     filtered = [s for s in txt_sites if normalize_url(s) != normalized]
     if len(filtered) != len(txt_sites):
@@ -416,14 +367,10 @@ def clear_all_sites():
         except Exception:
             pass
         return db_count
-
-    logging.warning("[SITECHK] Using txt fallback for clear_all_sites()")
     txt_sites = _txt_read_sites()
     _txt_write_sites([])
     return len(txt_sites)
 
-
-# ── Unified STRIPE-site API (separate pool) ─────────────────────
 
 def read_stripe_sites():
     db_sites = _db_read_global_stripe_sites()
@@ -432,18 +379,15 @@ def read_stripe_sites():
             return db_sites
         legacy = _txt_read_stripe_sites()
         if legacy:
-            logging.info(f"[SITECHK] Migrating {len(legacy)} legacy stripe sites from txt → DB")
             _db_write_global_stripe_sites(legacy)
             return legacy
         return []
-    logging.warning("[SITECHK] Using txt fallback for read_stripe_sites()")
     return _txt_read_stripe_sites()
 
 
 def write_stripe_sites(sites_list):
     if _db_write_global_stripe_sites(sites_list):
         return len(set(sites_list))
-    logging.warning("[SITECHK] Using txt fallback for write_stripe_sites()")
     return _txt_write_stripe_sites(sites_list)
 
 
@@ -451,7 +395,6 @@ def add_stripe_sites(new_sites):
     db_added = _db_add_global_stripe_sites(new_sites)
     if db_added is not None:
         return db_added
-    logging.warning("[SITECHK] Using txt fallback for add_stripe_sites()")
     return _txt_add_stripe_sites(new_sites)
 
 
@@ -463,14 +406,10 @@ def clear_all_stripe_sites():
         except Exception:
             pass
         return db_count
-
-    logging.warning("[SITECHK] Using txt fallback for clear_all_stripe_sites()")
     txt_sites = _txt_read_stripe_sites()
     _txt_write_stripe_sites([])
     return len(txt_sites)
 
-
-# ── Proxy helpers ───────────────────────────────────────────────
 
 def load_user_proxies(user_id):
     global PROXY_LIST, BAD_PROXIES
@@ -481,7 +420,7 @@ def load_user_proxies(user_id):
         PROXY_LIST = [str(row[0]).strip() for row in cursor.fetchall() if row[0] and str(row[0]).strip()]
         conn.close()
     except Exception as e:
-        logging.error(f"Error loading proxies from db: {e}")
+        logging.error(f"Error loading proxies: {e}")
         PROXY_LIST = []
     if not PROXY_LIST:
         from gates.st import DEFAULT_PROXIES
@@ -501,47 +440,25 @@ def normalize_url(url: str) -> str:
 
 
 def normalize_proxy(proxy: str) -> str:
-    """
-    Normalize any of these formats into a single URL form
-    "http://user:pass@host:port":
-
-        user pass host port       (space-separated)
-        ip:port
-        ip:port:user:pass
-        user:pass@host:port
-        http://... / https://... / socks5://...
-    """
     if not proxy or not proxy.strip():
         return ""
     proxy = proxy.strip()
-
-    # Already has a scheme
     if proxy.startswith(('http://', 'https://')):
         return proxy
     if proxy.startswith('socks5://'):
         return 'http://' + proxy[9:]
-
-    # Space-separated:  user pass host port
     parts_ws = proxy.split()
     if len(parts_ws) == 4:
         user, pwd, host, port = parts_ws
         return f'http://{user}:{pwd}@{host}:{port}'
-
-    # URL form without scheme:  user:pass@host:port
     if '@' in proxy:
         return f'http://{proxy}'
-
-    # Colon-separated
     parts = proxy.split(':')
     if len(parts) == 2 and parts[1].isdigit():
-        # host:port
         return f'http://{proxy}'
     if len(parts) == 4:
-        # ip:port:user:pass
         ip, port, user, password = parts
         return f'http://{user}:{password}@{ip}:{port}'
-
-    # Fallback — best effort
     return f'http://{proxy}'
 
 
@@ -573,19 +490,12 @@ def _get_sitechk_http_session():
     return _SITECHK_HTTP_SESSION
 
 
-async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str) -> dict:
+async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str,
+                              validate_only: bool = False) -> dict:
     try:
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
         api_proxy = normalize_proxy(proxy)
-
-        # ── FIX: keep the "http://" scheme intact. ──────────────────
-        # The API's _parse_proxy() needs "://" to recognise URL-form
-        # proxies like "http://user:pass@host:port". Stripping the
-        # scheme caused the API to silently fall back to its own IP,
-        # which gets throttled by Shopify → every site returned
-        # "NO_PRODUCT: THROTTLED".
         api_proxy_clean = api_proxy
-        # ─────────────────────────────────────────────────────────────
 
         servers_to_try = [get_active_server()]
         for s in API_SERVERS:
@@ -600,6 +510,8 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str) -> d
             current_api = f"{server}/shopify"
             for key in [SHOPIFY_API_KEY, ALT_API_KEY]:
                 params = {"site": site_url, "cc": cc_formatted, "proxy": api_proxy_clean, "key": key}
+                if validate_only:
+                    params["validate_only"] = "true"
                 try:
                     async with _http.get(current_api, params=params, timeout=timeout, ssl=False) as resp:
                         if resp.status == 200:
@@ -630,10 +542,8 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str) -> d
                     last_error = "CLIENT_ERROR"
                     last_resp_msg = str(ex)
                     break
-
         return {"success": False, "response": last_resp_msg, "price": "-1.0",
                 "proxy_status": "Live", "gateway": "", "error": last_error}
-
     except asyncio.TimeoutError:
         return {"success": False, "response": "Timeout Error", "price": "-1.0",
                 "proxy_status": "Dead", "gateway": "", "error": "TIMEOUT"}
@@ -652,28 +562,16 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str) -> d
                 "proxy_status": "Dead", "gateway": "", "error": "UNKNOWN_ERROR"}
 
 
-# ══════════════════════════════════════════════════════════════════
-# ── STRIPE API CALL (used by /stripesite validation) ──
-# ══════════════════════════════════════════════════════════════════
-
 async def call_stripe_check_api(site_url: str, cc_formatted: str, proxy: str) -> dict:
-    """
-    Validate a site against the Stripe API. Returns a dict similar to
-    call_site_check_api so the checker logic can be reused.
-    """
     try:
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
         api_proxy = normalize_proxy(proxy)
         cc_encoded = cc_formatted.replace("|", "%7C")
         proxy_encoded = urllib.parse.quote(api_proxy) if api_proxy else ""
-
         _http = _get_sitechk_http_session()
 
-        # Primary endpoint
-        primary_url = (
-            f"{STRIPE_PRIMARY_API}?cc={cc_encoded}&key={STRIPE_PRIMARY_KEY}"
-            f"&amount=1&proxy={proxy_encoded}"
-        )
+        primary_url = (f"{STRIPE_PRIMARY_API}?cc={cc_encoded}&key={STRIPE_PRIMARY_KEY}"
+                       f"&amount=1&proxy={proxy_encoded}")
         try:
             async with _http.get(primary_url, timeout=timeout, ssl=False) as resp:
                 if resp.status == 200:
@@ -685,18 +583,13 @@ async def call_stripe_check_api(site_url: str, cc_formatted: str, proxy: str) ->
                         "status": str(data.get("status", "")),
                         "charged": str(data.get("Charged", "")).lower() == "true",
                         "approved": str(data.get("Approved", "")).lower() == "true",
-                        "gateway": "Stripe",
-                        "error": None,
-                        "raw": data,
+                        "gateway": "Stripe", "error": None, "raw": data,
                     }
         except Exception as e:
-            logging.warning(f"[STRIPE] Primary endpoint failed: {e}")
+            logging.warning(f"[STRIPE] Primary failed: {e}")
 
-        # Fallback endpoint
-        fallback_url = (
-            f"{STRIPE_FALLBACK_API}?gate=corrigan&key={STRIPE_FALLBACK_KEY}"
-            f"&cc={cc_encoded}&proxy={proxy_encoded}"
-        )
+        fallback_url = (f"{STRIPE_FALLBACK_API}?gate=corrigan&key={STRIPE_FALLBACK_KEY}"
+                        f"&cc={cc_encoded}&proxy={proxy_encoded}")
         try:
             async with _http.get(fallback_url, timeout=timeout, ssl=False) as resp:
                 if resp.status == 200:
@@ -708,17 +601,13 @@ async def call_stripe_check_api(site_url: str, cc_formatted: str, proxy: str) ->
                         "status": str(data.get("status", "")),
                         "charged": str(data.get("Charged", "")).lower() == "true",
                         "approved": str(data.get("Approved", "")).lower() == "true",
-                        "gateway": "Stripe",
-                        "error": None,
-                        "raw": data,
+                        "gateway": "Stripe", "error": None, "raw": data,
                     }
         except Exception as e:
-            logging.warning(f"[STRIPE] Fallback endpoint failed: {e}")
-
+            logging.warning(f"[STRIPE] Fallback failed: {e}")
         return {"success": False, "response": "Stripe API unreachable",
                 "message": "", "status": "", "charged": False, "approved": False,
                 "gateway": "", "error": "STRIPE_API_ERROR", "raw": {}}
-
     except asyncio.TimeoutError:
         return {"success": False, "response": "Timeout", "message": "", "status": "",
                 "charged": False, "approved": False, "gateway": "", "error": "TIMEOUT", "raw": {}}
@@ -729,54 +618,43 @@ async def call_stripe_check_api(site_url: str, cc_formatted: str, proxy: str) ->
 
 
 async def check_stripe_site_status(site_url: str) -> tuple:
-    """
-    Validate a single Stripe site. Returns (site, status, data, response_msg).
-    Status is one of: KEEP / REMOVE / ERROR
-    """
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
         proxy = get_random_proxy()
         result = await call_stripe_check_api(site_url, STRIPE_TEST_CARD, proxy)
-
         if result.get("error") in ("PROXY_ERROR", "TIMEOUT") and attempt < MAX_RETRIES - 1:
             mark_proxy_bad(proxy)
             await asyncio.sleep(0.5)
             continue
-
         if not result.get("success"):
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(0.5)
                 continue
             return site_url, "REMOVE", {}, result.get("response", "Unknown Error")
-
         response_msg = result.get("response", "")
         message = result.get("message", "")
         status = result.get("status", "")
         combined = f"{response_msg} {message} {status}".lower()
-
         for err in STRIPE_DEAD_SITE_ERRORS:
             if err in combined:
                 return site_url, "REMOVE", {}, f"Not a Stripe site: {message or response_msg}"
-
         if any(k in combined for k in STRIPE_SUCCESS_RESPONSES):
             return site_url, "KEEP", {}, f"Stripe OK: {message or response_msg or status}"
-
         if result.get("charged") or result.get("approved"):
             return site_url, "KEEP", {}, f"Stripe OK: {status or response_msg}"
-
         return site_url, "KEEP", {}, f"Unclassified: {message or response_msg or status}"
-
     return site_url, "ERROR", {}, "Max retries reached"
 
 
-# ══════════════════════════════════════════════════════════════════
-
-async def check_site_status(site_url: str) -> tuple:
+async def check_site_status(site_url: str, validate_only: bool = False) -> tuple:
     MAX_RETRIES = 3
     max_price = _get_max_price()
     for attempt in range(MAX_RETRIES):
         proxy = get_random_proxy()
-        result = await call_site_check_api(site_url=site_url, cc_formatted=TEST_CARD, proxy=proxy)
+        result = await call_site_check_api(
+            site_url=site_url, cc_formatted=TEST_CARD, proxy=proxy,
+            validate_only=validate_only,
+        )
         response_msg = result.get("response", "Unknown")
         price_str = result.get("price", "-1.0")
         error_type = result.get("error")
@@ -814,17 +692,24 @@ async def check_site_status(site_url: str) -> tuple:
             if not (0.00 <= actual_price <= max_price):
                 return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> ${max_price:.2f} Rejected) | {response_msg}"
 
+            # ═══ SKIP fake-check if validate_only ═══
+            if validate_only:
+                return site_url, "KEEP", {"Price": actual_price}, f"${actual_price:.2f} | {response_msg}"
+
+            # ═══ PARALLEL FAKE-CHECK ═══
             FAKE_CARDS = ["4003035140199121|11|29|470", "4400666318254873|03|27|336"]
-            fake_charged = 0
-            for fake_cc in FAKE_CARDS:
-                try:
-                    f_result = await call_site_check_api(site_url=site_url, cc_formatted=fake_cc, proxy=proxy)
-                    f_resp = f_result.get("response", "").lower()
-                    if any(k in f_resp for k in ["thank you", "order_placed", "charged", "order_paid"]):
-                        fake_charged += 1
-                        break
-                except Exception:
-                    pass
+            fake_results = await asyncio.gather(
+                *[call_site_check_api(site_url=site_url, cc_formatted=fc, proxy=proxy)
+                  for fc in FAKE_CARDS],
+                return_exceptions=True,
+            )
+            fake_charged = sum(
+                1 for r in fake_results
+                if isinstance(r, dict) and any(
+                    k in str(r.get("response", "")).lower()
+                    for k in ["thank you", "order_placed", "charged", "order_paid"]
+                )
+            )
 
             if fake_charged >= 1:
                 return site_url, "REMOVE", {"Price": actual_price}, f"Fake Charge Detected (Fake Card Approved) | {response_msg}"
@@ -835,22 +720,18 @@ async def check_site_status(site_url: str) -> tuple:
             return site_url, "KEEP", {"Price": 0.0}, f"Unknown Response: {response_msg}"
 
         return site_url, "REMOVE", {"Price": -1.0}, response_msg
-
     return site_url, "ERROR", {"Price": -1.0}, "Max Retries Reached"
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BACKGROUND WORKER — SHOPIFY SITES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Audit", status_message_id=None, user_id=None):
+async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Audit",
+                            status_message_id=None, user_id=None):
     global BAD_PROXIES
     BAD_PROXIES.clear()
 
-    _log(f"[SITECHK] run_site_checker START: cmd={command_name} sites={len(sites_to_check)} user={user_id} proxies={len(PROXY_LIST)}")
+    _log(f"[SITECHK] START: cmd={command_name} sites={len(sites_to_check)} "
+         f"user={user_id} proxies={len(PROXY_LIST)} concurrency={MAX_CONCURRENT_CHECKS}")
 
     price_label = _price_range_label()
-
     total_sites = len(sites_to_check)
     valid_sites = []
     working_sites_content = []
@@ -858,26 +739,53 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     live_count = 0
     dead_count = 0
     duplicate_count = 0
-
     last_edit_time = 0
     MIN_EDIT_INTERVAL = 2.0
     CHECKS_PER_UPDATE = 20
-    sem = asyncio.Semaphore(30)
 
-    existing_sites = set()
+    # ═══ SPEED FIX: filter existing BEFORE validating ═══
     if command_name == "Adding":
         try:
             existing_sites = set(await asyncio.to_thread(read_sites))
-            _log(f"[SITECHK] Found {len(existing_sites)} existing sites for duplicate check")
+            if existing_sites:
+                normalized_existing = {normalize_url(s) for s in existing_sites}
+                original_count = len(sites_to_check)
+                sites_to_check = [s for s in sites_to_check
+                                  if normalize_url(s) not in normalized_existing]
+                pre_filtered = original_count - len(sites_to_check)
+                if pre_filtered > 0:
+                    _log(f"[SITECHK] Pre-filtered {pre_filtered}/{original_count} existing "
+                         f"— validating {len(sites_to_check)}")
+                duplicate_count = pre_filtered
         except Exception as e:
             _log(f"[SITECHK] Failed to read existing sites: {e}")
+
+    if not sites_to_check:
+        _log(f"[SITECHK] All {total_sites} sites already exist")
+        if status_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_message_id,
+                    text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>{command_name} Complete!</b>\n\n"
+                         f"<b>Total Submitted:</b> {total_sites}\n"
+                         f"<b>Already Existed:</b> {duplicate_count}\n"
+                         f"<b>New Sites Added:</b> 0",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        return
+
+    # ═══ SPEED FIX: raise concurrency 30→100 ═══
+    sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+    validate_only = (command_name == "Adding")
 
     async def worker(site):
         async with sem:
             try:
-                return await check_site_status(site)
+                return await check_site_status(site, validate_only=validate_only)
             except Exception as e:
-                logging.error(f"[SITECHK] check_site_status crashed for {site}: {e}")
+                logging.error(f"[SITECHK] check crashed for {site}: {e}")
                 traceback.print_exc()
                 return site, "ERROR", {"Price": -1.0}, f"Exception: {e}"
 
@@ -890,7 +798,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             checked_count += 1
             dead_count += 1
             _log(f"[LOG] <unknown> | Outer loop error: {e}")
-            traceback.print_exc()
             continue
 
         checked_count += 1
@@ -899,15 +806,9 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
         if status == "KEEP":
             normalized_site = normalize_url(site)
             if command_name == "Adding":
-                normalized_existing = {normalize_url(s) for s in existing_sites}
-                if normalized_site in normalized_existing:
-                    duplicate_count += 1
-                    _log(f"[DUPLICATE SKIPPED] {site} already exists!")
-                    continue
                 normalized_valid = {normalize_url(s) for s in valid_sites}
                 if normalized_site in normalized_valid:
                     duplicate_count += 1
-                    _log(f"[DUPLICATE SKIPPED] {site} duplicate in batch!")
                     continue
 
             live_count += 1
@@ -927,14 +828,13 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                     if duplicate_count > 0:
                         dup_text = f"\n🔄 <b>Duplicates Skipped:</b> <code>{duplicate_count}</code>"
                     await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=status_message_id,
-                        text=f"🔄 <b>{command_name}ing {total_sites} Sites...</b>\n"
+                        chat_id=chat_id, message_id=status_message_id,
+                        text=f"🔄 <b>{command_name}ing {len(sites_to_check)} Sites...</b>\n"
                              f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
                              f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>Kept ({price_label}):</b> <code>{live_count}</code>\n"
                              f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Rejected:</b> <code>{dead_count}</code>\n"
-                             f"🔄 <b>Checked:</b> <code>{checked_count}/{total_sites}</code>\n"
-                             f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies Available:</b> <code>{len(PROXY_LIST) - len(BAD_PROXIES)}/{len(PROXY_LIST)}</code>"
+                             f"🔄 <b>Checked:</b> <code>{checked_count}/{len(sites_to_check)}</code>\n"
+                             f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> <code>{len(PROXY_LIST) - len(BAD_PROXIES)}/{len(PROXY_LIST)}</code>"
                              f"{dup_text}",
                         parse_mode="HTML"
                     )
@@ -951,10 +851,8 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             final_unique_sites.append(site)
 
     removed_dupes = len(valid_sites) - len(final_unique_sites)
-    if removed_dupes > 0:
-        _log(f"[SITECHK] Removed {removed_dupes} internal duplicates before saving")
-
-    _log(f"[SITECHK] Run complete: checked={checked_count} live={live_count} dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
+    _log(f"[SITECHK] Done: checked={checked_count} live={live_count} "
+         f"dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
     if command_name == "Audit":
         await asyncio.to_thread(write_sites, final_unique_sites)
@@ -963,25 +861,23 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
         if user_id:
             try:
                 await asyncio.to_thread(add_user_sites_db, user_id, final_unique_sites)
-                _log(f"[SITECHK] Saved {len(final_unique_sites)} sites to custom pool for user {user_id}")
             except Exception as ue:
                 logging.error(f"Error saving to user_sites DB: {ue}")
-                traceback.print_exc()
 
-    # ── NEW: push updated pool to replicas immediately ──
+    # ═══ push updated pool ═══
     if command_name in ("Audit", "Adding"):
         asyncio.create_task(_push_sites_after_change(command_name.lower()))
 
     filename = f"report_{command_name.lower()}_{int(time.time())}.txt"
     file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    file_content += f"TOTAL CHECKED: {total_sites}\n"
+    file_content += f"TOTAL CHECKED: {len(sites_to_check)}\n"
     file_content += f"WORKING SITES (Price {price_label}): {len(final_unique_sites)}\n"
-    file_content += f"REJECTED (Dead/High Price): {dead_count}\n"
+    file_content += f"REJECTED: {dead_count}\n"
     if duplicate_count > 0 or removed_dupes > 0:
         file_content += f"DUPLICATES SKIPPED: {duplicate_count + removed_dupes}\n"
     file_content += f"PROXIES USED: {len(PROXY_LIST)} | BAD: {len(BAD_PROXIES)}\n"
     file_content += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    file_content += "\n".join(working_sites_content) if working_sites_content else "No valid sites found within price range!"
+    file_content += "\n".join(working_sites_content) if working_sites_content else "No valid sites found!"
 
     try:
         def _write_report():
@@ -995,14 +891,13 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                 if (duplicate_count + removed_dupes) > 0:
                     dup_final = f"\n<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Duplicates Blocked:</b> <code>{duplicate_count + removed_dupes}</code>"
                 await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_message_id,
+                    chat_id=chat_id, message_id=status_message_id,
                     text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>{command_name} Complete!</b>\n\n"
-                         f"<b>Total Checked:</b> {total_sites}\n"
+                         f"<b>Total Checked:</b> {len(sites_to_check)}\n"
                          f"<b>Valid ({price_label}):</b> {len(final_unique_sites)} <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>\n"
                          f"<b>Rejected:</b> {dead_count} <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>\n"
                          f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-                         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies Used:</b> {len(PROXY_LIST)} | <b>Bad:</b> {len(BAD_PROXIES)}"
+                         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> {len(PROXY_LIST)} | <b>Bad:</b> {len(BAD_PROXIES)}"
                          f"{dup_final}",
                     parse_mode="HTML"
                 )
@@ -1010,29 +905,24 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                 pass
 
         await bot.send_document(chat_id=chat_id, document=FSInputFile(filename),
-                                caption=f"📜 <b>{command_name} Report (Deduplicated)</b>",
+                                caption=f"📜 <b>{command_name} Report</b>",
                                 parse_mode="HTML")
         try:
             os.remove(filename)
-        except:
+        except Exception:
             pass
     except Exception as e:
         try:
-            await bot.send_message(chat_id=chat_id, text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
+            await bot.send_message(chat_id=chat_id,
+                                   text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
         except Exception:
             pass
 
 
-# ══════════════════════════════════════════════════════════════════
-# BACKGROUND WORKER — STRIPE SITES
-# ══════════════════════════════════════════════════════════════════
-
-async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Adding", status_message_id=None, user_id=None):
+async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name="Adding",
+                                   status_message_id=None, user_id=None):
     global BAD_PROXIES
     BAD_PROXIES.clear()
-
-    _log(f"[STRIPECHK] run_stripe_site_checker START: cmd={command_name} sites={len(sites_to_check)} user={user_id} proxies={len(PROXY_LIST)}")
-
     total_sites = len(sites_to_check)
     valid_sites = []
     working_sites_content = []
@@ -1040,27 +930,45 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
     live_count = 0
     dead_count = 0
     duplicate_count = 0
-
     last_edit_time = 0
     MIN_EDIT_INTERVAL = 2.0
     CHECKS_PER_UPDATE = 20
-    sem = asyncio.Semaphore(30)
 
-    existing_sites = set()
     if command_name == "Adding":
         try:
             existing_sites = set(await asyncio.to_thread(read_stripe_sites))
-            _log(f"[STRIPECHK] Found {len(existing_sites)} existing stripe sites for duplicate check")
+            if existing_sites:
+                norm_existing = {normalize_url(s) for s in existing_sites}
+                orig = len(sites_to_check)
+                sites_to_check = [s for s in sites_to_check if normalize_url(s) not in norm_existing]
+                pre = orig - len(sites_to_check)
+                if pre > 0:
+                    _log(f"[STRIPE] Pre-filtered {pre}/{orig} existing")
+                duplicate_count = pre
         except Exception as e:
-            _log(f"[STRIPECHK] Failed to read existing stripe sites: {e}")
+            _log(f"[STRIPE] read existing failed: {e}")
+
+    if not sites_to_check:
+        if status_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_message_id,
+                    text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>Stripe {command_name} Complete!</b>\n\n"
+                         f"<b>Already Existed:</b> {duplicate_count}",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        return
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
     async def worker(site):
         async with sem:
             try:
                 return await check_stripe_site_status(site)
             except Exception as e:
-                logging.error(f"[STRIPECHK] check_stripe_site_status crashed for {site}: {e}")
-                traceback.print_exc()
+                logging.error(f"[STRIPE] check crashed for {site}: {e}")
                 return site, "ERROR", {}, f"Exception: {e}"
 
     tasks = [worker(site) for site in sites_to_check]
@@ -1071,26 +979,17 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
         except Exception as e:
             checked_count += 1
             dead_count += 1
-            _log(f"[STRIPELOG] <unknown> | Outer loop error: {e}")
-            traceback.print_exc()
             continue
 
         checked_count += 1
-        _log(f"[STRIPELOG] {site} | {resp_msg}")
 
         if status == "KEEP":
             normalized_site = normalize_url(site)
             if command_name == "Adding":
-                normalized_existing = {normalize_url(s) for s in existing_sites}
-                if normalized_site in normalized_existing:
-                    duplicate_count += 1
-                    _log(f"[STRIPE DUP] {site} already exists!")
-                    continue
                 normalized_valid = {normalize_url(s) for s in valid_sites}
                 if normalized_site in normalized_valid:
                     duplicate_count += 1
                     continue
-
             live_count += 1
             valid_sites.append(site)
             working_sites_content.append(f"{site} | Response: {resp_msg}")
@@ -1101,19 +1000,13 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
         if (current_time - MIN_EDIT_INTERVAL > last_edit_time) or (checked_count % CHECKS_PER_UPDATE == 0):
             try:
                 if status_message_id:
-                    dup_text = ""
-                    if duplicate_count > 0:
-                        dup_text = f"\n🔄 <b>Duplicates Skipped:</b> <code>{duplicate_count}</code>"
                     await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=status_message_id,
-                        text=f"🔄 <b>{command_name} {total_sites} Stripe Sites...</b>\n"
+                        chat_id=chat_id, message_id=status_message_id,
+                        text=f"🔄 <b>{command_name} {len(sites_to_check)} Stripe Sites...</b>\n"
                              f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
                              f"<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> <b>Kept:</b> <code>{live_count}</code>\n"
                              f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Rejected:</b> <code>{dead_count}</code>\n"
-                             f"🔄 <b>Checked:</b> <code>{checked_count}/{total_sites}</code>\n"
-                             f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies Available:</b> <code>{len(PROXY_LIST) - len(BAD_PROXIES)}/{len(PROXY_LIST)}</code>"
-                             f"{dup_text}",
+                             f"🔄 <b>Checked:</b> <code>{checked_count}/{len(sites_to_check)}</code>",
                         parse_mode="HTML"
                     )
                     last_edit_time = current_time
@@ -1121,80 +1014,34 @@ async def run_stripe_site_checker(bot: Bot, chat_id: int, sites_to_check, comman
                 pass
 
     final_unique_sites = []
-    seen_normalized = set()
+    seen = set()
     for site in valid_sites:
-        normalized = normalize_url(site)
-        if normalized not in seen_normalized:
-            seen_normalized.add(normalized)
+        n = normalize_url(site)
+        if n not in seen:
+            seen.add(n)
             final_unique_sites.append(site)
-
-    removed_dupes = len(valid_sites) - len(final_unique_sites)
-
-    _log(f"[STRIPECHK] Run complete: checked={checked_count} live={live_count} dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
     if command_name == "Adding":
         await asyncio.to_thread(add_stripe_sites, final_unique_sites)
         if user_id:
             try:
                 await asyncio.to_thread(add_user_stripe_sites_db, user_id, final_unique_sites)
-                _log(f"[STRIPECHK] Saved {len(final_unique_sites)} stripe sites to user {user_id}")
             except Exception as ue:
                 logging.error(f"Error saving stripe sites to user DB: {ue}")
-                traceback.print_exc()
 
-    filename = f"stripe_report_{int(time.time())}.txt"
-    file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    file_content += f"TOTAL STRIPE SITES CHECKED: {total_sites}\n"
-    file_content += f"WORKING STRIPE SITES: {len(final_unique_sites)}\n"
-    file_content += f"REJECTED: {dead_count}\n"
-    if duplicate_count > 0 or removed_dupes > 0:
-        file_content += f"DUPLICATES SKIPPED: {duplicate_count + removed_dupes}\n"
-    file_content += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    file_content += "\n".join(working_sites_content) if working_sites_content else "No valid stripe sites found!"
-
-    try:
-        def _write_report():
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(file_content)
-        await asyncio.to_thread(_write_report)
-
-        if status_message_id:
-            try:
-                dup_final = ""
-                if (duplicate_count + removed_dupes) > 0:
-                    dup_final = f"\n<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Duplicates Blocked:</b> <code>{duplicate_count + removed_dupes}</code>"
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_message_id,
-                    text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>Stripe {command_name} Complete!</b>\n\n"
-                         f"<b>Total Checked:</b> {total_sites}\n"
-                         f"<b>Valid:</b> {len(final_unique_sites)} <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>\n"
-                         f"<b>Rejected:</b> {dead_count} <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>\n"
-                         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-                         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies Used:</b> {len(PROXY_LIST)} | <b>Bad:</b> {len(BAD_PROXIES)}"
-                         f"{dup_final}",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
-        await bot.send_document(chat_id=chat_id, document=FSInputFile(filename),
-                                caption=f"📜 <b>Stripe {command_name} Report</b>",
-                                parse_mode="HTML")
+    if status_message_id:
         try:
-            os.remove(filename)
-        except:
-            pass
-    except Exception as e:
-        try:
-            await bot.send_message(chat_id=chat_id, text=f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}")
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=status_message_id,
+                text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>Stripe {command_name} Complete!</b>\n\n"
+                     f"<b>Total Checked:</b> {len(sites_to_check)}\n"
+                     f"<b>Valid:</b> {len(final_unique_sites)}\n"
+                     f"<b>Rejected:</b> {dead_count}",
+                parse_mode="HTML"
+            )
         except Exception:
             pass
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /sitechk — Audit & Clean
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("sitechk"))
 async def sitechk_command(message: types.Message):
@@ -1202,7 +1049,7 @@ async def sitechk_command(message: types.Message):
     from sub import get_premium_status
     is_premium, _ = get_premium_status(user_id)
     if not is_premium:
-        await message.reply("<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗣𝗹𝗲𝗮𝘀𝗲 𝘂𝗽𝗴𝗿𝗮𝗱𝗲 𝘆𝗼𝘂𝗿 𝗽𝗹𝗮𝗻 𝘁𝗼 𝘂𝘀𝗲 𝘁𝗵𝗶𝘀 𝗳𝗲𝗮𝘁𝘂𝗿𝗲.", parse_mode="HTML")
+        await message.reply("<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> Please upgrade your plan.", parse_mode="HTML")
         return
     if not is_admin(user_id):
         await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
@@ -1214,17 +1061,13 @@ async def sitechk_command(message: types.Message):
 
     sites = await asyncio.to_thread(read_sites)
     if not sites:
-        await message.answer("📭 <b>No sites found in the global pool.</b>", parse_mode="HTML")
+        await message.answer("📭 <b>No sites found.</b>", parse_mode="HTML")
         return
-
-    price_label = _price_range_label()
 
     status_msg = await message.answer(
         f"🔄 <b>Starting Audit on {len(sites)} Sites...</b>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"🔄 <b>Checked:</b> <code>0/{len(sites)}</code>\n"
-        f"<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> <b>Kept ({price_label}):</b> <code>0</code>\n"
-        f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Rejected:</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> <code>{len(PROXY_LIST)}</code>",
         parse_mode="HTML"
     )
@@ -1233,10 +1076,6 @@ async def sitechk_command(message: types.Message):
                                           command_name="Audit",
                                           status_message_id=status_msg.message_id))
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /addsite — Add & Verify New Shopify Sites
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("addsite"))
 async def addsite_command(message: types.Message):
@@ -1255,7 +1094,7 @@ async def addsite_command(message: types.Message):
 
     if not doc:
         await message.answer(
-            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Please reply to a file or upload a file containing sites with /addsite.</b>",
+            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Attach a .txt file with sites.</b>",
             parse_mode="HTML"
         )
         return
@@ -1286,11 +1125,10 @@ async def addsite_command(message: types.Message):
 
         new_sites = list(set(new_sites))
         if not new_sites:
-            await message.answer("<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> <b>No valid sites found in file.</b>", parse_mode="HTML")
+            await message.answer("<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> <b>No valid sites.</b>", parse_mode="HTML")
             return
 
-        _log(f"[ADDSITE] Parsed {len(new_sites)} unique sites from uploaded file (user={user_id})")
-
+        _log(f"[ADDSITE] Parsed {len(new_sites)} unique sites (user={user_id})")
     except Exception as e:
         logging.error(f"Error downloading file: {e}", exc_info=True)
         await message.answer(f"<tg-emoji emoji-id='6234166879663987'>❌</tg-emoji> <b>Error reading file:</b> {e}", parse_mode="HTML")
@@ -1315,10 +1153,6 @@ async def addsite_command(message: types.Message):
                                           user_id=user_id))
 
 
-# ══════════════════════════════════════════════════════════════════
-# ── /stripesite — Add & Verify Stripe Sites
-# ══════════════════════════════════════════════════════════════════
-
 @router.message(Command("stripesite"))
 async def stripesite_command(message: types.Message):
     user_id = message.from_user.id
@@ -1336,8 +1170,7 @@ async def stripesite_command(message: types.Message):
 
     if not doc:
         await message.answer(
-            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
-            "<b>Please reply to a file or upload a file containing Stripe sites with /stripesite.</b>",
+            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Attach a .txt file with Stripe sites.</b>",
             parse_mode="HTML"
         )
         return
@@ -1368,21 +1201,11 @@ async def stripesite_command(message: types.Message):
 
         new_sites = list(set(new_sites))
         if not new_sites:
-            await message.answer(
-                "<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> "
-                "<b>No valid Stripe sites found in file.</b>",
-                parse_mode="HTML"
-            )
+            await message.answer("<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> <b>No valid sites.</b>", parse_mode="HTML")
             return
-
-        _log(f"[STRIPESITE] Parsed {len(new_sites)} unique stripe sites from uploaded file (user={user_id})")
-
     except Exception as e:
-        logging.error(f"Error downloading stripe sites file: {e}", exc_info=True)
-        await message.answer(
-            f"<tg-emoji emoji-id='6234166879663987'>❌</tg-emoji> <b>Error reading file:</b> {e}",
-            parse_mode="HTML"
-        )
+        logging.error(f"Error downloading stripe file: {e}", exc_info=True)
+        await message.answer(f"<tg-emoji emoji-id='6234166879663987'>❌</tg-emoji> <b>Error:</b> {e}", parse_mode="HTML")
         return
 
     status_msg = await message.answer(
@@ -1391,22 +1214,15 @@ async def stripesite_command(message: types.Message):
         f"🔄 <b>Checked:</b> <code>0/{len(new_sites)}</code>\n"
         f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>Added:</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Rejected:</b> <code>0</code>\n"
-        f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Duplicates:</b> <code>0</code>\n"
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> <code>{len(PROXY_LIST)}</code>",
         parse_mode="HTML"
     )
 
     asyncio.create_task(run_stripe_site_checker(
-        bot, chat_id, new_sites,
-        command_name="Adding",
-        status_message_id=status_msg.message_id,
-        user_id=user_id,
+        bot, chat_id, new_sites, command_name="Adding",
+        status_message_id=status_msg.message_id, user_id=user_id,
     ))
 
-
-# ══════════════════════════════════════════════════════════════════
-# ── /mystripesite
-# ══════════════════════════════════════════════════════════════════
 
 @router.message(Command("mystripesite"))
 async def mystripesite_command(message: types.Message):
@@ -1426,19 +1242,13 @@ async def mystripesite_command(message: types.Message):
 
     if not sites_to_send:
         await message.reply(
-            "<b>🌐 𝗬𝗼𝘂𝗿 𝗦𝘁𝗿𝗶𝗽𝗲 𝗦𝗶𝘁𝗲𝘀 𝗣𝗼𝗼𝗹:</b> <code>0</code>\n\n"
-            "You are currently using the <b>Global Stripe Sites Pool</b> (empty).\n"
-            "Use <code>/stripesite</code> with a .txt file to add Stripe sites!",
+            "<b>🌐 𝗬𝗼𝘂𝗿 𝗦𝘁𝗿𝗶𝗽𝗲 𝗦𝗶𝘁𝗲𝘀 𝗣𝗼𝗼𝗹:</b> <code>0</code>\n\nUse <code>/stripesite</code> with a .txt file.",
             parse_mode="HTML"
         )
         return
 
-    text = (
-        f"<b>🌐 𝗬𝗼𝘂𝗿 𝗦𝘁𝗿𝗶𝗽𝗲 𝗦𝗶𝘁𝗲𝘀 𝗣𝗼𝗼𝗹:</b> <code>{len(sites_to_send)} sites</code>\n"
-        f"<b>Source:</b> {source}\n\n"
-        "Your Stripe checks will automatically use these sites.\n"
-        "Use <code>/clearstripesites</code> to revert back to global Stripe sites.\n\n"
-    )
+    text = (f"<b>🌐 𝗬𝗼𝘂𝗿 𝗦𝘁𝗿𝗶𝗽𝗲 𝗦𝗶𝘁𝗲𝘀 𝗣𝗼𝗼𝗹:</b> <code>{len(sites_to_send)} sites</code>\n"
+            f"<b>Source:</b> {source}\n\n")
     preview = "\n".join(f"• <code>{s}</code>" for s in sites_to_send[:10])
     text += preview
     if len(sites_to_send) > 10:
@@ -1455,15 +1265,10 @@ async def clearstripesites_command(message: types.Message):
     user_id = message.from_user.id
     deleted = await asyncio.to_thread(clear_user_stripe_sites_db, user_id)
     await message.reply(
-        f"🗑️ <b>Cleared {deleted} custom Stripe sites from your pool.</b>\n\n"
-        "You are now back on the <b>Global Stripe Sites Pool</b>.",
+        f"🗑️ <b>Cleared {deleted} custom Stripe sites.</b>",
         parse_mode="HTML"
     )
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /mysites
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("mysites"))
 @router.message(Command("mysite"))
@@ -1472,16 +1277,12 @@ async def mysites_command(message: types.Message):
     user_sites = await asyncio.to_thread(get_user_sites_db, user_id)
     if not user_sites:
         await message.reply(
-            "<b>🌐 𝗬𝗼𝘂𝗿 𝗖𝘂𝘀𝘁𝗼𝗺 𝗦𝗶𝘁𝗲𝘀:</b> <code>0</code>\n\n"
-            "You are currently using the <b>Global Sites Pool</b>.\n"
-            "Use <code>/addsite</code> with a .txt file to add your own sites!",
+            "<b>🌐 𝗬𝗼𝘂𝗿 𝗖𝘂𝘀𝘁𝗼𝗺 𝗦𝗶𝘁𝗲𝘀:</b> <code>0</code>\n\nUsing <b>Global Pool</b>.",
             parse_mode="HTML"
         )
         return
 
     text = f"<b>🌐 𝗬𝗼𝘂𝗿 𝗖𝘂𝘀𝘁𝗼𝗺 𝗦𝗶𝘁𝗲𝘀 𝗣𝗼𝗼𝗹:</b> <code>{len(user_sites)} sites</code>\n\n"
-    text += "Your checks will automatically use <b>ONLY your sites</b>!\n"
-    text += "Use <code>/clearsites</code> to revert back to global sites.\n\n"
     preview = "\n".join(f"• <code>{s}</code>" for s in user_sites[:10])
     text += preview
     if len(user_sites) > 10:
@@ -1497,40 +1298,30 @@ async def mysites_command(message: types.Message):
 async def clearsites_command(message: types.Message):
     user_id = message.from_user.id
     deleted = await asyncio.to_thread(clear_user_sites_db, user_id)
-    await message.reply(
-        f"🗑️ <b>Cleared {deleted} custom sites from your pool.</b>\n\n"
-        "You are now back on the <b>Global Sites Pool</b>.",
-        parse_mode="HTML"
-    )
+    await message.reply(f"🗑️ <b>Cleared {deleted} custom sites.</b>", parse_mode="HTML")
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /siteall
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("siteall"))
 async def siteall_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
-
     sites = await asyncio.to_thread(read_sites)
     if not sites:
-        await message.answer("📭 <b>Global site pool is empty.</b>", parse_mode="HTML")
+        await message.answer("📭 <b>Pool empty.</b>", parse_mode="HTML")
         return
 
-    filename = f"full_sites_list_{int(time.time())}.txt"
+    filename = f"full_sites_{int(time.time())}.txt"
     try:
-        def _write_file():
+        def _write():
             with open(filename, "w", encoding="utf-8") as f:
-                f.write(f"Total Sites: {len(sites)} (Deduplicated)\n\n")
+                f.write(f"Total: {len(sites)}\n\n")
                 f.write("\n".join(sites))
-        await asyncio.to_thread(_write_file)
-
+        await asyncio.to_thread(_write)
         await message.answer_document(
             document=FSInputFile(filename),
-            caption=f"📜 <b>Total Sites:</b> <code>{len(sites)}</code> ✨ (No Duplicates)",
+            caption=f"📜 <b>Total:</b> <code>{len(sites)}</code>",
             parse_mode="HTML"
         )
         os.remove(filename)
@@ -1538,228 +1329,144 @@ async def siteall_command(message: types.Message):
         await message.answer(f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Error:</b> {e}", parse_mode="HTML")
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /removeall
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @router.message(Command("removeall"))
 async def removeall_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
 
     count = await asyncio.to_thread(clear_all_sites)
     if count == 0:
-        await message.answer("📭 <b>Global site pool is already empty.</b>", parse_mode="HTML")
+        await message.answer("📭 <b>Already empty.</b>", parse_mode="HTML")
         return
 
     asyncio.create_task(_push_sites_after_change("removeall"))
 
     await message.answer(
-        f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>All sites have been successfully removed.</b>\n\n"
-        f"<b>Removed:</b> <code>{count}</code> sites",
+        f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>Removed {count} sites.</b>",
         parse_mode="HTML"
     )
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /dedupe
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("dedupe"))
 async def dedupe_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
-
     sites = await asyncio.to_thread(read_sites)
     if not sites:
-        await message.answer("📭 <b>Global site pool is empty.</b>", parse_mode="HTML")
+        await message.answer("📭 <b>Empty.</b>", parse_mode="HTML")
         return
 
-    original_count = len(sites)
+    orig = len(sites)
     unique = {}
     for s in sites:
         n = normalize_url(s)
         if n not in unique:
             unique[n] = s
     deduped = list(unique.values())
-
-    final_count = await asyncio.to_thread(write_sites, deduped)
-    removed = original_count - final_count
+    final = await asyncio.to_thread(write_sites, deduped)
+    removed = orig - final
 
     asyncio.create_task(_push_sites_after_change("dedupe"))
 
-    if removed > 0:
-        await message.answer(
-            f"✨ <b>Deduplication Complete!</b>\n\n"
-            f"<b>Original:</b> <code>{original_count}</code>\n"
-            f"<b>Removed:</b> <code>{removed}</code> duplicates\n"
-            f"<b>Final:</b> <code>{final_count}</code> unique sites",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>No duplicates found!</b>\n\n"
-            f"<b>Total Sites:</b> <code>{final_count}</code> (All Unique)",
-            parse_mode="HTML"
-        )
+    await message.answer(
+        f"✨ <b>Done.</b> Original: {orig}, Removed: {removed}, Final: {final}",
+        parse_mode="HTML"
+    )
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /proxyinfo
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("proxyinfo"))
 async def proxyinfo_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
-
     available = len(PROXY_LIST) - len(BAD_PROXIES)
-    text = (
-        f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxy Information</b>\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"📊 <b>Total Proxies:</b> <code>{len(PROXY_LIST)}</code>\n"
-        f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>Available:</b> <code>{available}</code>\n"
-        f"<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> <b>Bad/Dead:</b> <code>{len(BAD_PROXIES)}</code>\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-    )
-    for i, proxy in enumerate(PROXY_LIST, 1):
-        status = "❌ Dead" if proxy in BAD_PROXIES else "✅ Live"
-        if "@" in proxy:
-            parts = proxy.split("@")
-            host_part = parts[1] if len(parts) > 1 else proxy
-            text += f"<code>{i}.</code> {host_part} - {status}\n"
-        else:
-            text += f"<code>{i}.</code> {proxy[:30]}... - {status}\n"
+    text = (f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies</b>\n"
+            f"Total: {len(PROXY_LIST)} | Available: {available} | Bad: {len(BAD_PROXIES)}")
     await message.answer(text, parse_mode="HTML")
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /resetproxy
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("resetproxy"))
 async def resetproxy_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
-
     global BAD_PROXIES
-    cleared_count = len(BAD_PROXIES)
+    cleared = len(BAD_PROXIES)
     BAD_PROXIES.clear()
+    await message.answer(f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>Reset {cleared} proxies.</b>", parse_mode="HTML")
 
-    await message.answer(
-        f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> <b>Proxy List Reset!</b>\n\n"
-        f"<b>Cleared:</b> <code>{cleared_count}</code> bad proxies\n"
-        f"<b>Available Now:</b> <code>{len(PROXY_LIST)}</code>",
-        parse_mode="HTML"
-    )
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /remsite
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("remsite"))
 async def remsite_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
-
     args = message.text.split()[1:]
     if not args:
-        await message.answer("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Usage:</b> /remsite {site_url}\nExample: /remsite example.com", parse_mode="HTML")
+        await message.answer("<b>Usage:</b> /remsite {url}", parse_mode="HTML")
         return
+    target = normalize_url(args[0])
+    removed = await asyncio.to_thread(remove_site, target)
 
-    target_site = normalize_url(args[0])
-    removed_from_active = await asyncio.to_thread(remove_site, target_site)
-
-    banned_sites = []
+    banned = []
     if os.path.exists(BANNED_SITES_FILE):
         try:
             with open(BANNED_SITES_FILE, "r", encoding="utf-8") as f:
-                banned_sites = json.load(f)
+                banned = json.load(f)
         except Exception:
-            banned_sites = []
-
-    if target_site not in banned_sites:
-        banned_sites.append(target_site)
+            banned = []
+    if target not in banned:
+        banned.append(target)
         try:
             with open(BANNED_SITES_FILE, "w", encoding="utf-8") as f:
-                json.dump(banned_sites, f, indent=4)
+                json.dump(banned, f, indent=4)
         except Exception as e:
-            await message.answer(f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Error writing to banned_sites.json:</b> <code>{str(e)}</code>", parse_mode="HTML")
+            await message.answer(f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> {e}", parse_mode="HTML")
             return
 
     asyncio.create_task(_push_sites_after_change("remsite"))
 
-    active_removed_str = "and removed from active list" if removed_from_active else "(was not in active list)"
     await message.answer(
-        f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>Site Banned successfully!</b>\n\n"
-        f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Site:</b> <code>{target_site}</code>\n"
-        f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Site is now added to <code>banned_sites.json</code> {active_removed_str} and will never be used again.",
+        f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>Banned:</b> <code>{target}</code>",
         parse_mode="HTML"
     )
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# /setprice
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(Command("setprice"))
 async def setprice_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
-        await message.answer("⛔ <b>You are not authorized.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
-
     args = message.text.split()[1:]
     if not args:
         current = _get_max_price()
         await message.answer(
-            f"<b>💵 Current max price ➛</b> <code>${current:.2f}</code>\n\n"
-            f"<b>Usage:</b> <code>/setprice 10</code>\n"
-            f"<i>Sets the highest price a site is allowed to have for it to be kept.</i>",
+            f"<b>💵 Current max:</b> <code>${current:.2f}</code>\n<b>Usage:</b> <code>/setprice 10</code>",
             parse_mode="HTML"
         )
         return
-
     raw = args[0].replace("$", "").strip()
     try:
         new_price = float(raw)
         if new_price < 0:
-            raise ValueError("Must be non-negative")
+            raise ValueError()
     except ValueError:
-        await message.answer(
-            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
-            "<b>Invalid amount.</b> Example: <code>/setprice 7.5</code>",
-            parse_mode="HTML"
-        )
+        await message.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Invalid amount.</b>", parse_mode="HTML")
         return
-
-    old_price = _get_max_price()
+    old = _get_max_price()
     ok = await asyncio.to_thread(set_setting, "sitechk_max_price", new_price)
-
     if ok:
         await message.answer(
-            f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> "
-            f"<b>Max price updated</b>\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"<b>Before ➛</b> <code>${old_price:.2f}</code>\n"
-            f"<b>After  ➛</b> <code>${new_price:.2f}</code>\n\n"
-            f"<i>Applies immediately to the next /sitechk or /addsite run.</i>",
+            f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>Max price:</b> ${old:.2f} → ${new_price:.2f}",
             parse_mode="HTML"
         )
     else:
-        await message.answer(
-            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
-            "<b>Failed to save setting.</b>",
-            parse_mode="HTML"
-        )
+        await message.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Save failed.</b>", parse_mode="HTML")
