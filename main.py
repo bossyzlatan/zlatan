@@ -23,7 +23,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from database import get_user, create_user, DB_CONFIG, get_db_connection
+from database import get_user, create_user, DB_CONFIG, get_db_connection, get_global_sites
 from gate import on_command, off_command
 from fb import setup_feedback_handler, feedback_cmd, router as fb_router
 from stats import stats_command
@@ -821,6 +821,43 @@ async def start_dummy_server():
     except Exception as e:
         logging.warning(f"Failed to start dummy web server: {e}. Continuing bot polling anyway.")
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SITE POOL SYNC — MongoDB → bot → API replicas
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _site_pool_sync_loop():
+    """
+    Push global_sites from MongoDB to all API replicas every 5 minutes.
+    Runs once ~10s after startup, then repeats.
+    """
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            sites = await asyncio.to_thread(get_global_sites)
+            if not sites:
+                logging.warning(
+                    "[site-sync] MongoDB global_sites is empty — "
+                    "replicas keep their current pool. Use /addsite to populate."
+                )
+            else:
+                result = await shopify_api.push_sites_to_all_replicas(sites)
+                ok = sum(1 for r in result["results"].values() if r.get("ok"))
+                detail = {
+                    host.split("//")[-1].split(".")[0]:
+                        (r.get("pool_size") if r.get("ok") else r.get("error"))
+                    for host, r in result["results"].items()
+                }
+                logging.info(
+                    "[site-sync] pushed %d sites to %d/%d replicas: %s",
+                    result["pushed"], ok, len(result["results"]), detail,
+                )
+        except Exception as e:
+            logging.error("[site-sync] error: %s", e, exc_info=True)
+
+        await asyncio.sleep(300)
+
+
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     pay_sys.set_bot(bot)
@@ -828,6 +865,7 @@ async def main():
     await start_dummy_server()
 
     asyncio.create_task(shopify_api.auto_health_check())
+    asyncio.create_task(_site_pool_sync_loop())
 
     logging.info("Bot starting via Long Polling…")
     while True:
