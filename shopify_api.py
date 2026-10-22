@@ -1,21 +1,19 @@
 """
-Shopify API Manager for mybot.
-Integrates the hosted Shopify API servers with:
-  - Dynamic health checking (/health) & active pool management
-  - Intelligent load balancing & failover across replicas
-  - Standardized /shopify and /check endpoint dispatchers
-  - Pool synchronization: bot pushes global_sites from MongoDB to replicas
+Shopify API Manager — Stateless Edition (v4.2.0)
 
-v3 patches (2026-10):
-  - check_shopify_card() accepts fallback_sites / attempts / auto and
-    forwards them to the API so the server rotates through the bot's
-    real pool instead of its local sites.txt.
-  - If a replica returns "SITE_ERROR / exhausted", try a DIFFERENT
-    replica before giving up — each replica has its own quarantine map.
-  - auto_health_check() only marks a replica active if it has a non-empty
-    pool, so empty replicas never receive traffic.
-  - push_sites_to_all_replicas() pushes the bot's current site list to
-    every replica's /sync-sites endpoint (used by main.py's sync loop).
+Matches the stateless `api.py` contract:
+  - Every /shopify call MUST forward the bot's own `fallback_sites` list.
+  - No /sync-sites. No pool-pushing. No pool_size in /health.
+  - Retries another replica only when a replica reports "sites exhausted"
+    (per-replica blacklist/throttle state differs, so a retry can help).
+  - NO_SITES (400) from any replica is returned immediately — it's a
+    client config error, retrying another replica won't help.
+
+CHANGES vs v3:
+  - push_sites_to_all_replicas() is now a no-op stub (deprecation).
+  - auto_health_check() no longer requires pool_size > 0.
+  - _is_pool_exhausted() only matches "sites exhausted" now.
+  - 400 responses are surfaced immediately with proper classification.
 """
 
 import asyncio
@@ -24,11 +22,12 @@ import logging
 import random
 import time
 import urllib.parse
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HOSTED API SERVERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 API_SERVERS = [
     "https://starkz-shopi.duckdns.org",
     "https://starkz-shopi1.duckdns.org",
@@ -41,22 +40,23 @@ ALT_API_KEY     = "oozaruhshop"
 ACTIVE_API_SERVERS: List[str] = API_SERVERS.copy()
 SERVER_HEALTH: Dict[str, dict] = {}
 
+# Cap forwarded fallback list to keep URLs safe (proxies / HTTP servers
+# default to 4-8KB line limits). 20 sites × ~30 chars = ~600 bytes.
+FALLBACK_SITES_CAP = 20
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SERVER SELECTOR & FORMATTERS
+# SERVER SELECTOR
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_active_server() -> str:
     pool = ACTIVE_API_SERVERS if ACTIVE_API_SERVERS else API_SERVERS
     return random.choice(pool)
 
-
 def get_active_servers_excluding(seen: set) -> List[str]:
     remaining = [s for s in ACTIVE_API_SERVERS if s not in seen]
     if not remaining:
         remaining = [s for s in API_SERVERS if s not in seen]
     return remaining or list(API_SERVERS)
-
 
 def format_proxy(proxy: Optional[str]) -> Optional[str]:
     if not proxy:
@@ -69,17 +69,18 @@ def format_proxy(proxy: Optional[str]) -> Optional[str]:
         return f"{parsed.hostname}:{parsed.port}"
     return p
 
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# GATE RESPONSE CLASSIFIER (August 2026 Standards)
+# GATE RESPONSE CLASSIFIER (unchanged)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def classify_gate_response(response_msg: str, raw_dict: Optional[dict] = None, gateway: str = "") -> dict:
     if raw_dict is None:
         raw_dict = {}
 
-    charged_flag = str(raw_dict.get('Charged', '')).lower() == 'true' or str(raw_dict.get('charged', '')).lower() == 'true'
-    approved_flag = str(raw_dict.get('Approved', '')).lower() == 'true' or str(raw_dict.get('approved', '')).lower() == 'true'
+    charged_flag = (str(raw_dict.get('Charged', '')).lower() == 'true'
+                    or str(raw_dict.get('charged', '')).lower() == 'true')
+    approved_flag = (str(raw_dict.get('Approved', '')).lower() == 'true'
+                     or str(raw_dict.get('approved', '')).lower() == 'true')
 
     if charged_flag:
         return {'status': 'Charged', 'retry': False}
@@ -130,7 +131,9 @@ def classify_gate_response(response_msg: str, raw_dict: Optional[dict] = None, g
         return {'status': 'Approved', 'retry': False}
     if any(k in msg_upper for k in AVS_MISMATCH_KEYWORDS):
         return {'status': 'Approved', 'retry': False}
-    if any(k in msg_upper for k in APPROVED_KEYWORDS) and not any(k in msg_upper for k in ['NOT APPROVED', 'UNAPPROVED', 'DECLINED']):
+    if (any(k in msg_upper for k in APPROVED_KEYWORDS)
+            and not any(k in msg_upper for k in
+                        ['NOT APPROVED', 'UNAPPROVED', 'DECLINED'])):
         return {'status': 'Approved', 'retry': False}
 
     SITE_ERROR_KEYWORDS = [
@@ -144,7 +147,7 @@ def classify_gate_response(response_msg: str, raw_dict: Optional[dict] = None, g
         'GATEWAY_TIMEOUT', 'BAD_GATEWAY', 'CLOUDFLARE_BLOCKED',
         'MERCHANT_ACCOUNT_CLOSED', 'GATEWAY_NOT_CONFIGURED',
         'SITE DEAD', 'INVALID SITE', 'CAPTCHA_REQUIRED', 'NOT_SUPPORTED',
-        'FAILED TO GET TOKEN', 'SITE ERROR'
+        'FAILED TO GET TOKEN', 'SITE ERROR', 'NO_SITES'
     ]
     if any(k in msg_upper for k in SITE_ERROR_KEYWORDS):
         return {'status': 'Site Error', 'retry': True}
@@ -153,18 +156,17 @@ def classify_gate_response(response_msg: str, raw_dict: Optional[dict] = None, g
 
 
 def _is_pool_exhausted(data: dict) -> bool:
+    """
+    True only when the API's auto-validate ran through every supplied site
+    and none produced a card-level answer. In that case, a different replica
+    (with its own blacklist state) might succeed on the SAME sites.
+    """
     code = str(data.get("Response", "")).upper()
     msg = str(data.get("Message", "") or data.get("message", "")).lower()
-    if code not in ("SITE_ERROR", "NO_PRODUCT", ""):
+    if code not in ("SITE_ERROR", ""):
         return False
-    return any(
-        k in msg for k in (
-            "exhausted", "quarantined", "pool is empty",
-            "all sites excluded", "all sites quarantined",
-            "no sites", "no usable sites",
-        )
-    )
-
+    # Match only _auto_validate's exhaustion string
+    return "sites exhausted" in msg
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CLIENT ENDPOINTS
@@ -191,10 +193,27 @@ async def check_shopify_card(
         session = aiohttp.ClientSession(timeout=client_timeout)
         close_session = True
 
+    # Cap + dedupe fallback list
     fallback_str: Optional[str] = None
     if fallback_sites:
-        cleaned = [s.strip() for s in fallback_sites if s and s.strip()]
-        fallback_str = ",".join(cleaned[:20])
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for s in fallback_sites:
+            if not s:
+                continue
+            ss = s.strip()
+            if not ss:
+                continue
+            if not ss.startswith("http"):
+                ss = f"https://{ss}"
+            if ss in seen:
+                continue
+            seen.add(ss)
+            cleaned.append(ss)
+            if len(cleaned) >= FALLBACK_SITES_CAP:
+                break
+        if cleaned:
+            fallback_str = ",".join(cleaned)
 
     try:
         tested_servers: set = set()
@@ -224,13 +243,14 @@ async def check_shopify_card(
 
             try:
                 async with session.get(url, timeout=timeout_sec) as resp:
+                    # ── 200 OK ──
                     if resp.status == 200:
                         data = await resp.json()
 
                         if _is_pool_exhausted(data):
-                            last_error = str(data.get("Message", "pool exhausted"))
+                            last_error = str(data.get("Message", "sites exhausted"))
                             logging.info(
-                                "[shopify_api] replica %s pool exhausted (%s) — "
+                                "[shopify_api] replica %s exhausted client sites (%s) — "
                                 "trying a different replica (attempt %d/%d)",
                                 server, last_error, attempt + 1, max_retries,
                             )
@@ -238,17 +258,27 @@ async def check_shopify_card(
                                 await asyncio.sleep(0.15)
                                 continue
                             resp_msg = str(data.get("Response", "SITE_ERROR"))
-                            gateway = data.get("Gate", data.get("Gateway", "Shopify Payments"))
-                            data["Classification"] = classify_gate_response(resp_msg, data, gateway)
+                            gateway = data.get("Gate",
+                                               data.get("Gateway", "Shopify Payments"))
+                            data["Classification"] = classify_gate_response(
+                                resp_msg, data, gateway
+                            )
                             data["Status"] = False
                             return data
 
-                        resp_msg = data.get("Response", data.get("card_response", "Unknown"))
-                        gateway = data.get("Gate", data.get("Gateway", "Shopify Payments"))
-                        data["Classification"] = classify_gate_response(resp_msg, data, gateway)
-                        data["Status"] = data["Classification"]["status"] in ("Charged", "Approved")
+                        resp_msg = data.get("Response",
+                                            data.get("card_response", "Unknown"))
+                        gateway = data.get("Gate",
+                                           data.get("Gateway", "Shopify Payments"))
+                        data["Classification"] = classify_gate_response(
+                            resp_msg, data, gateway
+                        )
+                        data["Status"] = data["Classification"]["status"] in (
+                            "Charged", "Approved"
+                        )
                         return data
 
+                    # ── 401/403: try ALT key once ──
                     elif resp.status in (401, 403):
                         alt_params = dict(params)
                         alt_params["key"] = ALT_API_KEY
@@ -258,20 +288,59 @@ async def check_shopify_card(
                                 if alt_resp.status == 200:
                                     data = await alt_resp.json()
                                     if _is_pool_exhausted(data):
-                                        last_error = str(data.get("Message", "pool exhausted"))
+                                        last_error = str(data.get("Message",
+                                                                  "sites exhausted"))
                                         if attempt < max_retries - 1:
                                             await asyncio.sleep(0.15)
                                             continue
-                                    resp_msg = data.get("Response", data.get("card_response", "Unknown"))
-                                    gateway = data.get("Gate", data.get("Gateway", "Shopify Payments"))
-                                    data["Classification"] = classify_gate_response(resp_msg, data, gateway)
-                                    data["Status"] = data["Classification"]["status"] in ("Charged", "Approved")
+                                    resp_msg = data.get("Response",
+                                                        data.get("card_response",
+                                                                 "Unknown"))
+                                    gateway = data.get("Gate",
+                                                       data.get("Gateway",
+                                                                "Shopify Payments"))
+                                    data["Classification"] = classify_gate_response(
+                                        resp_msg, data, gateway
+                                    )
+                                    data["Status"] = data["Classification"]["status"] in (
+                                        "Charged", "Approved"
+                                    )
                                     return data
                         except Exception as e:
                             last_error = f"alt-key: {e}"
                             logging.warning(
-                                "[shopify_api] alt-key fetch failed on %s: %s", server, e
+                                "[shopify_api] alt-key fetch failed on %s: %s",
+                                server, e,
                             )
+
+                    # ── 400: client error, retrying won't help ──
+                    elif resp.status == 400:
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            data = {
+                                "Response": "BAD_REQUEST",
+                                "Message":  f"HTTP 400 from {server}",
+                            }
+                        code = str(data.get("Response", "")).upper()
+                        if code == "NO_SITES":
+                            logging.warning(
+                                "[shopify_api] %s returned NO_SITES — "
+                                "bot must pass fallback_sites when auto=True",
+                                server,
+                            )
+                        else:
+                            logging.warning(
+                                "[shopify_api] %s returned 400 (%s) — "
+                                "client error, not retrying",
+                                server, data.get("Message", ""),
+                            )
+                        data["Classification"] = {"status": "Site Error",
+                                                   "retry": False}
+                        data["Status"] = False
+                        return data
+
+                    # ── other status ──
                     else:
                         last_error = f"HTTP {resp.status}"
                         logging.warning(
@@ -366,51 +435,33 @@ async def check_site(
         if close_session:
             await session.close()
 
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# POOL SYNC — push bot's site list to every replica
+# DEPRECATED — kept as no-op so main.py doesn't break
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def push_sites_to_all_replicas(sites: List[str]) -> Dict[str, Any]:
     """
-    Push the bot's current site pool to every replica's /sync-sites endpoint.
+    DEPRECATED: The API is now stateless. Sites are supplied per-request
+    via `fallback_sites`. This function is a no-op stub so existing callers
+    (main.py's sync loop) don't break.
 
-    Called from main.py's background sync loop every 5 minutes and after
-    any admin write to global_sites. Uses JSON body so large pools (500+)
-    don't hit URL length limits.
+    Remove the call from main.py at your convenience; nothing will change.
     """
-    if not sites:
-        return {"pushed": 0, "results": {}, "error": "empty list"}
-
-    # Cap to avoid overloading replicas. 500 covers the practical pool size.
-    to_push = sites[:500]
-
-    results: Dict[str, Any] = {}
-    timeout = aiohttp.ClientTimeout(total=25)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for server in API_SERVERS:
-            url = f"{server}/sync-sites"
-            try:
-                payload = {"sites": to_push, "key": SHOPIFY_API_KEY}
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results[server] = {
-                            "ok":        True,
-                            "pool_size": data.get("pool_size", 0),
-                            "previous":  data.get("previous", 0),
-                        }
-                    else:
-                        results[server] = {"ok": False, "error": f"HTTP {resp.status}"}
-            except Exception as e:
-                results[server] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    return {"pushed": len(to_push), "results": results}
-
+    logging.warning(
+        "[shopify_api] push_sites_to_all_replicas() is deprecated — "
+        "the API is stateless and receives sites per-request. "
+        "Remove the call from main.py."
+    )
+    return {
+        "deprecated": True,
+        "pushed":     0,
+        "results":    {},
+        "note":       "API is stateless — pass fallback_sites on every "
+                      "check_shopify_card call",
+    }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# BACKGROUND HEALTH CHECK LOOP
+# BACKGROUND HEALTH CHECK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def auto_health_check():
@@ -435,39 +486,26 @@ async def auto_health_check():
                                 continue
 
                             data = await resp.json()
-                            version = data.get("version", "?")
-                            pool_size = int(data.get("pool_size", 0) or 0)
-                            pool_source = data.get("pool_source", "?")
-                            healthy = data.get("file_pool_live")
-                            if healthy is None:
-                                healthy = data.get("healthy_sites")
-
-                            pool_usable = pool_size > 0 and (
-                                healthy is None or int(healthy) > 0
-                            )
-                            if pool_usable:
-                                active.append(api)
+                            if str(data.get("status", "")).lower() != "ok":
                                 SERVER_HEALTH[api] = {
-                                    "status":           "online",
-                                    "version":          version,
-                                    "pool_source":      pool_source,
-                                    "latency":          f"{elapsed}s",
-                                    "pool_size":        pool_size,
-                                    "healthy_sites":    healthy,
-                                    "site_concurrency": data.get("site_concurrency", 0),
-                                    "max_price":        data.get("max_price", 0),
-                                    "last_check":       time.time(),
-                                }
-                            else:
-                                SERVER_HEALTH[api] = {
-                                    "status":     "empty pool",
-                                    "version":    version,
-                                    "pool_source": pool_source,
+                                    "status":     data.get("status", "unknown"),
                                     "latency":    f"{elapsed}s",
-                                    "pool_size":  pool_size,
-                                    "healthy":    healthy,
                                     "last_check": time.time(),
                                 }
+                                continue
+
+                            active.append(api)
+                            SERVER_HEALTH[api] = {
+                                "status":            "online",
+                                "version":           data.get("version", "?"),
+                                "mode":              data.get("mode", "?"),
+                                "latency":           f"{elapsed}s",
+                                "keys_configured":   data.get("keys_configured", 0),
+                                "site_concurrency":  data.get("site_concurrency", 0),
+                                "blacklisted_sites": data.get("blacklisted_sites", 0),
+                                "throttled_sites":   data.get("throttled_sites", 0),
+                                "last_check":        time.time(),
+                            }
                     except Exception as e:
                         SERVER_HEALTH[api] = {
                             "status":     f"offline ({type(e).__name__})",
@@ -479,20 +517,19 @@ async def auto_health_check():
                 ACTIVE_API_SERVERS.clear()
                 ACTIVE_API_SERVERS.extend(active)
                 logging.debug(
-                    "[shopify_api] health check: %d/%d replicas active",
+                    "[shopify_api] health: %d/%d replicas active",
                     len(active), len(API_SERVERS),
                 )
             else:
                 logging.warning(
-                    "[shopify_api] no replica reported a usable pool — "
-                    "keeping previous active list (%d)",
+                    "[shopify_api] no healthy replicas — keeping previous "
+                    "active list (%d)",
                     len(ACTIVE_API_SERVERS),
                 )
         except Exception as e:
             logging.error("[shopify_api] health check loop exception: %s", e)
 
         await asyncio.sleep(60)
-
 
 def get_health_summary() -> str:
     lines = [
@@ -501,25 +538,24 @@ def get_health_summary() -> str:
     ]
     for idx, s in enumerate(API_SERVERS, 1):
         info = SERVER_HEALTH.get(s, {})
-        status = info.get("status", "unknown")
-        latency = info.get("latency", "-")
-        version = info.get("version", "?")
-        pool_size = info.get("pool_size", 0)
-        healthy = info.get("healthy_sites")
-        pool_source = info.get("pool_source", "?")
+        status     = info.get("status", "unknown")
+        latency    = info.get("latency", "-")
+        version    = info.get("version", "?")
+        mode       = info.get("mode", "?")
+        blacklisted = info.get("blacklisted_sites", 0)
+        throttled  = info.get("throttled_sites", 0)
 
         domain = urllib.parse.urlparse(s).netloc.split(".")[0]
-        icon = "🟢" if status == "online" else (
-            "🟡" if status == "empty pool" else "🔴"
-        )
+        icon = "🟢" if status == "online" else "🔴"
 
         lines.append(f"{icon} <b>Replica {idx}</b> (<code>{domain}</code>)")
         lines.append(f"  ├ Status: <code>{status}</code>")
-        lines.append(f"  ├ Version: <code>{version}</code> ({pool_source})")
-        lines.append(f"  ├ Pool: <code>{pool_size}</code>"
-                     + (f" · healthy <code>{healthy}</code>" if healthy is not None else ""))
+        lines.append(f"  ├ Version: <code>{version}</code> ({mode})")
+        lines.append(f"  ├ Blacklisted: <code>{blacklisted}</code> · "
+                     f"Throttled: <code>{throttled}</code>")
         lines.append(f"  └ Latency: <code>{latency}</code>")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 <b>Active Replicas:</b> {len(ACTIVE_API_SERVERS)}/{len(API_SERVERS)}")
+    lines.append(f"📊 <b>Active Replicas:</b> "
+                 f"{len(ACTIVE_API_SERVERS)}/{len(API_SERVERS)}")
     return "\n".join(lines)
