@@ -739,30 +739,80 @@ def is_expired(mm: str, yy: str) -> bool:
         return True
 
 
+# ═══════════════════════════════════════════════════════════════
+# SITE POOL — MongoDB-backed, 60s cache, sites.txt fallback
+# ═══════════════════════════════════════════════════════════════
+
+_sites_cache = {"sites": [], "loaded_at": 0.0}
+_SITES_CACHE_SOFT_TTL = 60       # re-read from DB every 60s
+_SITES_CACHE_HARD_TTL = 900      # use stale cache up to 15 min if DB fails
+
+
 def get_sites():
-    sites = []
+    """
+    Read the site pool from MongoDB's global_sites collection (single
+    source of truth), 60-second cache.
+
+    Fallback chain: DB → 15-min-old cache → sites.txt → empty list
+    """
+    global _sites_cache
+    now = time.time()
+    age = now - _sites_cache["loaded_at"]
+
+    if _sites_cache["sites"] and age < _SITES_CACHE_SOFT_TTL:
+        return _sites_cache["sites"]
+
+    sites: list = []
+    try:
+        from database import get_global_sites
+        sites = get_global_sites() or []
+        if sites:
+            _sites_cache = {"sites": sites, "loaded_at": now}
+            logging.info(f"[MSH] Loaded {len(sites)} sites from MongoDB global_sites")
+            return sites
+    except Exception as e:
+        logging.error(f"[MSH] Error loading global_sites from DB: {e}")
+
+    if _sites_cache["sites"] and age < _SITES_CACHE_HARD_TTL:
+        logging.warning(
+            f"[MSH] DB global_sites empty — using {age:.0f}s-old cache "
+            f"({len(_sites_cache['sites'])} sites)"
+        )
+        return _sites_cache["sites"]
+
     try:
         sites_file = os.path.join(os.path.dirname(__file__), "sites.txt")
         if os.path.exists(sites_file):
             with open(sites_file, "r", encoding="utf-8", errors="ignore") as f:
                 sites = [line.strip() for line in f if line.strip()]
-        elif os.path.exists("sites.txt"):
-            with open("sites.txt", "r", encoding="utf-8", errors="ignore") as f:
-                sites = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        logging.error(f"[MSH] Error reading sites.txt: {e}")
 
-        banned_file = os.path.join(os.path.dirname(__file__), "banned_sites.json")
-        if os.path.exists(banned_file):
-            try:
+    if sites:
+        try:
+            banned_file = os.path.join(os.path.dirname(__file__), "banned_sites.json")
+            if os.path.exists(banned_file):
                 import json
                 with open(banned_file, "r", encoding="utf-8") as bf:
                     banned = set(json.load(bf))
+                    before = len(sites)
                     sites = [s for s in sites if s not in banned]
-            except Exception as e:
-                logging.error(f"Error reading banned_sites.json: {e}")
-    except Exception as e:
-        logging.error(f"Error reading sites.txt: {e}")
+                    if len(sites) < before:
+                        logging.info(f"[MSH] Filtered {before - len(sites)} banned sites")
+        except Exception as e:
+            logging.error(f"[MSH] Error reading banned_sites.json: {e}")
+
+    if sites:
+        _sites_cache = {"sites": sites, "loaded_at": now}
+        logging.warning(f"[MSH] Using sites.txt fallback ({len(sites)} sites)")
+
     return sites
 
+
+def invalidate_sites_cache():
+    """Force a fresh DB read on next get_sites(). Call after any write to global_sites."""
+    global _sites_cache
+    _sites_cache = {"sites": [], "loaded_at": 0.0}
 
 def get_user_display(user_obj, plan_name):
     return f"{user_obj.first_name} ({plan_name})"
