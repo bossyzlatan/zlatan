@@ -160,6 +160,41 @@ STRIPE_DEAD_SITE_ERRORS = [
 
 router = Router()
 
+
+async def _push_sites_after_change(label: str = "sitechk"):
+    """
+    Push global_sites from MongoDB to all API replicas after any mutation
+    (addsite / removeall / remsite / dedupe / audit). Runs in the
+    background — never blocks the command handler.
+
+    Also invalidates the msh.py site cache so the next /msh run picks up
+    the new pool immediately.
+    """
+    try:
+        from mass_gates.msh import invalidate_sites_cache
+        from shopify_api import push_sites_to_all_replicas
+        from database import get_global_sites
+
+        invalidate_sites_cache()
+        fresh = await asyncio.to_thread(get_global_sites)
+        if not fresh:
+            logging.warning(f"[{label}] pool empty after mutation — nothing to push")
+            return
+
+        result = await push_sites_to_all_replicas(fresh)
+        ok = sum(1 for r in result["results"].values() if r.get("ok"))
+        detail = {
+            host.split("//")[-1].split(".")[0]:
+                (r.get("pool_size") if r.get("ok") else r.get("error"))
+            for host, r in result["results"].items()
+        }
+        logging.info(
+            f"[{label}] pushed {result['pushed']} sites to {ok}/{len(result['results'])} replicas: {detail}"
+        )
+    except Exception as e:
+        logging.error(f"[{label}] push failed: {e}", exc_info=True)
+
+
 SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sites.txt")
 STRIPE_SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stripe_sites.txt")
 BANNED_SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banned_sites.json")
@@ -933,6 +968,10 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                 logging.error(f"Error saving to user_sites DB: {ue}")
                 traceback.print_exc()
 
+    # ── NEW: push updated pool to replicas immediately ──
+    if command_name in ("Audit", "Adding"):
+        asyncio.create_task(_push_sites_after_change(command_name.lower()))
+
     filename = f"report_{command_name.lower()}_{int(time.time())}.txt"
     file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     file_content += f"TOTAL CHECKED: {total_sites}\n"
@@ -1515,6 +1554,8 @@ async def removeall_command(message: types.Message):
         await message.answer("📭 <b>Global site pool is already empty.</b>", parse_mode="HTML")
         return
 
+    asyncio.create_task(_push_sites_after_change("removeall"))
+
     await message.answer(
         f"<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> <b>All sites have been successfully removed.</b>\n\n"
         f"<b>Removed:</b> <code>{count}</code> sites",
@@ -1548,6 +1589,8 @@ async def dedupe_command(message: types.Message):
 
     final_count = await asyncio.to_thread(write_sites, deduped)
     removed = original_count - final_count
+
+    asyncio.create_task(_push_sites_after_change("dedupe"))
 
     if removed > 0:
         await message.answer(
@@ -1654,6 +1697,8 @@ async def remsite_command(message: types.Message):
         except Exception as e:
             await message.answer(f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Error writing to banned_sites.json:</b> <code>{str(e)}</code>", parse_mode="HTML")
             return
+
+    asyncio.create_task(_push_sites_after_change("remsite"))
 
     active_removed_str = "and removed from active list" if removed_from_active else "(was not in active list)"
     await message.answer(
