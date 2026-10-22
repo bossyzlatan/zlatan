@@ -104,11 +104,17 @@ _start_msh_gc()
 router = Router()
 
 try:
-    from shopify_api import get_active_server, SHOPIFY_API_KEY, ALT_API_KEY, API_SERVERS
+    from shopify_api import (
+        get_active_server, SHOPIFY_API_KEY, ALT_API_KEY, API_SERVERS,
+        check_shopify_card,
+    )
 except ImportError:
     import sys
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from shopify_api import get_active_server, SHOPIFY_API_KEY, ALT_API_KEY, API_SERVERS
+    from shopify_api import (
+        get_active_server, SHOPIFY_API_KEY, ALT_API_KEY, API_SERVERS,
+        check_shopify_card,
+    )
 
 
 _BLACKLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blacklisted_sites.txt")
@@ -358,7 +364,7 @@ class ProxyManager:
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
 
-        # ═══ FIX ═══ The API returns Response:"PROXY_ERROR" over HTTP 200.
+        # The API returns Response:"PROXY_ERROR" over HTTP 200.
         # Must be detected BEFORE the http_status==200 early-return below.
         if "proxy_error" in response_lower or "proxy error" in response_lower:
             return True
@@ -560,7 +566,7 @@ RETRY_ERRORS = [
     '504', 'server error', 'client error', 'failed',
     'token not found', 'invalid_response', 'resolve', 'item', 'curl error',
     'could not resolve host', 'connect tunnel failed',
-    'timeout', 'proxy error', 'proxy_error',          # ═══ FIX ═══
+    'timeout', 'proxy error', 'proxy_error', 'api_replicas_unreachable',
     'http 429', '429', 'too many requests',
     'payment method not available', 'site not supported', 'captcha_required',
     'payments_credit_card_brand_not_supported', 'delivery_delivery_line_detail_changed',
@@ -763,22 +769,28 @@ def get_user_display(user_obj, plan_name):
 
 
 # ═══════════════════════════════════════════════════════════════
-# API CALL
+# API CALL — delegates to shopify_api.check_shopify_card
 # ═══════════════════════════════════════════════════════════════
 
 async def process_card_api(
     cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str,
     fallback_sites: Optional[list] = None,
 ) -> Tuple[bool, str, str, str, str, str, str, int]:
-    import aiohttp
+    """
+    Thin wrapper around shopify_api.check_shopify_card().
+
+    Inherits for free:
+      - Replica failover (tries other replicas on pool-exhausted)
+      - fallback_sites forwarding (uses bot's real pool on the API)
+      - Health-aware active-server selection
+
+    Returns the same tuple as the original API call so the rest of
+    process_single_card() doesn't change.
+    """
 
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
 
-    if proxy is None:
-        proxy = ""
-    proxy = str(proxy).strip()
-
-    api_proxy = proxy
+    api_proxy = (proxy or "").strip()
     if api_proxy.startswith("http://"):
         api_proxy = api_proxy[7:]
     elif api_proxy.startswith("https://"):
@@ -786,109 +798,67 @@ async def process_card_api(
     elif api_proxy.startswith("socks5://"):
         api_proxy = api_proxy[9:]
 
-    servers_to_try = [get_active_server()]
-    for s in API_SERVERS:
-        if s not in servers_to_try:
-            servers_to_try.append(s)
-
-    http_status = None
-    last_error_msg = "Unknown Error"
-
-    fallback_str = ""
-    if fallback_sites:
-        alts = [s for s in fallback_sites if s and s != site]
-        random.shuffle(alts)
-        fallback_str = ",".join(alts[:20])
-
     try:
         _http = _get_msh_http_session()
-        for server in servers_to_try:
-            current_api = f"{server}/shopify"
-            for key in [SHOPIFY_API_KEY, ALT_API_KEY]:
-                params = {
-                    "site": site,
-                    "cc": cc_formatted,
-                    "proxy": api_proxy,
-                    "key": key,
-                }
-                if fallback_str:
-                    params["fallback_sites"] = fallback_str
+        data = await check_shopify_card(
+            site=site,
+            cc=cc_formatted,
+            proxy=api_proxy or None,
+            session=_http,
+            max_retries=3,
+            timeout_sec=40.0,
+            fallback_sites=fallback_sites,
+            attempts=15,
+            auto=False,
+        )
 
-                try:
-                    async with _http.get(current_api, params=params) as response:
-                        http_status = response.status
+        api_response = data.get("Response") or data.get("Message") or "Unknown Error"
+        if api_response is None:
+            api_response = "Unknown Error"
+        if not isinstance(api_response, str):
+            api_response = str(api_response)
 
-                        if response.status == 200:
-                            data = await response.json()
+        msg_field = data.get("Message") or data.get("message")
+        code_field = data.get("decline_code") or data.get("code")
+        api_lower = api_response.lower()
+        recognized = any(
+            k in api_lower for k in
+            ["insufficient", "order_placed", "charged",
+             "thank you", "declined", "cvc", "3d", "3ds",
+             "zip", "fraud", "amount"]
+        )
+        if not recognized:
+            if msg_field:
+                api_response = f"{api_response} - {msg_field}"
+            elif code_field:
+                api_response = f"{api_response} - {code_field}"
 
-                            gateway = data.get("Gateway", "Shopify Payments")
-                            price = data.get("Price", "0.00")
-                            proxy_raw = data.get("Proxy", "Live")
-                            api_response = data.get("Response", "Unknown Error")
+        gateway = data.get("Gateway") or data.get("Gate") or "Shopify Payments"
+        price = data.get("Price", "0.00")
+        proxy_raw = data.get("Proxy", "Live")
+        if "live" in str(proxy_raw).lower():
+            proxy_status = "Live"
+        else:
+            proxy_status = "Dead"
 
-                            if api_response is None:
-                                api_response = "Unknown Error"
-                            if not isinstance(api_response, str):
-                                api_response = str(api_response)
+        status = data.get("Status", False)
+        if isinstance(status, str):
+            success = status.lower() == "true"
+        else:
+            success = bool(status)
 
-                            msg_field = data.get("Message") or data.get("message")
-                            code_field = data.get("decline_code") or data.get("code")
-                            api_lower = api_response.lower()
-                            recognized = any(
-                                k in api_lower for k in
-                                ["insufficient", "order_placed", "charged",
-                                 "thank you", "declined", "cvc", "3d", "3ds",
-                                 "zip", "fraud", "amount"]
-                            )
-                            if not recognized:
-                                if msg_field:
-                                    api_response = f"{api_response} - {msg_field}"
-                                elif code_field:
-                                    api_response = f"{api_response} - {code_field}"
-
-                            status = data.get("Status", False)
-
-                            if isinstance(status, str):
-                                success = status.lower() == "true"
-                            else:
-                                success = bool(status)
-
-                            if "live" in str(proxy_raw).lower():
-                                proxy_status = "Live"
-                            else:
-                                proxy_status = "Dead"
-
-                            return (
-                                success,
-                                api_response,
-                                site,
-                                gateway,
-                                price,
-                                "USD",
-                                proxy_status,
-                                http_status,
-                            )
-                        elif response.status in (401, 403):
-                            last_error_msg = f"API Auth Error: HTTP {response.status}"
-                            continue
-                        else:
-                            last_error_msg = f"API Error: HTTP {response.status}"
-                            break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as ex:
-                    last_error_msg = f"{type(ex).__name__}: {ex}"
-                    break
-
+        # Any successful round-trip to the API returns 200 here even if
+        # the classified response is a site error. The proxy manager
+        # inspects the response body, not the HTTP status, so this is safe.
         return (
-            False,
-            last_error_msg,
+            success,
+            api_response,
             site,
-            "Shopify Payments",
-            "0.00",
+            gateway,
+            price,
             "USD",
-            "Error",
-            http_status,
+            proxy_status,
+            200,
         )
 
     except asyncio.CancelledError:
@@ -1509,9 +1479,35 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                     or "all sites excluded" in message_lower
                 )
             ):
-                logging.info(f"[MSH] Pool unavailable for {cc_formatted}: {message}")
+                # This only triggers when the API's site file is literally
+                # empty — soft-exhausted mode returns real codes otherwise.
+                logging.info(f"[MSH] API pool truly empty for {cc_formatted}: {message}")
                 result_status = "ERROR"
                 response_msg = "Pool Exhausted"
+                break
+
+            elif "THROTTLED" in message_upper:
+                # THROTTLED is cached per-host on the API side for 15 min.
+                # A different proxy that hashes to a DIFFERENT host could
+                # succeed but the majority will hit the cache. Fail fast
+                # after 2 attempts to avoid burning all 15 retries.
+                if attempt <= 2:
+                    logging.info(f"[MSH] THROTTLED — retrying with new proxy ({attempt}/2)")
+                    await asyncio.sleep(0.3)
+                    continue
+                result_status = "ERROR"
+                response_msg = f"Throttled: {message[:100]}"
+                break
+
+            elif "API_REPLICAS_UNREACHABLE" in message_upper or "API_REPLICAS_TIMEOUT" in message_upper:
+                # All replicas failed at the transport layer. Retry with
+                # a fresh proxy a few times, then fail clearly.
+                if attempt <= 3:
+                    logging.info(f"[MSH] API replicas unreachable — rotating proxy ({attempt}/3)")
+                    await asyncio.sleep(0.3)
+                    continue
+                result_status = "ERROR"
+                response_msg = "API Replicas Unreachable"
                 break
 
             else:
@@ -1528,9 +1524,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 else:
                     session.setdefault('_blacklisted_sites', set()).add(site)
 
-                    # ═══ FIX ═══ Only decrement attempt for API-level 429s.
-                    # Site-level throttled/generic errors must increment the
-                    # retry counter, otherwise an empty pool loops forever.
+                    # Only decrement attempt for API-level 429s.
                     is_api_rate_limit = (
                         "api error: http 429" in message_lower
                         or "api rate limit" in message_lower
