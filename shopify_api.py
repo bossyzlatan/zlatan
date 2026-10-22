@@ -29,9 +29,7 @@ from typing import Optional, Dict, Any, List
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 API_SERVERS = [
-    "https://starkz-shopi.duckdns.org",
-    "https://starkz-shopi1.duckdns.org",
-    "https://starkz-shopi2.duckdns.org",
+    "shopi-production-8424.up.railway.app",
 ]
 
 SHOPIFY_API_KEY = "oozaruhshop"
