@@ -1007,7 +1007,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     lines.append("")
     lines.append(f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {type_label} {type_emoji}")
     lines.append(f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ {total_count}")
-    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗜𝗙𝘆 𝗠𝗮𝘀𝘀")
+    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗙𝘆 𝗠𝗮𝘀𝘀")
     lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Starkz")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
@@ -1376,7 +1376,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_retry:
             session['retry_checked'] = session.get('retry_checked', 0) + 1
         else:
-            session['errors'] += 1
             session['checked'] += 1
             if session['checked'] % 3 == 0 or session['checked'] == session['total']:
                 await update_progress_message(bot, session_id)
@@ -1388,7 +1387,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_retry:
             session['retry_checked'] = session.get('retry_checked', 0) + 1
         else:
-            session['errors'] += 1
             session['checked'] += 1
             if session['checked'] % 3 == 0 or session['checked'] == session['total']:
                 await update_progress_message(bot, session_id)
@@ -1445,7 +1443,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             if is_retry:
                 session['retry_checked'] = session.get('retry_checked', 0) + 1
             else:
-                session['errors'] += 1
                 session['checked'] += 1
                 if session['checked'] % 3 == 0 or session['checked'] == session['total']:
                     await update_progress_message(bot, session_id)
@@ -1758,7 +1755,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             asyncio.to_thread(update_user_stats, user_id, False),
         )
     elif result_status == "ERROR":
-        session['errors'] += 1
         session['error_cards'].append(card_result_data)
         await asyncio.to_thread(update_user_stats, user_id, False)
 
@@ -2290,7 +2286,6 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
                     if is_retry:
                         _s['retry_checked'] = _s.get('retry_checked', 0) + 1
                     else:
-                        _s['errors'] += 1
                         _s['checked'] += 1
                         if _s['checked'] % 3 == 0 or _s['checked'] == _s['total']:
                             await update_progress_message(bot, session_id)
@@ -2370,7 +2365,7 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
             await asyncio.sleep(1)
 
         session['error_cards'] = finals
-        session['errors'] = len(finals)
+        session['errors'] = 0
 
         await _run_single_round(bot, session_id, retryable, user_obj, plan_name, round_num=round_num)
 
