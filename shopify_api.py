@@ -30,6 +30,9 @@ from typing import Optional, Dict, Any, List
 
 API_SERVERS = [
     "https://shopi-production-8424.up.railway.app",
+    "https://shopi-production-8a5f.up.railway.app",
+    "https://web-production-28654.up.railway.app",
+    "https://shopi-production-4802.up.railway.app",
 ]
 
 SHOPIFY_API_KEY = "oozaruhshop"
