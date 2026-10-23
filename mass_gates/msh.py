@@ -372,8 +372,6 @@ class ProxyManager:
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
 
-        # The API returns Response:"PROXY_ERROR" over HTTP 200.
-        # Must be detected BEFORE the http_status==200 early-return below.
         if "proxy_error" in response_lower or "proxy error" in response_lower:
             return True
 
@@ -1007,7 +1005,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     lines.append("")
     lines.append(f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {type_label} {type_emoji}")
     lines.append(f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ {total_count}")
-    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗜𝗙𝘆 𝗠𝗮𝘀𝘀")
+    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗙𝘆 𝗠𝗮𝘀𝘀")
     lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Starkz")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
@@ -1376,7 +1374,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_retry:
             session['retry_checked'] = session.get('retry_checked', 0) + 1
         else:
-            session['errors'] += 1
             session['checked'] += 1
             if session['checked'] % 3 == 0 or session['checked'] == session['total']:
                 await update_progress_message(bot, session_id)
@@ -1388,7 +1385,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_retry:
             session['retry_checked'] = session.get('retry_checked', 0) + 1
         else:
-            session['errors'] += 1
             session['checked'] += 1
             if session['checked'] % 3 == 0 or session['checked'] == session['total']:
                 await update_progress_message(bot, session_id)
@@ -1445,7 +1441,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             if is_retry:
                 session['retry_checked'] = session.get('retry_checked', 0) + 1
             else:
-                session['errors'] += 1
                 session['checked'] += 1
                 if session['checked'] % 3 == 0 or session['checked'] == session['total']:
                     await update_progress_message(bot, session_id)
@@ -1600,18 +1595,23 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                     or "all sites excluded" in message_lower
                 )
             ):
-                logging.info(f"[MSH] API pool truly empty for {cc_formatted}: {message}")
-                result_status = "ERROR"
-                response_msg = "Pool Exhausted"
+                # api.py walked the whole fallback pool and every site
+                # failed at the site level. Dropping silently — the card
+                # isn't a decline and isn't an API error.
+                logging.info(f"[MSH] API pool exhausted for {cc_formatted}: {message}")
+                result_status = "SKIPPED"
+                response_msg = "Pool exhausted"
                 break
 
             elif "THROTTLED" in message_upper:
-                if attempt <= 2:
-                    logging.info(f"[MSH] THROTTLED — retrying with new proxy ({attempt}/2)")
-                    await asyncio.sleep(0.3)
-                    continue
-                result_status = "ERROR"
-                response_msg = f"Throttled: {message[:100]}"
+                # With the stateless API now walking the full pool per call,
+                # a THROTTLED response means every site in the caller's list
+                # was 429ing at that instant. Retrying picks the same sites
+                # again — skip silently instead of surfacing as an error.
+                session.setdefault('_blacklisted_sites', set()).add(site)
+                logging.info(f"[MSH] Skipped {cc_formatted} — all pool sites throttled")
+                result_status = "SKIPPED"
+                response_msg = "Site throttled"
                 break
 
             elif "API_REPLICAS_UNREACHABLE" in message_upper or "API_REPLICAS_TIMEOUT" in message_upper:
@@ -1758,9 +1758,15 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             asyncio.to_thread(update_user_stats, user_id, False),
         )
     elif result_status == "ERROR":
-        session['errors'] += 1
+        # Error counter stays at 0 (0-errors policy) but the card is
+        # queued in error_cards so the outer retry loop can re-run it.
         session['error_cards'].append(card_result_data)
         await asyncio.to_thread(update_user_stats, user_id, False)
+
+    elif result_status == "SKIPPED":
+        # Throttled / pool-exhausted — not a decline, not an API error.
+        # Dropped silently: no error_cards, no UI counter, no file entry.
+        logging.info(f"[MSH] Skipped {cc_formatted} — {response_msg}")
 
     if is_session_stopped(session_id):
         return
@@ -2290,7 +2296,7 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
                     if is_retry:
                         _s['retry_checked'] = _s.get('retry_checked', 0) + 1
                     else:
-                        _s['errors'] += 1
+                        # 0-errors policy: no errors counter, just bump checked
                         _s['checked'] += 1
                         if _s['checked'] % 3 == 0 or _s['checked'] == _s['total']:
                             await update_progress_message(bot, session_id)
@@ -2342,7 +2348,6 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
             logging.info(f"[MSH] Round {round_num}: no retryable errors — stopping")
             break
 
-        # ADAPTIVE DELAY: if pool has >=100 sites, retry immediately
         pool_size = 0
         try:
             from database import get_global_sites
@@ -2370,7 +2375,7 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
             await asyncio.sleep(1)
 
         session['error_cards'] = finals
-        session['errors'] = len(finals)
+        session['errors'] = 0
 
         await _run_single_round(bot, session_id, retryable, user_obj, plan_name, round_num=round_num)
 
