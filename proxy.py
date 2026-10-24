@@ -2,8 +2,10 @@ import re
 import logging
 import aiohttp
 import asyncio
+import json
 from datetime import datetime
 from urllib.parse import quote
+from typing import Optional
 
 from aiogram import types, F, Router
 from aiogram.types import BufferedInputFile
@@ -21,13 +23,30 @@ from database import (
 
 router = Router()
 
-# Synced with main.py
 ADMIN_IDS = {6962534443, 8428369446}
 
-MAX_CONCURRENT_CHECKS = 5
-PROXY_TIMEOUT = 8
-IPIFY_API_URL = "https://api.ipify.org?format=json"
+# ─── PERF TUNING ────────────────────────────────────────────
+# 50 concurrent checks: 100 proxies finish in ~16s instead of ~160s.
+MAX_CONCURRENT_CHECKS = 50
+PROXY_TIMEOUT = 8           # per-endpoint timeout
+PROGRESS_EDIT_INTERVAL = 8  # seconds between Telegram message edits
 
+# ─── MULTI-ENDPOINT IP LOOKUP ──────────────────────────────
+# Tried in order. If ONE returns 200 → proxy is live.
+# If ALL return 429 → "unknown" (do not remove from DB).
+# If ANY throws a proxy-level error → "dead".
+IP_ENDPOINTS = [
+    "https://api.ipify.org?format=json",
+    "https://api64.ipify.org?format=json",
+    "https://ipinfo.io/ip",
+    "https://checkip.amazonaws.com",
+    "https://icanhazip.com",
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PROXY PARSING
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def parse_proxy_input(proxy_input):
     s = proxy_input.strip()
@@ -35,7 +54,7 @@ def parse_proxy_input(proxy_input):
     protocol_match = re.match(r'^(?P<p>http|https|socks4|socks5)://', s, re.IGNORECASE)
     if protocol_match:
         protocol = protocol_match.group('p').lower()
-        s = s[len(protocol_match.group('p'))+3:]
+        s = s[len(protocol_match.group('p')) + 3:]
 
     def is_valid(ip, port):
         return port and port.isdigit()
@@ -97,84 +116,180 @@ def build_dict(user, password, ip, port, protocol, original_input):
     }
 
 
-async def check_proxy_live(proxy_url, session=None, timeout=PROXY_TIMEOUT):
-    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
-    client_timeout = aiohttp.ClientTimeout(total=timeout, connect=timeout/2)
-    close_session = False
-    if session is None:
-        session = aiohttp.ClientSession(timeout=client_timeout, headers=headers)
-        close_session = True
-    try:
-        async with session.get(IPIFY_API_URL, proxy=proxy_url, ssl=False) as resp:
-            if resp.status == 200:
-                try:
-                    data = await resp.json()
-                    ip = data.get('ip')
-                    if ip:
-                        return True, {"ip": ip}
-                    return False, {"error": "No IP in response"}
-                except Exception:
-                    text_data = await resp.text()
-                    if text_data.strip():
-                        return True, {"ip": text_data.strip()}
-                    return False, {"error": "Empty response"}
-            elif resp.status == 429:
-                return False, {"error": "Rate limited"}
-            else:
-                return False, {"error": f"HTTP {resp.status}"}
-    except asyncio.TimeoutError:
-        return False, {"error": "Timeout"}
-    except aiohttp.ClientProxyConnectionError:
-        return False, {"error": "Connection failed"}
-    except aiohttp.ClientConnectorError:
-        return False, {"error": "DNS/Connection error"}
-    except aiohttp.ClientError as e:
-        return False, {"error": f"Client error: {str(e)[:50]}"}
-    except Exception as e:
-        return False, {"error": str(e)[:80]}
-    finally:
-        if close_session:
-            await session.close()
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PROXY LIVENESS CHECK
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _extract_ip(text: str) -> Optional[str]:
+    """Extract an IP from either a JSON response or plain text."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            return data.get("ip") or data.get("IP") or data.get("query")
+        except Exception:
+            pass
+    parts = text.split()
+    return parts[0][:64] if parts else None
 
 
-async def check_proxies_parallel(proxies_list, max_concurrent=MAX_CONCURRENT_CHECKS):
+async def check_proxy_live(proxy_url: str, session: aiohttp.ClientSession,
+                           timeout: float = PROXY_TIMEOUT):
+    """
+    Try multiple IP endpoints in order.
+
+    Returns (status, info):
+      (True,  {"ip": "..."} )  → proxy is live
+      (False, {"error": "..."}) → proxy is dead (proxy-level connection failure)
+      (None,  {"error": "..."}) → status unknown (all endpoints rate-limited)
+                                  Caller MUST NOT remove from DB on this result.
+    """
+    rate_limit_hits = 0
+    last_error = "unknown"
+
+    for endpoint in IP_ENDPOINTS:
+        try:
+            async with session.get(
+                endpoint,
+                proxy=proxy_url,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout / 2),
+            ) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    ip = _extract_ip(text)
+                    return True, {"ip": ip or "unknown", "endpoint": endpoint}
+                elif resp.status == 429:
+                    rate_limit_hits += 1
+                    last_error = "endpoint rate limited"
+                    continue
+                elif resp.status in (403, 503):
+                    # Endpoint blocked us — proxy itself responded, so it's alive
+                    return True, {"ip": "unknown", "endpoint": endpoint, "http": resp.status}
+                else:
+                    last_error = f"HTTP {resp.status} from {endpoint}"
+                    continue
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+            continue
+        except aiohttp.ClientProxyConnectionError:
+            return False, {"error": "proxy connection failed"}
+        except aiohttp.ClientConnectorError:
+            return False, {"error": "proxy DNS/connect failed"}
+        except aiohttp.ClientHttpProxyError as e:
+            return False, {"error": f"proxy HTTP error: {str(e)[:50]}"}
+        except aiohttp.ClientError as e:
+            last_error = f"{type(e).__name__}: {str(e)[:40]}"
+            continue
+        except Exception as e:
+            last_error = str(e)[:60]
+            continue
+
+    # Every endpoint failed
+    if rate_limit_hits >= len(IP_ENDPOINTS) - 1:
+        return None, {"error": "all IP endpoints rate-limited — try again later"}
+    return False, {"error": last_error}
+
+
+async def check_proxies_parallel(proxies_list, max_concurrent: int = MAX_CONCURRENT_CHECKS,
+                                 on_progress=None):
+    """
+    Shared session for all checks (single TCP pool).
+    on_progress(done, total, live_count) is throttled to PROGRESS_EDIT_INTERVAL.
+    """
     semaphore = asyncio.Semaphore(max_concurrent)
-    async def check_with_semaphore(proxy_data):
-        async with semaphore:
-            is_live, info = await check_proxy_live(proxy_data['url_format'])
-            return (proxy_data, is_live, info)
-    tasks = [check_with_semaphore(p) for p in proxies_list]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    timeout = aiohttp.ClientTimeout(total=PROXY_TIMEOUT, connect=PROXY_TIMEOUT / 2)
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json,text/plain,*/*'}
+
+    done_count = 0
+    live_count = 0
+    last_edit_time = 0.0
+    lock = asyncio.Lock()
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async def check_with_semaphore(proxy_data):
+            nonlocal done_count, live_count, last_edit_time
+            async with semaphore:
+                status, info = await check_proxy_live(proxy_data['url_format'], session)
+                async with lock:
+                    done_count += 1
+                    if status is True:
+                        live_count += 1
+                    if on_progress:
+                        now = asyncio.get_event_loop().time()
+                        if (now - last_edit_time >= PROGRESS_EDIT_INTERVAL
+                                or done_count == len(proxies_list)):
+                            last_edit_time = now
+                            try:
+                                await on_progress(done_count, len(proxies_list), live_count)
+                            except Exception:
+                                pass
+                return (proxy_data, status, info)
+
+        tasks = [check_with_semaphore(p) for p in proxies_list]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
     processed = []
     for i, res in enumerate(results):
         if isinstance(res, Exception):
-            processed.append((proxies_list[i], False, {"error": str(res)}))
+            processed.append((proxies_list[i], False, {"error": str(res)[:60]}))
         else:
             processed.append(res)
     return processed
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# /proxy — background add pipeline
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 async def process_proxies_background(bot, message: types.Message, valid_proxies: list):
     user_id = message.from_user.id
     total_count = len(valid_proxies)
+
     status_msg = await message.reply(
         f"<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> <b>Processing...</b>\n\n"
-        f"<code>{total_count}</code> proxies to check\n"
-        f"<i>Checking</i>",
+        f"<b>Checking ➛</b> <code>0/{total_count}</code>\n"
+        f"<b>Live ➛</b> <b>0</b> ✅",
         parse_mode="HTML"
     )
-    results_list = await check_proxies_parallel(valid_proxies)
-    live_count = sum(1 for _, is_live, _ in results_list if is_live)
-    dead_count = total_count - live_count
-    added_count = 0
-    clone_count = 0
-    for proxy_data, is_live, _ in results_list:
-        if is_live:
-            was_added = await asyncio.to_thread(add_proxy, user_id, proxy_data['db_format'])
-            if was_added:
-                added_count += 1
-            else:
-                clone_count += 1
+
+    async def _progress(done, total, live):
+        pct = int(done * 100 / total) if total else 0
+        try:
+            await bot.edit_message_text(
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                text=(
+                    f"<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> <b>Processing...</b>\n\n"
+                    f"<b>Checking ➛</b> <code>{done}/{total}</code> ({pct}%)\n"
+                    f"<b>Live ➛</b> <b>{live}</b> ✅"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    results_list = await check_proxies_parallel(valid_proxies, on_progress=_progress)
+
+    live_count  = sum(1 for _, is_live, _ in results_list if is_live is True)
+    dead_count  = sum(1 for _, is_live, _ in results_list if is_live is False)
+    unknown_count = sum(1 for _, is_live, _ in results_list if is_live is None)
+
+    # Parallel DB writes (was serial)
+    live_entries = [p for (p, is_live, _) in results_list if is_live is True]
+    if live_entries:
+        add_results = await asyncio.gather(
+            *[asyncio.to_thread(add_proxy, user_id, p['db_format']) for p in live_entries],
+            return_exceptions=True,
+        )
+        added_count = sum(1 for r in add_results if r is True)
+        clone_count = sum(1 for r in add_results if r is False)
+    else:
+        added_count = 0
+        clone_count = 0
+
     is_bulk = total_count > 1
     if is_bulk:
         caption = (
@@ -185,12 +300,14 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
             f"<b>Clones ➛</b> <b>{clone_count}</b> 🔁\n"
             f"<b>Dead ➛</b> <b>{dead_count}</b> ⚠️"
         )
+        if unknown_count:
+            caption += f"\n<b>Unknown ➛</b> <b>{unknown_count}</b> ❔ (endpoints throttled)"
     else:
         if results_list:
             proxy_data, is_live, info = results_list[0]
         else:
             proxy_data, is_live, info = valid_proxies[0], False, {}
-        if is_live:
+        if is_live is True:
             ip = info.get("ip") or proxy_data['ip']
             if added_count > 0:
                 caption = (
@@ -206,7 +323,7 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
                     f"<b>IP ➛</b> <code>{ip}</code>\n\n"
                     f"<b>🔁 Already exists in DB</b>"
                 )
-        else:
+        elif is_live is False:
             error_msg = info.get("error", "Unknown")
             caption = (
                 f"<b>❌ Failed!</b>\n\n"
@@ -214,6 +331,14 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
                 f"<b>Reason ➛</b> <code>{error_msg}</code>\n\n"
                 f"<b>❌ Not added.</b>"
             )
+        else:  # None — unknown
+            caption = (
+                f"<b>❔ Uncertain</b>\n\n"
+                f"<b>Status ➛ Unknown</b>\n"
+                f"<b>Reason ➛</b> <code>{info.get('error', 'unknown')}</code>\n\n"
+                f"<b>⏳ Try again in a minute.</b>"
+            )
+
     try:
         await bot.edit_message_text(
             chat_id=status_msg.chat.id,
@@ -225,41 +350,84 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
         await message.reply(caption, parse_mode="HTML")
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# /checkproxy — background verify-and-prune
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 async def check_db_proxies_background(bot, message: types.Message):
     user_id = message.from_user.id
     proxies_str_list = await asyncio.to_thread(get_proxies, user_id)
     if not proxies_str_list:
         await message.reply("<b>📭 No proxies saved.</b>", parse_mode="HTML")
         return
+
     total_count = len(proxies_str_list)
+
     status_msg = await message.reply(
         f"<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> <b>Checking...</b>\n\n"
-        f"<code>{total_count}</code> saved proxies\n"
-        f"<i>Testing {min(MAX_CONCURRENT_CHECKS, total_count)} at a time...</i>",
+        f"<b>Saved ➛</b> <code>{total_count}</code>\n"
+        f"<b>Progress ➛</b> <code>0/{total_count}</code>",
         parse_mode="HTML"
     )
+
     proxies_to_check = []
     for p_str in proxies_str_list:
         parsed = parse_proxy_input(p_str)
         if parsed:
             proxies_to_check.append(parsed)
-    results_list = await check_proxies_parallel(proxies_to_check)
-    live_proxies = []
-    dead_proxies = []
+
+    if not proxies_to_check:
+        await status_msg.edit_text(
+            "<b>⚠️ None of the saved proxies could be parsed.</b>",
+            parse_mode="HTML"
+        )
+        return
+
+    async def _progress(done, total, live):
+        pct = int(done * 100 / total) if total else 0
+        try:
+            await bot.edit_message_text(
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                text=(
+                    f"<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> <b>Checking...</b>\n\n"
+                    f"<b>Progress ➛</b> <code>{done}/{total}</code> ({pct}%)\n"
+                    f"<b>Live ➛</b> <b>{live}</b> ✅"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    results_list = await check_proxies_parallel(proxies_to_check, on_progress=_progress)
+
+    live_proxies    = []
+    dead_proxies    = []
+    unknown_proxies = []
     for proxy_data, is_live, info in results_list:
-        if is_live:
+        if is_live is True:
             live_proxies.append(proxy_data['db_format'])
-        else:
+        elif is_live is False:
             dead_proxies.append(proxy_data['db_format'])
+        else:  # None — keep
+            unknown_proxies.append(proxy_data['db_format'])
+
+    # Parallel DB removal (was serial)
     if dead_proxies:
-        for dead_str in dead_proxies:
-            await asyncio.to_thread(remove_proxy, user_id, dead_str)
+        await asyncio.gather(
+            *[asyncio.to_thread(remove_proxy, user_id, d) for d in dead_proxies],
+            return_exceptions=True,
+        )
+
     caption = (
         f"<b>✅ Check Complete!</b>\n\n"
         f"<b>Total ➛</b> <code>{total_count}</code>\n"
         f"<b>Live ➛</b> <b>{len(live_proxies)}</b> ✅\n"
         f"<b>Removed ➛</b> <b>{len(dead_proxies)}</b> 🗑️"
     )
+    if unknown_proxies:
+        caption += f"\n<b>Unknown ➛</b> <b>{len(unknown_proxies)}</b> ❔ (kept)"
+
     if not live_proxies:
         caption += "\n\n<b>⚠️ No live proxies remaining.</b>"
         try:
@@ -272,6 +440,7 @@ async def check_db_proxies_background(bot, message: types.Message):
         except Exception:
             await message.reply(caption, parse_mode="HTML")
         return
+
     file_content = ""
     for p_str in live_proxies:
         parsed = parse_proxy_input(p_str)
@@ -279,10 +448,12 @@ async def check_db_proxies_background(bot, message: types.Message):
             file_content += parsed['http_format'] + "\n"
         else:
             file_content += p_str + "\n"
+
     txt_file = BufferedInputFile(
         file=file_content.encode('utf-8'),
         filename=f"live_proxies_{len(live_proxies)}.txt"
     )
+
     try:
         await bot.delete_message(
             chat_id=status_msg.chat.id,
@@ -290,6 +461,7 @@ async def check_db_proxies_background(bot, message: types.Message):
         )
     except Exception:
         pass
+
     try:
         await message.reply_document(
             document=txt_file,
@@ -301,6 +473,10 @@ async def check_db_proxies_background(bot, message: types.Message):
         logging.error(f"File send error: {e}")
         await message.reply(caption, parse_mode="HTML")
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# COMMANDS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.regexp(r'^/proxy(?:\s|$)'))
 async def proxy_command(message: types.Message):
@@ -397,7 +573,7 @@ async def myproxies_command(message: types.Message):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ADMIN: /rtvproxy — Retrieve every proxy across all users
+# ADMIN: /rtvproxy
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @router.message(F.text.regexp(r'^/rtvproxy(?:\s|$)'))
