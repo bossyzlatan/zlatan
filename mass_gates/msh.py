@@ -72,15 +72,15 @@ OUTER_RETRY_DELAYS = [
 ]
 
 # ═══ PER-CARD RETRY BUDGETS ═══
-MAX_PROXY_RETRIES = 5    # proxy/connection failures before giving up
-MAX_SITE_RETRIES  = 15   # site-level failures before giving up
+MAX_PROXY_RETRIES = 5
+MAX_SITE_RETRIES  = 15
 
 # ═══ PER-CARD CONCURRENCY ═══
-CARD_CONCURRENCY = 1000  # parallel card slots — matches your 1000-proxy pool
+CARD_CONCURRENCY = 1000
 
 # ═══ API CALL TIMING ═══
-API_ATTEMPTS = 3         # max sites per API call (was 15 — this was the 45x amplification bug)
-API_TIMEOUT = 25.0       # max seconds per API call
+API_ATTEMPTS = 3
+API_TIMEOUT = 25.0
 
 # ═══ STRUCTURED CODE CLASSIFICATIONS ═══
 SKIP_SITE_CODES = {
@@ -667,7 +667,7 @@ def is_expired(mm: str, yy: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SITE POOL
+# SITE POOL — Fix 1: dedupe on every load
 # ═══════════════════════════════════════════════════════════════
 
 _sites_cache = {"sites": [], "loaded_at": 0.0}
@@ -681,19 +681,25 @@ def get_sites():
     age = now - _sites_cache["loaded_at"]
     if _sites_cache["sites"] and age < _SITES_CACHE_SOFT_TTL:
         return _sites_cache["sites"]
+
     sites: list = []
+
     try:
         from database import get_global_sites
         sites = get_global_sites() or []
         if sites:
+            # ─── Fix 1: dedupe (was causing nxp9rb-pm to be hit 363 times) ───
+            sites = list(dict.fromkeys(sites))
             _sites_cache = {"sites": sites, "loaded_at": now}
-            logging.info(f"[MSH] Loaded {len(sites)} sites from MongoDB")
+            logging.info(f"[MSH] Loaded {len(sites)} unique sites from MongoDB")
             return sites
     except Exception as e:
         logging.error(f"[MSH] Error loading global_sites: {e}")
+
     if _sites_cache["sites"] and age < _SITES_CACHE_HARD_TTL:
         logging.warning(f"[MSH] DB empty — using {age:.0f}s-old cache ({len(_sites_cache['sites'])} sites)")
         return _sites_cache["sites"]
+
     try:
         sites_file = os.path.join(os.path.dirname(__file__), "sites.txt")
         if os.path.exists(sites_file):
@@ -701,6 +707,7 @@ def get_sites():
                 sites = [line.strip() for line in f if line.strip()]
     except Exception as e:
         logging.error(f"[MSH] Error reading sites.txt: {e}")
+
     if sites:
         try:
             banned_file = os.path.join(os.path.dirname(__file__), "banned_sites.json")
@@ -714,9 +721,13 @@ def get_sites():
                         logging.info(f"[MSH] Filtered {before - len(sites)} banned sites")
         except Exception as e:
             logging.error(f"[MSH] Error reading banned_sites.json: {e}")
+
     if sites:
+        # ─── Fix 1: dedupe ───
+        sites = list(dict.fromkeys(sites))
         _sites_cache = {"sites": sites, "loaded_at": now}
-        logging.warning(f"[MSH] Using sites.txt fallback ({len(sites)} sites)")
+        logging.warning(f"[MSH] Using sites.txt fallback ({len(sites)} unique sites)")
+
     return sites
 
 
@@ -1097,7 +1108,6 @@ async def _background_progress_updater(bot: Bot, session_id: str):
         session = MSH_SESSIONS.get(session_id)
         if not session:
             return
-
         if session['status'] in ("FINISHED", "STOPPED"):
             session['last_update_time'] = 0
             try:
@@ -1105,13 +1115,10 @@ async def _background_progress_updater(bot: Bot, session_id: str):
             except Exception:
                 pass
             return
-
         await asyncio.sleep(3.0)
-
         session = MSH_SESSIONS.get(session_id)
         if not session:
             return
-
         session['last_update_time'] = 0
         try:
             if session.get('current_round', 0) > 0:
@@ -1214,7 +1221,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        # ── Exit conditions ──────────────────────────────────
         if proxy_fails >= MAX_PROXY_RETRIES:
             result_status = "ERROR"
             response_msg = f"All proxies exhausted ({proxy_fails} proxy errors)"
@@ -1228,7 +1234,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             response_msg = "No sites with products available"
             break
 
-        # ── Get a proxy ──────────────────────────────────────
         proxy_result = proxy_manager.get_next_proxy()
         if not proxy_result or proxy_result[0] is None:
             result_status = "ERROR"
@@ -1240,7 +1245,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        # ── Pick a site ──────────────────────────────────────
         blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
         no_products = session.get('_no_product_sites', set())
         available = [s for s in sites_list if s not in blacklisted and s not in no_products]
@@ -1255,7 +1259,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         site = random.choice(available)
         used_site = site
 
-        # ── Call API ─────────────────────────────────────────
         try:
             success, message, url, gateway, price, currency, proxy_status_raw, http_status = await process_card_api(
                 cc=cc, mes=mm, ano=yy, cvv=cvv, site=site, proxy=proxy,
@@ -1285,54 +1288,39 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         api_price = price
         proxy_manager.report_result(proxy, message, http_status)
 
-        # ── Classify via structured code ─────────────────────
         code = _extract_code(message)
 
-        # 1. POOL_EXHAUSTED — API already tried its `attempts` sites and all failed.
-        #    Terminal: retrying from msh.py burns another batch with no benefit.
+        # Terminal: SITES_EXHAUSTED — API already tried its batch, retrying doesn't help
         if code in POOL_EXHAUSTED_CODES:
-            logging.info(
-                f"[MSH] API pool exhausted for {cc_formatted} "
-                f"(API tried its full batch) — marking as ERROR"
-            )
+            logging.info(f"[MSH] API pool exhausted for {cc_formatted} (terminal)")
             result_status = "ERROR"
             response_msg = f"Sites exhausted: {message[:100]}"
             break
 
-        # 2. SKIP_SITE — no products / login / etc. Try another site,
-        #    do not consume any retry budget.
+        # No products / login / etc — try another site, no budget consumed
         if code in SKIP_SITE_CODES:
             session.setdefault('_no_product_sites', set()).add(site)
             no_product_hits += 1
-            logging.info(
-                f"[MSH] Site {site} rejected ({code}) for {cc_formatted} — "
-                f"trying another site ({no_product_hits} sites rejected)"
-            )
+            logging.info(f"[MSH] Site {site} rejected ({code}) — trying another ({no_product_hits}/{len(sites_list)})")
             await asyncio.sleep(0.05)
             continue
 
-        # 3. PROXY_ERROR — rotate proxy silently
+        # Proxy error — rotate silently
         if code in PROXY_ERROR_CODES:
             proxy_fails += 1
-            logging.info(
-                f"[MSH] Proxy/connection error for {cc_formatted} — "
-                f"rotating proxy ({proxy_fails}/{MAX_PROXY_RETRIES}): {message[:80]}"
-            )
+            logging.info(f"[MSH] Proxy error for {cc_formatted} — rotating ({proxy_fails}/{MAX_PROXY_RETRIES}): {message[:80]}")
             await asyncio.sleep(0.1)
             continue
 
-        # 4. SITE_ERROR — try a different site
+        # Site error — try another site
         if code in SITE_ERROR_CODES:
             site_fails += 1
             session.setdefault('_blacklisted_sites', set()).add(site)
-            logging.info(
-                f"[MSH] Site error for {cc_formatted} on {site} — "
-                f"trying another site ({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}"
-            )
+            logging.info(f"[MSH] Site error for {cc_formatted} on {site} — trying another ({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}")
             await asyncio.sleep(0.05)
             continue
 
-        # 5. CHARGED
+        # CHARGED — verify with fake cards
         if code in CHARGED_CODES or "ORDER_PLACED" in message.upper():
             logging.info(f"[MSH] Potential CHARGED on {site} — running fake-card verification")
 
@@ -1388,20 +1376,18 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
-        # 6. APPROVED
         if code in APPROVED_CODES:
             result_status = "APPROVED"
             response_msg = message
             is_insufficient = code in INSUFFICIENT_CODES
             break
 
-        # 7. DEAD
         if code in DEAD_CODES:
             result_status = "DEAD"
             response_msg = message
             break
 
-        # 8. Unknown — treat as transient proxy issue
+        # Unknown — treat as transient
         proxy_fails += 1
         logging.info(f"[MSH] Unknown response for {cc_formatted}: {message[:80]} — retrying")
         await asyncio.sleep(0.1)
@@ -1419,10 +1405,8 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     if is_session_stopped(session_id):
         return
 
-    print(f"{cc_formatted} | {result_status} | {response_msg} | "
-          f"Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
-    logging.info(f"[MSH] {cc_formatted} | {result_status} | {response_msg} | "
-                 f"Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
+    print(f"{cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
+    logging.info(f"[MSH] {cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
 
     card_result_data = {
         'card': cc_formatted,
@@ -1484,8 +1468,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
     elif result_status == "SKIPPED":
         logging.info(f"[MSH] Skipped {cc_formatted} — {response_msg}")
-
-    # Progress updates handled by _background_progress_updater
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1784,8 +1766,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
     plan_name = await get_user_plan_name(user_id)
     proxy_manager = ProxyManager(user_proxies, session_id)
     proxy_stats = proxy_manager.get_stats()
-    logging.info(f"🔄 [MSH] Session {session_id}: {proxy_stats['total_proxies']} proxies, "
-                 f"{total_cards} cards, concurrency={CARD_CONCURRENCY}")
+    logging.info(f"🔄 [MSH] Session {session_id}: {proxy_stats['total_proxies']} proxies, {total_cards} cards, concurrency={CARD_CONCURRENCY}")
     initial_text = (
         f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
         f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> <tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>\n"
@@ -1833,9 +1814,7 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
         session['retry_total'] = len(cards)
         session['retry_checked'] = 0
 
-    # Prune completed tasks from previous rounds
     session['tasks'] = [t for t in session.get('tasks', []) if not t.done()]
-
     sem = asyncio.Semaphore(CARD_CONCURRENCY)
 
     async def worker(cc_formatted, cc_num):
@@ -1927,7 +1906,6 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
         if session['status'] != "STOPPED":
             session['status'] = "FINISHED"
 
-    # Let the updater flush the final state, then wait for it to exit
     if session:
         updater = session.get('_updater_task')
         if updater and not updater.done():
