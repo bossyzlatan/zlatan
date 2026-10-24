@@ -1661,8 +1661,156 @@ async def stopmsh_command(message: types.Message):
             f"<a href='tg://user?id={s['user_id']}'>{s['user_id']}</a> "
             f"({s['checked']}/{s['total']}) — {s['cancelled']} tasks cancelled"
         )
-    await message.reply("\n".join(lines), parse_mode="HTML")
+        await message.reply("\n".join(lines), parse_mode="HTML")
 
+#______________________________________________
+# PRUNE COMMAND /prunedead
+#______________________________________________
+@router.message(F.text.startswith("/prunedead"))
+async def prunedead_command(message: types.Message):
+    """
+    Fetch hard-dead sites from every API replica and permanently delete
+    them from MongoDB global_sites. Also strips them from sites.txt if present.
+    """
+    user = message.from_user
+    if user.id not in ADMIN_IDS:
+        await message.reply(
+            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
+            "<b>𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    status_msg = await message.reply(
+        "<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> "
+        "<b>Fetching dead sites from all replicas...</b>",
+        parse_mode="HTML",
+    )
+
+    # 1. Fetch /dead-sites from every API replica
+    dead_hosts: set = set()
+    replica_reports: list = []
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
+        for server in API_SERVERS:
+            try:
+                async with session.get(f"{server}/dead-sites") as resp:
+                    if resp.status != 200:
+                        replica_reports.append((server, f"HTTP {resp.status}"))
+                        continue
+                    data = await resp.json()
+                    sites = data.get("sites", {})
+                    for h in sites.keys():
+                        dead_hosts.add(h)
+                    replica_reports.append((server, f"{len(sites)} dead"))
+            except Exception as e:
+                replica_reports.append((server, f"err: {type(e).__name__}"))
+
+    if not dead_hosts:
+        lines = [
+            "<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> "
+            "<b>Nothing to prune.</b>",
+            "",
+            "<b>Replica responses:</b>",
+        ]
+        for server, status in replica_reports:
+            domain = server.replace("https://", "").split(".")[0]
+            lines.append(f"• <code>{domain}</code> — {status}")
+        await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    await status_msg.edit_text(
+        f"<tg-emoji emoji-id='5039579582764680065'>⏳</tg-emoji> "
+        f"<b>Found {len(dead_hosts)} unique dead hosts. Pruning MongoDB...</b>",
+        parse_mode="HTML",
+    )
+
+    # 2. Delete from MongoDB global_sites
+    deleted_from_db = 0
+    try:
+        def _delete_from_mongo():
+            from database import get_db_connection
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM global_sites WHERE site = ANY(%s)",
+                (list(dead_hosts),),
+            )
+            count = cursor.rowcount
+            conn.commit()
+            conn.close()
+            return count
+
+        deleted_from_db = await asyncio.to_thread(_delete_from_mongo)
+    except Exception as e:
+        logging.error(f"[prunedead] Mongo delete failed: {e}")
+
+    # 3. Strip from sites.txt if it exists
+    deleted_from_txt = 0
+    try:
+        sites_file = os.path.join(os.path.dirname(__file__), "sites.txt")
+        if os.path.exists(sites_file):
+            with open(sites_file, "r", encoding="utf-8", errors="ignore") as f:
+                before = [ln.strip() for ln in f if ln.strip()]
+            dead_norm = {h.replace("myshopify.com", "").strip() for h in dead_hosts}
+            after = [
+                s for s in before
+                if not any(
+                    h in s or h.replace("myshopify.com", "") in s
+                    for h in dead_hosts
+                )
+            ]
+            deleted_from_txt = len(before) - len(after)
+            if deleted_from_txt > 0:
+                with open(sites_file, "w", encoding="utf-8") as f:
+                    for s in after:
+                        f.write(f"{s}\n")
+    except Exception as e:
+        logging.error(f"[prunedead] sites.txt prune failed: {e}")
+
+    # 4. Clear the API caches so the next run uses the fresh pool
+    cache_cleared = 0
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=10)
+    ) as session:
+        for server in API_SERVERS:
+            for endpoint in ("/dead-sites/clear", "/reload"):
+                try:
+                    async with session.post(f"{server}{endpoint}") as resp:
+                        if resp.status == 200:
+                            cache_cleared += 1
+                except Exception:
+                    pass
+
+    # 5. Report
+    lines = [
+        "<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> "
+        "<b>𝗣𝗿𝘂𝗻𝗲 𝗰𝗼𝗺𝗽𝗹𝗲𝘁𝗲</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"<b>Unique dead hosts found ➛</b> <code>{len(dead_hosts)}</code>",
+        f"<b>Deleted from MongoDB ➛</b> <code>{deleted_from_db}</code>",
+        f"<b>Deleted from sites.txt ➛</b> <code>{deleted_from_txt}</code>",
+        f"<b>Cache clears sent ➛</b> <code>{cache_cleared}</code>",
+        "",
+        "<b>Replica responses:</b>",
+    ]
+    for server, status in replica_reports:
+        domain = server.replace("https://", "").split(".")[0]
+        lines.append(f"• <code>{domain}</code> — {status}")
+
+    lines.append("")
+    lines.append(
+        "<i>Next /msh will use the pruned pool. "
+        "No restart needed.</i>"
+    )
+
+    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+    logging.info(
+        f"[prunedead] admin {user.id}: {len(dead_hosts)} dead hosts, "
+        f"mongo={deleted_from_db}, txt={deleted_from_txt}"
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN COMMAND /msh
