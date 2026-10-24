@@ -75,6 +75,13 @@ OUTER_RETRY_DELAYS = [
 MAX_PROXY_RETRIES = 5    # proxy/connection failures before giving up
 MAX_SITE_RETRIES  = 15   # site-level failures before giving up
 
+# ═══ PER-CARD CONCURRENCY ═══
+CARD_CONCURRENCY = 1000  # parallel card slots — matches your 1000-proxy pool
+
+# ═══ API CALL TIMING ═══
+API_ATTEMPTS = 3         # max sites per API call (was 15 — this was the 45x amplification bug)
+API_TIMEOUT = 25.0       # max seconds per API call
+
 # ═══ STRUCTURED CODE CLASSIFICATIONS ═══
 SKIP_SITE_CODES = {
     "NO_PRODUCT", "NO_PRODUCT_FOUND", "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
@@ -527,6 +534,7 @@ RETRYABLE_ERRORS = frozenset({
     "SUBMIT_FAILED", "ORDER_CREATION_FAILED", "NO_PAYMENT_REQUIRED",
     "API_REPLICAS_UNREACHABLE", "Pool Exhausted", "CAPTCHA_REQUIRED",
     "SITES_EXHAUSTED", "All proxies exhausted", "All sites exhausted",
+    "Sites exhausted",
 })
 
 
@@ -734,8 +742,12 @@ async def process_card_api(
         _http = _get_msh_http_session()
         data = await check_shopify_card(
             site=site, cc=cc_formatted, proxy=api_proxy or None,
-            session=_http, max_retries=3, timeout_sec=40.0,
-            fallback_sites=fallback_sites, attempts=15, auto=False,
+            session=_http,
+            max_retries=3,
+            timeout_sec=API_TIMEOUT,
+            fallback_sites=fallback_sites,
+            attempts=API_ATTEMPTS,
+            auto=False,
         )
         api_response = data.get("Response") or data.get("Message") or "Unknown Error"
         if api_response is None: api_response = "Unknown Error"
@@ -1081,13 +1093,6 @@ async def update_progress_message(bot: Bot, session_id):
 
 
 async def _background_progress_updater(bot: Bot, session_id: str):
-    """
-    Single task that refreshes the progress message every 3s.
-    Replaces the per-card update_progress_message calls, which caused
-    N-way lock contention when many cards finished simultaneously.
-    First update fires at t=3s showing the actual count (fixes the
-    "starts from 3" issue caused by the % 3 modulo gate).
-    """
     while True:
         session = MSH_SESSIONS.get(session_id)
         if not session:
@@ -1283,16 +1288,16 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         # ── Classify via structured code ─────────────────────
         code = _extract_code(message)
 
-        # 1. POOL_EXHAUSTED — API tried its fallback pool and all failed.
-        #    Counts as 1 site failure, does NOT burn proxy budget.
+        # 1. POOL_EXHAUSTED — API already tried its `attempts` sites and all failed.
+        #    Terminal: retrying from msh.py burns another batch with no benefit.
         if code in POOL_EXHAUSTED_CODES:
-            site_fails += 1
             logging.info(
-                f"[MSH] API pool exhausted for {cc_formatted} — "
-                f"site failure {site_fails}/{MAX_SITE_RETRIES}: {message[:80]}"
+                f"[MSH] API pool exhausted for {cc_formatted} "
+                f"(API tried its full batch) — marking as ERROR"
             )
-            await asyncio.sleep(0.1)
-            continue
+            result_status = "ERROR"
+            response_msg = f"Sites exhausted: {message[:100]}"
+            break
 
         # 2. SKIP_SITE — no products / login / etc. Try another site,
         #    do not consume any retry budget.
@@ -1746,7 +1751,7 @@ async def msh_command(message: types.Message):
         return
     valid_cards = []
     expired_count = invalid_luhn_count = 0
-    MAX_VALID_CARDS = 10000
+    MAX_VALID_CARDS = 20000
     for card_string in extracted:
         if len(valid_cards) >= MAX_VALID_CARDS: break
         pc = card_string.split('|')
@@ -1779,7 +1784,8 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
     plan_name = await get_user_plan_name(user_id)
     proxy_manager = ProxyManager(user_proxies, session_id)
     proxy_stats = proxy_manager.get_stats()
-    logging.info(f"🔄 [MSH] Session {session_id}: {proxy_stats['total_proxies']} proxies")
+    logging.info(f"🔄 [MSH] Session {session_id}: {proxy_stats['total_proxies']} proxies, "
+                 f"{total_cards} cards, concurrency={CARD_CONCURRENCY}")
     initial_text = (
         f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
         f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> <tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>\n"
@@ -1830,7 +1836,7 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
     # Prune completed tasks from previous rounds
     session['tasks'] = [t for t in session.get('tasks', []) if not t.done()]
 
-    sem = asyncio.Semaphore(400)
+    sem = asyncio.Semaphore(CARD_CONCURRENCY)
 
     async def worker(cc_formatted, cc_num):
         if is_session_stopped(session_id):
@@ -1863,7 +1869,7 @@ async def _run_single_round(bot: Bot, session_id, cards, user_obj, plan_name, ro
         task = asyncio.create_task(worker(cc_formatted, cc_num))
         tasks.append(task)
         session['tasks'].append(task)
-    logging.info(f"[MSH] Round {round_num}: {len(tasks)} tasks created")
+    logging.info(f"[MSH] Round {round_num}: {len(tasks)} tasks created (concurrency={CARD_CONCURRENCY})")
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1934,5 +1940,6 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
         logging.info(
             f"[MSH] Session {session_id} finished — "
             f"charged={session['charged']} approved={session['approved']} "
-            f"dead={session['dead']} errors={session['errors']}"
+            f"dead={session['dead']} errors={session['errors']} "
+            f"elapsed={time.time() - session['start_time']:.0f}s"
         )
