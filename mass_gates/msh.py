@@ -798,8 +798,7 @@ async def process_card_api(
     if api_proxy.startswith("http://"): api_proxy = api_proxy[7:]
     elif api_proxy.startswith("https://"): api_proxy = api_proxy[8:]
     elif api_proxy.startswith("socks5://"): api_proxy = api_proxy[9:]
-
-        try:
+    try:
         _http = _get_msh_http_session()
         # FIX #11: check_shopify_card has its OWN internal site-fanout logic
         # that treats CARD_DECLINED as "site failed" and synthesizes
