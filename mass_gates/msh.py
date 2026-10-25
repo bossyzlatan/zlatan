@@ -799,15 +799,26 @@ async def process_card_api(
     elif api_proxy.startswith("https://"): api_proxy = api_proxy[8:]
     elif api_proxy.startswith("socks5://"): api_proxy = api_proxy[9:]
 
-    try:
+        try:
         _http = _get_msh_http_session()
+        # FIX #11: check_shopify_card has its OWN internal site-fanout logic
+        # that treats CARD_DECLINED as "site failed" and synthesizes
+        # SITES_EXHAUSTED when all fallback_sites return a decline. This is
+        # the actual root cause of the massive SITES_EXHAUSTED count — the
+        # sites ARE working, the cards ARE being declined, but
+        # check_shopify_card throws away the decline and reports "exhausted".
+        #
+        # The fix: pass fallback_sites=None so check_shopify_card validates
+        # exactly ONE site and returns its actual outcome (CARD_DECLINED,
+        # INSUFFICIENT_FUNDS, 3DS_REQUIRED, SITE_ERROR, etc.).
+        # msh.py's own while-loop does the site rotation.
         data = await check_shopify_card(
             site=site, cc=cc_formatted, proxy=api_proxy or None,
             session=_http,
-            max_retries=3,
+            max_retries=1,       # no HTTP retry amplification
             timeout_sec=API_TIMEOUT,
-            fallback_sites=fallback_sites,
-            attempts=API_ATTEMPTS,
+            fallback_sites=None, # critical: no internal fanout
+            attempts=1,
             auto=False,
         )
         api_response = data.get("Response") or data.get("Message") or "Unknown Error"
@@ -1364,25 +1375,28 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         code = _extract_code(message)
 
-        # FIX #2: SITES_EXHAUSTED is TRANSIENT, not terminal.
-        # API returns this when its whole site pool is in cooldown —
-        # which recovers within 30-45s. One quick inner retry, then
-        # defer to the outer round (which waits 90s+).
+        # FIX #11 + #2: SITES_EXHAUSTED — even with the fallback_sites=None
+        # fix, check_shopify_card may still occasionally return this when
+        # its single primary call hits a truly broken site. Treat the
+        # current site as cooldown so next iteration picks a DIFFERENT one,
+        # then retry quickly. If we still get SITES_EXHAUSTED repeatedly,
+        # it means the pool is genuinely recovering — defer to outer round.
         if code in POOL_EXHAUSTED_CODES:
+            # Diagnostic log so we can verify what's happening on the wire
+            logging.warning(
+                f"[MSH] SITES_EXHAUSTED for {cc_formatted} on site={site} "
+                f"(available={len(available)}, pool_hit={pool_exhausted_hits}/"
+                f"{POOL_EXHAUSTED_MAX_INNER}). msg={message[:200]}"
+            )
+            # Mark current site bad so next iteration uses a different one
+            session.setdefault('_blacklisted_sites', {})[site] = (
+                time.time() + SITE_COOLDOWN_TTL
+            )
             if pool_exhausted_hits < POOL_EXHAUSTED_MAX_INNER:
                 pool_exhausted_hits += 1
                 _cleanup_site_cooldowns(session)
-                logging.info(
-                    f"[MSH] Pool exhausted for {cc_formatted} "
-                    f"({pool_exhausted_hits}/{POOL_EXHAUSTED_MAX_INNER}) "
-                    f"— retrying in {POOL_EXHAUSTED_INNER_DELAY}s"
-                )
                 await asyncio.sleep(POOL_EXHAUSTED_INNER_DELAY)
                 continue
-            logging.info(
-                f"[MSH] Pool exhausted for {cc_formatted} after "
-                f"{POOL_EXHAUSTED_MAX_INNER} inner retries — deferring to outer round"
-            )
             result_status = "ERROR"
             response_msg = f"Sites exhausted: {message[:100]}"
             break
