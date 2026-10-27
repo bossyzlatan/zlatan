@@ -811,7 +811,6 @@ async def process_card_api(
     if api_proxy.startswith("http://"): api_proxy = api_proxy[7:]
     elif api_proxy.startswith("https://"): api_proxy = api_proxy[8:]
     elif api_proxy.startswith("socks5://"): api_proxy = api_proxy[9:]
-
     try:
         _http = _get_msh_http_session()
         # FIX #11: check_shopify_card has its OWN internal site-fanout logic
@@ -928,8 +927,8 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             code = _extract_code(response)
             # FIX #12: detect "exhausted" / error phrases directly since
             # _extract_code returns the whole phrase when there's no
-            # separator. Previously "All proxies exhausted (...)" was
-            # shown as Declined while the breakdown counted it as Error.
+            # separator. Previously "All proxies exhausted (...)" was shown
+            # as Declined while the breakdown counted it as Error.
             resp_upper = (response or "").upper()
             is_exhausted = (
                 "EXHAUSTED" in resp_upper
