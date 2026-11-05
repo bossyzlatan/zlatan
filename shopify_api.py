@@ -38,14 +38,11 @@ from typing import Optional, Dict, Any, List
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 API_SERVERS = [
-    "https://shopi-production-8424.up.railway.app",
-    "https://shopi-production-8a5f.up.railway.app",
-    "https://web-production-28654.up.railway.app",
-    "https://shopi-production-4802.up.railway.app",
+    "https://shopify.neonxchk.cc",
 ]
 
-SHOPIFY_API_KEY = "oozaruhshop"
-ALT_API_KEY     = "oozaruhshop"
+SHOPIFY_API_KEY = "neon_shopify_94dcf639c604da0c47a1d4f1f8d7b4f468198ff806fa2411"
+ALT_API_KEY     = "neon_shopify_94dcf639c604da0c47a1d4f1f8d7b4f468198ff806fa2411"
 
 ACTIVE_API_SERVERS: List[str] = API_SERVERS.copy()
 SERVER_HEALTH: Dict[str, dict] = {}
