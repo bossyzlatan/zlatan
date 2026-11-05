@@ -1343,7 +1343,7 @@ async def mystripesite_command(message: types.Message):
 # ─── /clearsite (singular) — NEW: admin-only global wipe ─────────────────────
 
 @router.message(Command("clearsite"))
-async def clearsite_global_command(message: types.Message):
+async def clearsites_command(message: types.Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
         await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
@@ -1398,7 +1398,7 @@ async def clearsite_global_command(message: types.Message):
 # ─── /clearsites (plural) — user-scoped custom-site clear (unchanged) ────────
 
 @router.message(Command("clearsites"))
-async def clearsites_user_command(message: types.Message):
+async def clearsites_plural_command(message: types.Message):
     user_id = message.from_user.id
     deleted = await asyncio.to_thread(clear_user_sites_db, user_id)
     await message.reply(f"🗑️ <b>Cleared {deleted} custom sites.</b>", parse_mode="HTML")
@@ -1607,3 +1607,11 @@ async def setprice_command(message: types.Message):
         )
     else:
         await message.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Save failed.</b>", parse_mode="HTML")
+
+# ─── Backward-compat aliases ──────────────────────────────────────────────
+# main.py imports `clearsites_command` at module load time. Both the old
+# name and the descriptive name resolve to the same handler so deploys
+# never crash on import again.
+clearsite_command         = clearsites_command           # singular alias
+clearsite_global_command  = clearsites_command           # descriptive alias
+clearsites_user_command   = clearsites_plural_command    # descriptive alias
