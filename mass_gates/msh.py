@@ -58,13 +58,23 @@ BTN_LIVE_EMOJI_ID = "5039844895779455925"
 BTN_STOP_EMOJI_ID = "5040042498634810056"
 BTN_ALL_EMOJI_ID = "5447602197439218445"
 
+# ── Hit-log / summary specific premium emoji IDs (user-specified) ──
+HIT_CHARGED_EMOJI_ID = "5188487846968732572"
+HIT_USER_EMOJI_ID    = "5201873447554145566"
+HIT_WARNING_EMOJI_ID = "4915853119839011973"
+HIT_BLOCKED_EMOJI_ID = "5040030395416969985"
+HIT_GATE_EMOJI_ID    = "5039895103947146186"
+HIT_FIRE_EMOJI_ID    = "5436113877181941026"
+HIT_CARD_EMOJI_ID    = "5039623284056917259"
+HIT_CHART_EMOJI_ID   = "5231200819986047254"
+HIT_BOLT_EMOJI_ID    = "5456140674028019486"
+HIT_DEV_EMOJI_ID     = "5039653765439816618"
+
 HIT_LOG_GROUP_ID = -1004384293344
 EXTRA_CHARGED_GROUP_IDS = [-5447284969]
 
 BUTTON_LOCK_SECONDS = 30
 
-# ═══ OUTER RETRY CONFIG ═══
-# FIX #8: 4 rounds with delays that outlast API cooldowns (30s host + 15s blacklist).
 MAX_OUTER_ROUNDS = int(os.environ.get("MAX_OUTER_ROUNDS", 4))
 OUTER_RETRY_DELAYS = [
     int(os.environ.get("RETRY_DELAY_1", 90)),
@@ -73,43 +83,23 @@ OUTER_RETRY_DELAYS = [
     int(os.environ.get("RETRY_DELAY_4", 300)),
 ]
 
-# ═══ PER-CARD RETRY BUDGETS ═══
-# FIX: 8 retries is plenty — real checkouts succeed within 2-3 sites.
 MAX_PROXY_RETRIES = int(os.environ.get("MAX_PROXY_RETRIES", 8))
 MAX_SITE_RETRIES  = int(os.environ.get("MAX_SITE_RETRIES", 8))
-
-# ═══ PER-CARD CONCURRENCY ═══
-# FIX #9: With 400 proxies the proxy bottleneck is gone; CPU is the limit.
-# 50 is the sweet spot on Railway Hobby (~2 effective vCPU under load).
-CARD_CONCURRENCY = int(os.environ.get("CARD_CONCURRENCY", 50))
-
-# FIX #3: cap fallback sites so we don't amplify API fan-out.
+CARD_CONCURRENCY  = int(os.environ.get("CARD_CONCURRENCY", 50))
 MAX_FALLBACKS = 3
-
-# FIX #1: session-level site cooldown (TTL dict, not permanent set).
 SITE_COOLDOWN_TTL = 90
-
-# FIX #2: SITES_EXHAUSTED is transient — one inner retry, then defer.
 POOL_EXHAUSTED_MAX_INNER = 1
 POOL_EXHAUSTED_INNER_DELAY = 8.0
-
-# FIX: cap concurrent cards per site to prevent THROTTLED cascades.
 SITE_CONCURRENCY_LIMIT = int(os.environ.get("SITE_CONCURRENCY_LIMIT", 5))
-
-# ═══ API CALL TIMING ═══
-# FIX: match API's REQUEST_TIMEOUT (12s) plus a small buffer.
 API_ATTEMPTS = 1
 API_TIMEOUT = 14.0
 
-# ═══ STRUCTURED CODE CLASSIFICATIONS ═══
 SKIP_SITE_CODES = {
     "NO_PRODUCT", "NO_PRODUCT_FOUND", "PRICE_TOO_HIGH", "PRICE_OVER_MAX",
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "THROTTLED",
     "CAPTCHA_REQUIRED",
 }
 
-# FIX #12: TIMEOUT is a SITE error, not a proxy error.
-# PROXY_ERROR = proxy dead (Proxy="Dead"); TIMEOUT = site slow (Proxy="Live").
 PROXY_ERROR_CODES = {"PROXY_ERROR", "API_REPLICAS_UNREACHABLE"}
 
 SITE_ERROR_CODES = {
@@ -118,7 +108,7 @@ SITE_ERROR_CODES = {
     "NO_ATTEMPT_TOKEN", "NO_SELLER_PROPOSAL", "CHECKPOINTDENIED",
     "SUBMIT_FAILED", "TOKENIZATION_FAILED", "ORDER_CREATION_FAILED",
     "NO_PAYMENT_REQUIRED",
-    "TIMEOUT",  # site-level transient — rotate to a different site
+    "TIMEOUT",
 }
 
 POOL_EXHAUSTED_CODES = {"SITES_EXHAUSTED", "Pool Exhausted"}
@@ -162,11 +152,7 @@ def _get_msh_http_session():
 _MSH_SESSION_MAX_AGE = 3600
 
 
-# ═══════════════════════════════════════════════════════════════
-# FIX #1: time-based session site cooldowns
-# ═══════════════════════════════════════════════════════════════
 def _site_available(site: str, session: dict) -> bool:
-    """Return True if site is NOT in a cooldown window."""
     now = time.time()
     bl = session.get('_blacklisted_sites') or {}
     np = session.get('_no_product_sites') or {}
@@ -174,7 +160,6 @@ def _site_available(site: str, session: dict) -> bool:
 
 
 def _cleanup_site_cooldowns(session: dict) -> None:
-    """Prune expired entries from the time-based cooldown dicts."""
     now = time.time()
     session['_blacklisted_sites'] = {
         k: v for k, v in (session.get('_blacklisted_sites') or {}).items() if v > now
@@ -184,11 +169,7 @@ def _cleanup_site_cooldowns(session: dict) -> None:
     }
 
 
-# ═══════════════════════════════════════════════════════════════
-# PERF: BIN lookup helpers — run off the event loop so cards don't block
-# ═══════════════════════════════════════════════════════════════
 async def _safe_bin_lookup(cc_num: str) -> dict:
-    """Run get_bin_info with a 4s timeout; tolerate both sync and async."""
     try:
         result = get_bin_info(cc_num)
         if asyncio.iscoroutine(result):
@@ -249,10 +230,6 @@ def _save_to_blacklist(site):
 
 GLOBAL_BLACKLISTED_SITES = _load_blacklist()
 
-
-# ═══════════════════════════════════════════════════════════════
-# ROBUST SEND HELPERS
-# ═══════════════════════════════════════════════════════════════
 
 def _strip_html_and_tg_emoji(text: str) -> str:
     if not text:
@@ -339,10 +316,6 @@ async def _safe_send_animation_or_text(bot, chat_id, caption, gif_url=None, repl
         return False
 
 
-# ═══════════════════════════════════════════════════════════════
-# CALLBACK DATA
-# ═══════════════════════════════════════════════════════════════
-
 class MshResultCallback(CallbackData, prefix="mshr"):
     session_id: str
     result_type: str
@@ -350,10 +323,6 @@ class MshResultCallback(CallbackData, prefix="mshr"):
 class MshStopCallback(CallbackData, prefix="mshs"):
     session_id: str
 
-
-# ═══════════════════════════════════════════════════════════════
-# PROXY MANAGER
-# ═══════════════════════════════════════════════════════════════
 
 class ProxyManager:
     SUCCESS_RESPONSES = [
@@ -365,9 +334,6 @@ class ProxyManager:
         'INCORRECT_NUMBER', 'AMOUNT_TOO_SMALL',
         'TRANSACTION_NOT_ALLOWED', 'RESTRICTED_CARD'
     ]
-    # FIX #12: removed 'timeout' and 'timed out' — those match generic site
-    # timeouts which are NOT proxy failures. 'connect timeout' is kept
-    # because that specifically means the proxy connection stalled.
     PROXY_ERROR_PATTERNS = [
         'connection error', 'connection refused', 'connection reset',
         'connect timeout',
@@ -534,10 +500,6 @@ def build_user_link(user_obj) -> str:
     return f'<a href="tg://user?id={user_obj.id}">{name}</a>'
 
 
-# ═══════════════════════════════════════════════════════════════
-# CARD EXTRACTION
-# ═══════════════════════════════════════════════════════════════
-
 def extract_cards_from_text(text: str) -> List[str]:
     patterns = [
         r'(\d{13,19})\s*\|\s*(\d{1,2})\s*\|\s*(\d{2,4})\s*\|\s*(\d{3,4})',
@@ -573,10 +535,6 @@ def log_hit_to_mshh(user_id, username, first_name):
     except Exception as e:
         logging.error(f"Error writing to mshh.txt: {e}")
 
-
-# ═══════════════════════════════════════════════════════════════
-# OUTER RETRY CLASSIFICATION
-# ═══════════════════════════════════════════════════════════════
 
 FINAL_GOOD_RESPONSES = frozenset({
     "CARD_DECLINED", "INSUFFICIENT_FUNDS", "INVALID_CVC",
@@ -664,7 +622,7 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if any(k in p for k in ["kashim", "chirag", "darkanon", "starkz"]):
+                    if any(k in p for k in ["starkz"]):
                         return 'Starkz <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
                     if "elite" in p: return "𝗘𝗹𝗶𝘁𝗲 <tg-emoji emoji-id='5278751923338490157'>⭐</tg-emoji>"
@@ -679,10 +637,10 @@ async def get_user_plan_name(user_id):
 
 
 DEFAULT_PROXIES = [
-    "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
-    "http://1401:FVRHsSXw2DNK@p103.squidproxies.com:9238",
-    "http://1439:jqvFsDEZ&%Sm@p102.squidproxies.com:9292",
-    "http://1439:jqvFsDEZ&%Sm@p103.squidproxies.com:9291",
+    "http://us3.cactussstp.com:81:bvmbsmie:shibby2511",
+    "http://us3.cactussstp.com:8080:bvmbsmie:shibby2511",
+    "http://us3.cactussstp.com:3129:bvmbsmie:shibby2511",
+    "http://us3.cactussstp.com:3129:hughmuir2:lisamarie11",
 ]
 
 
@@ -730,10 +688,6 @@ def is_expired(mm: str, yy: str) -> bool:
     except ValueError:
         return True
 
-
-# ═══════════════════════════════════════════════════════════════
-# SITE POOL
-# ═══════════════════════════════════════════════════════════════
 
 _sites_cache = {"sites": [], "loaded_at": 0.0}
 _SITES_CACHE_SOFT_TTL = 60
@@ -798,10 +752,6 @@ def get_user_display(user_obj, plan_name):
     return f"{user_obj.first_name} ({plan_name})"
 
 
-# ═══════════════════════════════════════════════════════════════
-# API CALL
-# ═══════════════════════════════════════════════════════════════
-
 async def process_card_api(
     cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str,
     fallback_sites: Optional[list] = None,
@@ -813,12 +763,6 @@ async def process_card_api(
     elif api_proxy.startswith("socks5://"): api_proxy = api_proxy[9:]
     try:
         _http = _get_msh_http_session()
-        # FIX #11: check_shopify_card has its OWN internal site-fanout logic
-        # that treats CARD_DECLINED as "site failed" and synthesizes
-        # SITES_EXHAUSTED when all fallback_sites return a decline. This was
-        # the actual root cause of mass SITES_EXHAUSTED. The fix: pass
-        # fallback_sites=None so check_shopify_card validates ONE site and
-        # returns its actual outcome. msh.py's own while-loop does rotation.
         data = await check_shopify_card(
             site=site, cc=cc_formatted, proxy=api_proxy or None,
             session=_http,
@@ -863,7 +807,7 @@ async def process_card_api(
 
 
 # ═══════════════════════════════════════════════════════════════
-# RESULT FILE
+# RESULT FILE (compact "Hits" layout)
 # ═══════════════════════════════════════════════════════════════
 
 def generate_result_file(session: dict, result_type: str, user_obj, plan_name: str) -> Tuple[BytesIO, str, int]:
@@ -872,129 +816,168 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     dead_list    = session.get('dead_cards', [])
     error_list   = session.get('error_cards', [])
 
-    if result_type == "charged":
-        cards_list = charged_list
-        type_label, type_emoji = "𝗖𝗵𝗮𝗿𝗴𝗲𝗱", "💎"
-    elif result_type == "live":
-        cards_list = live_list
-        type_label, type_emoji = "𝗟𝗶𝘃𝗲", "🎁"
-    elif result_type == "dead":
-        cards_list = dead_list
-        type_label, type_emoji = "𝗗𝗲𝗮𝗱", "🚫"
-    else:
-        cards_list = charged_list + live_list + dead_list + error_list
-        type_label, type_emoji = "𝗔𝗹𝗹", "📁"
+    total   = session.get('total', 0)
+    checked = session.get('checked', 0)
 
-    total_count = len(cards_list)
-    user_display = get_user_display(user_obj, plan_name)
+    if result_type == "charged":
+        cards_to_show = [("💎", c.get('card', 'N/A')) for c in charged_list]
+        file_prefix   = "CHARGED"
+    elif result_type == "live":
+        cards_to_show = [("🔥", c.get('card', 'N/A')) for c in live_list]
+        file_prefix   = "LIVE"
+    elif result_type == "dead":
+        cards_to_show = [("❌", c.get('card', 'N/A')) for c in dead_list]
+        file_prefix   = "DEAD"
+    else:  # "all" → only hits (charged + live)
+        cards_to_show = (
+            [("💎", c.get('card', 'N/A')) for c in charged_list]
+            + [("🔥", c.get('card', 'N/A')) for c in live_list]
+        )
+        file_prefix = "HITS"
+
+    total_count = len(cards_to_show)
 
     lines = []
-    lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃           STARKZ               ┃")
-    lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+    lines.append("⚡️ 𝐒𝐓𝐀𝐑𝐊𝐙 𝐂𝐇𝐄𝐂𝐊𝐄𝐑 ⚡️")
     lines.append("")
-    lines.append(f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {type_label} {type_emoji}")
-    lines.append(f"𝗧𝗼𝘁𝗮𝗹 𝗖𝗮𝗿𝗱𝘀 ➛ {total_count}")
-    lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗙𝘆 𝗠𝗮𝘀𝘀")
-    lines.append(f"𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗕𝘆 ➛ Starkz")
-
-    if result_type == "all":
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("📊 𝗕𝗿𝗲𝗮𝗸𝗱𝗼𝘄𝗻")
-        lines.append(f"   💎 Charged : {len(charged_list)}")
-        lines.append(f"   ✅ Live    : {len(live_list)}")
-        lines.append(f"   ❌ Dead    : {len(dead_list)}")
-        lines.append(f"   ⚠️ Errors  : {len(error_list)}")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("⚡ 𝐑𝐞𝐬𝐮𝐥𝐭𝐬")
+    lines.append(f"💳 Total: {total}")
+    lines.append(f"📊 Checked: {checked}/{total}")
+    lines.append(f"🤍 Charged: {len(charged_list)}")
+    lines.append(f"😀 Live: {len(live_list)}")
+    lines.append(f"🧩 Captcha: 0")
+    lines.append(f"⚠️ Dead: {len(dead_list)}")
     lines.append("")
+    lines.append("🛒 Gateway: Shopify Payments")
+    lines.append("")
+    lines.append("🎯 𝐇𝐢𝐭𝐬")
 
-    if total_count == 0:
-        lines.append("⚠️ No cards found for this category")
+    if not cards_to_show:
+        lines.append("⚠️ No hits in this category")
     else:
-        for card_data in cards_list:
-            cc = card_data.get('card', 'N/A')
-            response = card_data.get('response', 'N/A')
-            bin_info = card_data.get('bin_info', {})
-            price = card_data.get('price', 'N/A')
+        for emoji, cc in cards_to_show:
+            lines.append(f"{emoji} {cc}")
 
-            scheme = bin_info.get('scheme', 'N/A')
-            bank = bin_info.get('bank', 'N/A')
-            country = bin_info.get('country', 'N/A')
-            flag = bin_info.get('country_emoji', '')
-            country_display = f"{flag} {country}" if flag else country
-
-            code = _extract_code(response)
-            # FIX #12: detect "exhausted" / error phrases directly since
-            # _extract_code returns the whole phrase when there's no
-            # separator. Previously "All proxies exhausted (...)" was shown
-            # as Declined while the breakdown counted it as Error.
-            resp_upper = (response or "").upper()
-            is_exhausted = (
-                "EXHAUSTED" in resp_upper
-                or "ALL PROXIES" in resp_upper
-                or "ALL SITES" in resp_upper
-            )
-            is_synthetic_err = code in PROXY_ERROR_CODES or code in POOL_EXHAUSTED_CODES
-
-            if code in CHARGED_CODES or "CHARGED" in response or "ORDER_PLACED" in response:
-                status = "𝗖𝗵𝗮𝗿𝗴𝗲𝗱 💎"
-            elif code in APPROVED_CODES or "APPROVED" in response or "INVALID_CVC" in response or "INSUFFICIENT" in response or "3DS_REQUIRED" in response:
-                status = "𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ✅"
-            elif is_exhausted or is_synthetic_err or code in SITE_ERROR_CODES:
-                status = "𝗘𝗥𝗥𝗢𝗥 ❌"
-            else:
-                status = "𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 ⚠️"
-
-            lines.append(f"💎 𝗦𝘁𝗮𝘁𝘂𝘀 ➛ {status}")
-            lines.append(f"💳 𝗖𝗮𝗿𝗱 ➛ {cc}")
-            lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 {price} 𝗨𝗦𝗗")
-            lines.append(f"💬 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ➛ {response}")
-            lines.append(f"🆔 𝗕𝗿𝗮𝗻𝗱 ➛ {scheme}")
-            lines.append(f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ {bank}")
-            lines.append(f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ {country_display}")
-            lines.append(f"👤 𝗨𝘀𝗲𝗿 ➛ {user_display}")
-            lines.append(f"🐈‍⬛ 𝗗𝗲𝘃 ➛ Starkz")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🤖 Bot By: Starkz (https://t.me/oozaruh)")
 
     content = "\n".join(lines)
+    # Strip any tg-emoji (safety net — this function never emits them, but keep it)
     content = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', content, flags=re.DOTALL)
     file_buffer = BytesIO(content.encode('utf-8'))
     file_buffer.seek(0)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    type_map = {"charged": "CHARGED", "live": "LIVE", "dead": "DEAD", "all": "ALL"}
-    filename = f"STARKZ_{type_map.get(result_type, 'ALL')}_{timestamp}.txt"
+    filename = f"STARKZ_{file_prefix}_{timestamp}.txt"
     return file_buffer, filename, total_count
 
 
 # ═══════════════════════════════════════════════════════════════
-# NOTIFICATION HELPERS
+# AUTO-POST PREMIUM SUMMARY (chat message — all emojis premium)
+# ═══════════════════════════════════════════════════════════════
+
+async def _post_hits_summary(bot: Bot, session_id: str):
+    session = MSH_SESSIONS.get(session_id)
+    if not session:
+        return
+    if session.get('status') != "FINISHED":
+        return
+    if session.get('_summary_posted'):
+        return
+
+    charged_list = session.get('charged_cards', [])
+    live_list    = session.get('live_cards', [])
+    dead_count   = len(session.get('dead_cards', []))
+    total        = session.get('total', 0)
+    checked      = session.get('checked', 0)
+
+    if not charged_list and not live_list:
+        session['_summary_posted'] = True
+        return
+
+    def E(name, eid):
+        return f'<tg-emoji emoji-id="{eid}">{name}</tg-emoji>'
+
+    header = (
+        f"{E('⚡️', HIT_BOLT_EMOJI_ID)} <b>𝗦𝗧𝗔𝗥𝗞𝗭 𝗖𝗛𝗘𝗖𝗞𝗘𝗥</b> {E('⚡️', HIT_BOLT_EMOJI_ID)}\n"
+        f"\n"
+        f"{E('⚡', HIT_BOLT_EMOJI_ID)} <b>𝗥𝗲𝘀𝘂𝗹𝘁𝘀</b>\n"
+        f"{E('💳', HIT_CARD_EMOJI_ID)} Total: <b>{total}</b>\n"
+        f"{E('📊', HIT_CHART_EMOJI_ID)} Checked: <b>{checked}/{total}</b>\n"
+        f"{E('💎', HIT_CHARGED_EMOJI_ID)} Charged: <b>{len(charged_list)}</b>\n"
+        f"{E('✅', CUSTOM_APPROVED_EMOJI_ID)} Live: <b>{len(live_list)}</b>\n"
+        f"{E('🚫', HIT_BLOCKED_EMOJI_ID)} Captcha: <b>0</b>\n"
+        f"{E('⚠️', HIT_WARNING_EMOJI_ID)} Dead: <b>{dead_count}</b>\n"
+        f"\n"
+        f"{E('🌐', HIT_GATE_EMOJI_ID)} Gateway: <b>Shopify Payments</b>\n"
+        f"\n"
+        f"{E('🔥', HIT_FIRE_EMOJI_ID)} <b>𝗛𝗶𝘁𝘀</b>\n"
+    )
+
+    footer = (
+        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{E('🐈‍⬛', HIT_DEV_EMOJI_ID)} Bot By: <a href='https://t.me/oozaruh'>Starkz</a>"
+    )
+
+    hit_lines = []
+    for c in charged_list:
+        hit_lines.append(f"{E('💎', HIT_CHARGED_EMOJI_ID)} <code>{html_escape(c.get('card', 'N/A'))}</code>")
+    for c in live_list:
+        hit_lines.append(f"{E('🔥', HIT_FIRE_EMOJI_ID)} <code>{html_escape(c.get('card', 'N/A'))}</code>")
+
+    budget = 3800 - len(header) - len(footer)
+    included, used = [], 0
+    for line in hit_lines:
+        if used + len(line) + 1 > budget:
+            break
+        included.append(line)
+        used += len(line) + 1
+
+    remaining = len(hit_lines) - len(included)
+    if remaining > 0:
+        included.append(f"<i>... and {remaining} more — tap a button below for the full file</i>")
+
+    text = header + "\n".join(included) + footer
+
+    try:
+        await safe_send_message(
+            bot, chat_id=session['chat_id'], text=text,
+            parse_mode="HTML",
+            reply_markup=get_result_buttons(session_id, is_running=False),
+        )
+    except Exception as e:
+        logging.warning(f"[MSH] Failed to post hits summary: {e}")
+
+    session['_summary_posted'] = True
+
+
+# ═══════════════════════════════════════════════════════════════
+# HIT LOG TO GROUP (compact premium-emoji format)
 # ═══════════════════════════════════════════════════════════════
 
 async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, user_obj, plan_name, proxy_status_formatted, price, site="Unknown Site", hit_type="CHARGED"):
     user_link = build_user_link(user_obj)
-    gateway_display = html_escape(f"Shopify {price} USD")
     safe_response = html_escape(str(response_msg))
-    dev_link = '<a href="https://t.me/oozaruh">Starkz</a>'
     user_display = f"{user_link} ({plan_name})"
-    safe_proxy = str(proxy_status_formatted)
+
     if hit_type == "CHARGED":
-        status_text = f'𝗖𝗛𝗔𝗥𝗚𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_CHARGED_EMOJI_ID}">💎</tg-emoji>'
+        status_line = f'Charged <tg-emoji emoji-id="{HIT_CHARGED_EMOJI_ID}">💎</tg-emoji>'
     else:
-        status_text = f'𝗔𝗣𝗣𝗥𝗢𝗩𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_APPROVED_EMOJI_ID}">✅</tg-emoji>'
+        status_line = f'Approved <tg-emoji emoji-id="{CUSTOM_APPROVED_EMOJI_ID}">✅</tg-emoji>'
+
     caption = (
-        f"<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛ {status_text}\n"
-        f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ <b>{gateway_display}</b>\n"
-        f"<tg-emoji emoji-id='5040042498634810056'>💬</tg-emoji> 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ➛ <b>{safe_response}</b>\n"
-        f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"[𐓷] 𝗦𝘁𝗮𝘁𝘂𝘀 : {status_line}\n"
+        f"[𐓷] 𝗚𝗮𝘁𝗲 : Shopify [{html_escape(str(price))}$]\n"
+        f"[𐓷] 𝗥𝗲𝘀𝗽 : {safe_response}\n"
+        f"[𐓷] 𝗨𝘀𝗲𝗿 : {user_display} <tg-emoji emoji-id=\"{HIT_USER_EMOJI_ID}\">👤</tg-emoji>"
     )
+
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="STARKZ", url="https://t.me/StarkzchkBot",
                              icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
+
     await _safe_send_animation_or_text(bot, chat_id=HIT_LOG_GROUP_ID, caption=caption,
                                        gif_url=None, reply_markup=reply_markup)
 
@@ -1080,10 +1063,6 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
             sent_to_extra = True
     return sent_to_extra
 
-
-# ═══════════════════════════════════════════════════════════════
-# BUTTONS & PROGRESS
-# ═══════════════════════════════════════════════════════════════
 
 def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboardMarkup:
     session = MSH_SESSIONS.get(session_id, {})
@@ -1241,10 +1220,6 @@ async def _update_retry_banner(bot: Bot, session_id, round_num, retry_total, del
         pass
 
 
-# ═══════════════════════════════════════════════════════════════
-# PER-CARD PROCESSING
-# ═══════════════════════════════════════════════════════════════
-
 async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, user_obj, plan_name,
                               is_retry: bool = False):
     session = MSH_SESSIONS.get(session_id)
@@ -1283,10 +1258,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     proxy_fails      = 0
     site_fails       = 0
     no_product_hits  = 0
-    # FIX #2: track how many times we've hit SITES_EXHAUSTED for this card
     pool_exhausted_hits = 0
-    # FIX #12: record WHICH codes burned the proxy budget so the final
-    # message isn't a lie. E.g. "All proxies exhausted (8 errors: PROXY_ERROR)"
     proxy_fail_codes: list[str] = []
 
     parts = cc_formatted.split('|')
@@ -1296,7 +1268,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     if is_session_stopped(session_id):
         return
 
-    # PERF: kick off BIN lookup concurrently with the checkout flow.
     _bin_task = asyncio.create_task(_safe_bin_lookup(cc_num[:6]))
 
     while True:
@@ -1330,7 +1301,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        # FIX #1: time-based availability — expired cooldowns re-enter pool
         if session['checked'] % 100 == 0:
             _cleanup_site_cooldowns(session)
 
@@ -1340,7 +1310,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         ]
 
         if not available:
-            # All sites temporarily in cooldown. Yield briefly and recheck.
             _cleanup_site_cooldowns(session)
             await asyncio.sleep(2.0)
             available = [
@@ -1348,9 +1317,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 if s not in GLOBAL_BLACKLISTED_SITES and _site_available(s, session)
             ]
             if not available:
-                # Last resort — ignore cooldowns entirely (better than losing
-                # the card). API will return THROTTLED or SITES_EXHAUSTED and
-                # our handler below will decide.
                 available = [s for s in sites_list if s not in GLOBAL_BLACKLISTED_SITES]
                 if not available:
                     result_status = "SKIPPED"
@@ -1360,12 +1326,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         site = random.choice(available)
         used_site = site
 
-        # FIX #3: cap fallback sites to MAX_FALLBACKS
         pool_minus = [s for s in available if s != site]
         random.shuffle(pool_minus)
         fallback_sites = pool_minus[:MAX_FALLBACKS]
 
-        # PERF: cap concurrent cards per site (5) to prevent THROTTLED cascade
         _site_sems = session.setdefault("_site_sems", {})
         if site not in _site_sems:
             _site_sems[site] = asyncio.Semaphore(SITE_CONCURRENCY_LIMIT)
@@ -1419,11 +1383,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         code = _extract_code(message)
 
-        # FIX #2 + #11: SITES_EXHAUSTED is TRANSIENT, not terminal.
-        # Even with fallback_sites=None, check_shopify_card may occasionally
-        # return this when its single primary call hits a truly broken site.
-        # Mark that site in cooldown so next iteration picks a DIFFERENT one,
-        # then retry quickly. If still SITES_EXHAUSTED, defer to outer round.
         if code in POOL_EXHAUSTED_CODES:
             logging.warning(
                 f"[MSH] SITES_EXHAUSTED for {cc_formatted} on site={site} "
@@ -1442,7 +1401,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             response_msg = f"Sites exhausted: {message[:100]}"
             break
 
-        # FIX #1: TTL cooldown instead of permanent blacklist
         if code in SKIP_SITE_CODES:
             session.setdefault('_no_product_sites', {})[site] = (
                 time.time() + SITE_COOLDOWN_TTL
@@ -1456,7 +1414,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await asyncio.sleep(0.05)
             continue
 
-        # Proxy error — rotate silently
         if code in PROXY_ERROR_CODES:
             proxy_fails += 1
             proxy_fail_codes.append(code)
@@ -1467,7 +1424,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await asyncio.sleep(0.1)
             continue
 
-        # FIX #1: TTL cooldown instead of permanent blacklist
         if code in SITE_ERROR_CODES:
             site_fails += 1
             session.setdefault('_blacklisted_sites', {})[site] = (
@@ -1481,7 +1437,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await asyncio.sleep(0.05)
             continue
 
-        # CHARGED — verify with fake cards
         if code in CHARGED_CODES or "ORDER_PLACED" in message.upper():
             logging.info(f"[MSH] Potential CHARGED on {site} — running fake-card verification")
 
@@ -1550,9 +1505,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             response_msg = message
             break
 
-        # FIX #12: unknown responses are more likely a site/API hiccup than
-        # a broken proxy. Rotate the SITE (cheap) rather than burning proxy
-        # budget (expensive — proxies have cooldowns, sites don't).
         site_fails += 1
         session.setdefault('_blacklisted_sites', {})[site] = (
             time.time() + SITE_COOLDOWN_TTL
@@ -1576,7 +1528,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     if is_session_stopped(session_id):
         return
 
-    # PERF: collect the BIN lookup result
     try:
         bin_data = await _bin_task
     except Exception:
@@ -1644,15 +1595,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         await asyncio.to_thread(update_user_stats, user_id, False)
 
     elif result_status == "SKIPPED":
-        # FIX #1: count SKIPPED as errors so the outer round retries them
         session['errors'] += 1
         session['error_cards'].append(card_result_data)
         logging.info(f"[MSH] Skipped→counted as error for outer retry: {cc_formatted}")
 
-
-# ═══════════════════════════════════════════════════════════════
-# CALLBACK HANDLERS
-# ═══════════════════════════════════════════════════════════════
 
 @router.callback_query(MshResultCallback.filter())
 async def handle_result_callback(callback: types.CallbackQuery, callback_data: MshResultCallback):
@@ -1692,9 +1638,14 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
         file_content = file_buffer.read()
         file_buffer.seek(0)
 
-        type_emojis = {"charged": "💎", "live": "🍾", "dead": "❌", "all": "📁"}
+        type_emoji_map = {
+            "charged": f'<tg-emoji emoji-id="{HIT_CHARGED_EMOJI_ID}">💎</tg-emoji>',
+            "live": f'<tg-emoji emoji-id="{CUSTOM_APPROVED_EMOJI_ID}">✅</tg-emoji>',
+            "dead": f'<tg-emoji emoji-id="{HIT_WARNING_EMOJI_ID}">⚠️</tg-emoji>',
+            "all": f'<tg-emoji emoji-id="{HIT_FIRE_EMOJI_ID}">🔥</tg-emoji>',
+        }
         type_labels = {"charged": "𝗖𝗛𝗔𝗥𝗚𝗘𝗗", "live": "𝗟𝗶𝘃𝗲", "dead": "𝗗𝗲𝗮𝗱", "all": "𝗔𝗹𝗹"}
-        emoji = type_emojis.get(result_type, "📁")
+        emoji = type_emoji_map.get(result_type, type_emoji_map["all"])
         label = type_labels.get(result_type, "𝗔𝗹𝗹")
         caption = (
             f"𝗥𝗲𝘀𝘂𝗹𝘁 𝗧𝘆𝗽𝗲 ➛ {label} {emoji}\n"
@@ -1753,10 +1704,6 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
         except:
             pass
 
-
-# ═══════════════════════════════════════════════════════════════
-# ADMIN /stopmsh
-# ═══════════════════════════════════════════════════════════════
 
 @router.message(F.text.startswith("/stopmsh"))
 async def stopmsh_command(message: types.Message):
@@ -1843,15 +1790,9 @@ async def stopmsh_command(message: types.Message):
         )
         await message.reply("\n".join(lines), parse_mode="HTML")
 
-#______________________________________________
-# PRUNE COMMAND /prunedead
-#______________________________________________
+
 @router.message(F.text.startswith("/prunedead"))
 async def prunedead_command(message: types.Message):
-    """
-    Fetch hard-dead sites from every API replica and permanently delete
-    them from MongoDB global_sites. Also strips them from sites.txt if present.
-    """
     user = message.from_user
     if user.id not in ADMIN_IDS:
         await message.reply(
@@ -1987,9 +1928,6 @@ async def prunedead_command(message: types.Message):
         f"mongo={deleted_from_db}, txt={deleted_from_txt}"
     )
 
-# ═══════════════════════════════════════════════════════════════
-# MAIN COMMAND /msh
-# ═══════════════════════════════════════════════════════════════
 
 @router.message(lambda message: (message.text and message.text.startswith("/msh")) or (message.caption and message.caption.startswith("/msh")))
 async def msh_command(message: types.Message):
@@ -2115,11 +2053,10 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         "live_cards": [], "dead_cards": [], "charged_cards": [], "error_cards": [],
         "user_obj": user_obj, "plan_name": plan_name, "is_group": is_group,
         "retry_checked": 0, "retry_total": 0, "current_round": 0,
-        # FIX #1: time-based dicts — host -> cooldown_until timestamp
         "_blacklisted_sites": {},
         "_no_product_sites": {},
-        # PERF: per-site concurrency caps
         "_site_sems": {},
+        "_summary_posted": False,
     }
     user_custom_sites = await asyncio.to_thread(get_user_sites_db, user_id)
     active_sites = user_custom_sites if user_custom_sites else get_sites()
@@ -2206,9 +2143,6 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
         if not retryable:
             logging.info(f"[MSH] Round {round_num}: no retryable errors — stopping")
             break
-        # FIX #8: always use the configured delays — was overridden to 5s
-        # when pool_size >= 100, guaranteeing all retries fired during the
-        # API's 30s host cooldown and failed identically.
         delay = OUTER_RETRY_DELAYS[
             min(round_num - 1, len(OUTER_RETRY_DELAYS) - 1)
         ]
@@ -2233,6 +2167,13 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
         session['errors'] = residual
         if session['status'] != "STOPPED":
             session['status'] = "FINISHED"
+
+        # Auto-post premium-emoji hits summary when check finishes
+        if session['status'] == "FINISHED":
+            try:
+                await _post_hits_summary(bot, session_id)
+            except Exception as e:
+                logging.warning(f"[MSH] Summary post failed: {e}")
 
     if session:
         updater = session.get('_updater_task')
