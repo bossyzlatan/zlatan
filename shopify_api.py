@@ -1,5 +1,27 @@
 """
-Shopify API Manager — Stateless Edition (v4.4.0)
+Shopify API Manager — Stateless Edition (v4.5.0)
+
+CHANGES vs v4.4:
+  - check_shopify_card: on retryable exceptions, the log message now
+    includes the exception TYPE NAME when str(e) is empty (which happens
+    for TimeoutError, ServerDisconnectedError, ConnectionResetError, and
+    any OOM-killed replica). This makes the routine retry-exhaustion
+    lines actionable instead of blank.
+  - check_shopify_card: the retry-failure line moved to DEBUG so the
+    routine (per-attempt) exceptions stop drowning INFO-level logs.
+    Real replica unreachability still surfaces via the API_REPLICAS_UNREACHABLE
+    return payload (INFO on the msh.py side).
+
+Retained from v4.4:
+  - format_proxy() accepts stripped user:pass@host:port
+  - classify_gate_response anchors 3-digit codes
+  - _build_fallback seeds `seen` with primary site
+  - Alt-key 401/403 records last_error
+  - auto_health_check prunes stale SERVER_HEALTH
+  - Retry jitter
+  - check_shopify_card attempts default = 3, clamped to >=1
+  - _is_pool_exhausted matches phrasing set
+  - TLS/SSL docstring
 """
 
 import asyncio
@@ -28,11 +50,8 @@ ALT_API_KEY     = "oozaruhshop"
 ACTIVE_API_SERVERS: List[str] = API_SERVERS.copy()
 SERVER_HEALTH: Dict[str, dict] = {}
 
-# Cap forwarded fallback list to keep URLs safe.
 FALLBACK_SITES_CAP = 20
 
-# S9: known "pool exhausted" phrasings the API may return. Keep this list
-# short and specific — anything here causes another replica to be tried.
 POOL_EXHAUSTED_MESSAGE_PATTERNS = (
     "sites exhausted",
     "all sites exhausted",
@@ -57,40 +76,27 @@ def get_active_servers_excluding(seen: set) -> List[str]:
 
 
 def format_proxy(proxy: Optional[str]) -> Optional[str]:
-    """
-    Accept three input shapes and return the API's expected
-    `host:port:user:pass` (or `host:port` when no auth):
-
-      1. Full URL:                     http://user:pass@host:port
-      2. Stripped userinfo (msh.py):   user:pass@host:port
-      3. Bare no-auth:                 host:port
-    """
     if not proxy:
         return None
     p = proxy.strip()
 
-    # Shape 1 — full URL with protocol
     if p.startswith(("http://", "https://")):
         parsed = urllib.parse.urlparse(p)
-        # Never fabricate "host:None" when the port is missing.
         if parsed.hostname and parsed.port:
             if parsed.username and parsed.password:
                 return f"{parsed.hostname}:{parsed.port}:{parsed.username}:{parsed.password}"
             return f"{parsed.hostname}:{parsed.port}"
         return p
 
-    # Shape 2 — "user:pass@host:port" (no protocol; what msh.py passes)
     if "@" in p and ":" in p.split("@", 1)[0]:
         userinfo, hostport = p.split("@", 1)
         if ":" in hostport and hostport.rsplit(":", 1)[1].isdigit():
             user, _, pw = userinfo.partition(":")
             return f"{hostport}:{user}:{pw}"
 
-    # Shape 3 — bare "host:port" (no-auth)
     if "@" not in p and p.count(":") == 1 and p.rsplit(":", 1)[1].isdigit():
         return p
 
-    # Unknown shape — pass through untouched so the API can surface its error
     return p
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -98,8 +104,6 @@ def format_proxy(proxy: Optional[str]) -> Optional[str]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _matches_keyword(k: str, msg_upper: str) -> bool:
-    """Numeric keywords must match on word boundaries to avoid false
-    positives like 'ERROR_1400' or 'HTTP 103 EARLY HINTS'."""
     if k.isdigit():
         return bool(re.search(rf'\b{re.escape(k)}\b', msg_upper))
     return k in msg_upper
@@ -188,13 +192,6 @@ def classify_gate_response(response_msg: str, raw_dict: Optional[dict] = None, g
 
 
 def _is_pool_exhausted(data: dict) -> bool:
-    """
-    S9: match a small set of phrasings so an API wording change doesn't
-    silently disable the cross-replica retry.
-
-    Still gated on Response == SITE_ERROR (or empty) so an unrelated error
-    that happens to mention "sites" cannot trigger a replica hop.
-    """
     code = str(data.get("Response", "")).upper()
     msg = str(data.get("Message", "") or data.get("message", "")).lower()
     if code not in ("SITE_ERROR", ""):
@@ -206,8 +203,6 @@ def _is_pool_exhausted(data: dict) -> bool:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _build_fallback_string(site: str, fallback_sites: Optional[List[str]]) -> Optional[str]:
-    """Seed `seen` with `site` so the primary site never appears in the
-    fallback list (the API would try it twice, wasting one attempt)."""
     if not fallback_sites:
         return None
     seen = {site}
@@ -245,57 +240,20 @@ async def check_shopify_card(
 
     Parameters
     ----------
-    site : str
-        Primary site URL or hostname. Protocol is added if missing.
-    cc : str
-        Card string formatted as `number|month|year|cvv`.
-    proxy : Optional[str]
-        Any of the three shapes accepted by `format_proxy()` — full URL,
-        stripped `user:pass@host:port` (what msh.py sends), or bare
-        `host:port`. Passed to the API as `host:port:user:pass`.
-    session : Optional[aiohttp.ClientSession]
-        S10 (TLS / SSL ownership):
-            If provided, this function **does not modify** the session's
-            SSL settings. The caller owns TLS configuration. In production
-            the API replicas serve valid Let's Encrypt certificates, so a
-            default `ssl=True` session works — but if you ever point this
-            at a self-signed replica you MUST pass a session whose
-            connector has `ssl=False`, or a `ClientConnectorSSLError`
-            will surface as `API_REPLICAS_UNREACHABLE`.
-            msh.py always passes a session created with `ssl=False`, so
-            the fast path is unaffected.
-            If `None`, a temporary session is created and closed
-            automatically; TLS defaults to aiohttp's standard verification.
-    max_retries : int
-        Maximum number of *distinct replicas* to try. Each retry also
-        consumes one cross-replica sleep with jitter (S6).
-    timeout_sec : float
-        Per-request timeout handed to aiohttp.
-    fallback_sites : Optional[List[str]]
-        Extra sites the API is allowed to rotate into on "no product"
-        responses. Capped to `FALLBACK_SITES_CAP` and deduped against
-        `site` (S1).
-    attempts : int
-        S8: how many times the API tries each site. Default lowered from
-        15 to 3 — 15 wastefully hammered a single site. Values below 1
-        are clamped to 1 so callers cannot accidentally disable the
-        per-site retry loop. msh.py passes `attempts=1` explicitly.
-    auto : bool
-        When True, tells the API to auto-rotate through `fallback_sites`.
-
-    Returns
-    -------
-    dict
-        Always contains at least `Response`, `Message`, `Status`, and
-        `Classification`. On complete replica failure the dict has
-        `Response="API_REPLICAS_UNREACHABLE"` and
-        `Classification={"status": "Site Error", "retry": True}`.
+    site : str — primary site URL or hostname.
+    cc : str — card string formatted as `number|month|year|cvv`.
+    proxy : Optional[str] — any of the three shapes accepted by `format_proxy()`.
+    session : Optional[aiohttp.ClientSession] — caller owns TLS settings; this
+        function does not modify them.
+    max_retries : int — max distinct replicas to try (with jitter between).
+    timeout_sec : float — per-request timeout.
+    fallback_sites : Optional[List[str]] — capped + deduped against `site`.
+    attempts : int — how many times the API tries each site (clamped to >=1).
+    auto : bool — API auto-rotates through fallback_sites.
     """
     if not site.startswith("http"):
         site = f"https://{site}"
 
-    # S8: clamp attempts defensively — caller passing 0 or a negative
-    # number should not suppress the per-site retry loop entirely.
     try:
         attempts = max(1, int(attempts))
     except (TypeError, ValueError):
@@ -338,7 +296,6 @@ async def check_shopify_card(
 
             try:
                 async with session.get(url, timeout=timeout_sec) as resp:
-                    # ── 200 OK ──
                     if resp.status == 200:
                         data = await resp.json()
 
@@ -350,7 +307,6 @@ async def check_shopify_card(
                                 server, last_error, attempt + 1, max_retries,
                             )
                             if attempt < max_retries - 1:
-                                # S6: jitter to spread retries across replicas.
                                 await asyncio.sleep(0.15 + random.uniform(0, 0.35))
                                 continue
                             resp_msg = str(data.get("Response", "SITE_ERROR"))
@@ -374,7 +330,6 @@ async def check_shopify_card(
                         )
                         return data
 
-                    # ── 401/403: try ALT key once ──
                     elif resp.status in (401, 403):
                         alt_params = dict(params)
                         alt_params["key"] = ALT_API_KEY
@@ -405,8 +360,6 @@ async def check_shopify_card(
                                     )
                                     return data
                                 else:
-                                    # S3: record the alt-key failure so the
-                                    # final message isn't misleading.
                                     last_error = (
                                         f"HTTP {alt_resp.status} "
                                         f"(both keys rejected) from {server}"
@@ -417,16 +370,13 @@ async def check_shopify_card(
                                         server, alt_resp.status,
                                     )
                         except Exception as e:
-                            last_error = f"alt-key: {e}"
-                            logging.warning(
+                            last_error = f"alt-key: {type(e).__name__}: {e}"
+                            logging.debug(
                                 "[shopify_api] alt-key fetch failed on %s: %s",
-                                server, e,
+                                server, last_error,
                             )
 
-                    # ── 400: client error, retrying won't help ──
                     elif resp.status == 400:
-                        # S7: guarantee Response/Message exist even if the
-                        # body is empty, non-JSON, or an unexpected shape.
                         try:
                             data = await resp.json()
                         except Exception:
@@ -453,19 +403,24 @@ async def check_shopify_card(
                         data["Status"] = False
                         return data
 
-                    # ── other status ──
                     else:
                         last_error = f"HTTP {resp.status}"
-                        logging.warning(
+                        logging.debug(
                             "[shopify_api] %s returned HTTP %s (attempt %d/%d)",
                             server, resp.status, attempt + 1, max_retries,
                         )
 
             except Exception as e:
-                last_error = f"{type(e).__name__}: {e}"
-                logging.warning(
+                # Empty exceptions are common (TimeoutError, ServerDisconnectedError,
+                # OOM-killed replica). Always log the type name so the message
+                # is actionable. Downgraded to DEBUG because this is normal
+                # retry noise; real replica failures surface via the final
+                # API_REPLICAS_UNREACHABLE return below.
+                err_str = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                last_error = err_str
+                logging.debug(
                     "[shopify_api] attempt %d/%d on %s failed: %s",
-                    attempt + 1, max_retries, server, e,
+                    attempt + 1, max_retries, server, err_str,
                 )
                 await asyncio.sleep(0.3)
 
@@ -549,7 +504,7 @@ async def check_site(
             await session.close()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DEPRECATED — kept as no-op so main.py doesn't break
+# DEPRECATED
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def push_sites_to_all_replicas(sites: List[str]) -> Dict[str, Any]:
@@ -619,8 +574,6 @@ async def auto_health_check():
                             "last_check": time.time(),
                         }
 
-            # S4: prune stale entries for servers that were removed from
-            # API_SERVERS so SERVER_HEALTH doesn't grow unboundedly.
             for stale in list(SERVER_HEALTH.keys()):
                 if stale not in API_SERVERS:
                     del SERVER_HEALTH[stale]
