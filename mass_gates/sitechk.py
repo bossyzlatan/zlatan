@@ -45,7 +45,6 @@ BAD_PROXIES = set()
 
 DEFAULT_MAX_PRICE = 5.0
 
-# ═══ SPEED FIX: parallel fake-check + faster add mode ═══
 MAX_CONCURRENT_CHECKS = int(os.environ.get("SITECHK_CONCURRENCY", 100))
 
 
@@ -246,6 +245,58 @@ def _db_clear_global_stripe_sites():
     except Exception as e:
         logging.warning(f"[SITECHK] DB stripe clear failed: {e}")
         return None
+
+
+# ─── NEW: cross-user site cleanup helpers (used by /clearsite and /sitechk) ───
+
+def _db_clear_all_user_sites():
+    """Delete every row from user_sites across all users."""
+    try:
+        from database import _get_db
+        db = _get_db()
+        result = db.user_sites.delete_many({})
+        return result.deleted_count if result else 0
+    except Exception as e:
+        logging.warning(f"[SITECHK] user_sites clear failed: {e}")
+        return 0
+
+
+def _db_clear_all_user_stripe_sites():
+    """Delete every row from user_stripe_sites across all users."""
+    try:
+        from database import _get_db
+        db = _get_db()
+        result = db.user_stripe_sites.delete_many({})
+        return result.deleted_count if result else 0
+    except Exception as e:
+        logging.warning(f"[SITECHK] user_stripe_sites clear failed: {e}")
+        return 0
+
+
+def _db_remove_user_sites_matching(url_set):
+    """
+    Delete every user_sites row across all users whose URL matches an entry
+    in url_set. Matching is done on DB-normalized form: .strip().lower().rstrip('/'),
+    with https:// prefixed if missing — the exact form used by add_user_sites_db.
+    """
+    try:
+        from database import _get_db
+        db = _get_db()
+        targets = set()
+        for u in url_set:
+            n = str(u).strip().lower().rstrip("/")
+            if not n:
+                continue
+            if not n.startswith(("http://", "https://")):
+                n = "https://" + n
+            targets.add(n)
+        if not targets:
+            return 0
+        result = db.user_sites.delete_many({"url": {"$in": list(targets)}})
+        return result.deleted_count if result else 0
+    except Exception as e:
+        logging.warning(f"[SITECHK] user_sites prune failed: {e}")
+        return 0
 
 
 def _txt_read_sites():
@@ -692,11 +743,9 @@ async def check_site_status(site_url: str, validate_only: bool = False) -> tuple
             if not (0.00 <= actual_price <= max_price):
                 return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> ${max_price:.2f} Rejected) | {response_msg}"
 
-            # ═══ SKIP fake-check if validate_only ═══
             if validate_only:
                 return site_url, "KEEP", {"Price": actual_price}, f"${actual_price:.2f} | {response_msg}"
 
-            # ═══ PARALLEL FAKE-CHECK ═══
             FAKE_CARDS = ["4003035140199121|11|29|470", "4400666318254873|03|27|336"]
             fake_results = await asyncio.gather(
                 *[call_site_check_api(site_url=site_url, cc_formatted=fc, proxy=proxy)
@@ -739,11 +788,11 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     live_count = 0
     dead_count = 0
     duplicate_count = 0
+    failed_sites = []  # NEW: track every URL that failed so we can prune user_sites
     last_edit_time = 0
     MIN_EDIT_INTERVAL = 2.0
     CHECKS_PER_UPDATE = 20
 
-    # ═══ SPEED FIX: filter existing BEFORE validating ═══
     if command_name == "Adding":
         try:
             existing_sites = set(await asyncio.to_thread(read_sites))
@@ -776,7 +825,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                 pass
         return
 
-    # ═══ SPEED FIX: raise concurrency 30→100 ═══
     sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
     validate_only = (command_name == "Adding")
 
@@ -819,6 +867,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             working_sites_content.append(f"{site} | Price: {price} | Response: {resp_msg}")
         else:
             dead_count += 1
+            failed_sites.append(site)  # NEW: record raw URL for user_sites pruning
 
         current_time = time.time()
         if (current_time - MIN_EDIT_INTERVAL > last_edit_time) or (checked_count % CHECKS_PER_UPDATE == 0):
@@ -842,6 +891,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             except Exception:
                 pass
 
+    # Dedup survivors by normalize_url (strips www. + trailing slash + lowercases)
     final_unique_sites = []
     seen_normalized = set()
     for site in valid_sites:
@@ -854,8 +904,23 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     _log(f"[SITECHK] Done: checked={checked_count} live={live_count} "
          f"dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
+    # ─── Write survivors + prune failed sites from user_sites (Audit only) ───
+    user_sites_pruned = 0
     if command_name == "Audit":
-        await asyncio.to_thread(write_sites, final_unique_sites)
+        # This call wipes global_sites entirely and re-inserts survivors —
+        # so failed URLs are already removed from global_sites here.
+        written = await asyncio.to_thread(write_sites, final_unique_sites)
+        _log(f"[SITECHK] global_sites written: {written} (expected {len(final_unique_sites)})")
+
+        # NEW: also prune every user's user_sites for URLs that failed validation.
+        # msh.py prefers user_sites over global, so this is critical — otherwise
+        # a user's custom-site list keeps pointing at dead sites forever.
+        if failed_sites:
+            user_sites_pruned = await asyncio.to_thread(
+                _db_remove_user_sites_matching, failed_sites
+            )
+            _log(f"[SITECHK] Pruned {user_sites_pruned} user_site rows "
+                 f"for {len(failed_sites)} failed URLs")
     elif command_name == "Adding":
         await asyncio.to_thread(add_sites, final_unique_sites)
         if user_id:
@@ -864,10 +929,10 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             except Exception as ue:
                 logging.error(f"Error saving to user_sites DB: {ue}")
 
-    # ═══ push updated pool ═══
     if command_name in ("Audit", "Adding"):
         asyncio.create_task(_push_sites_after_change(command_name.lower()))
 
+    # ─── Report file ───
     filename = f"report_{command_name.lower()}_{int(time.time())}.txt"
     file_content = "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     file_content += f"TOTAL CHECKED: {len(sites_to_check)}\n"
@@ -875,6 +940,8 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     file_content += f"REJECTED: {dead_count}\n"
     if duplicate_count > 0 or removed_dupes > 0:
         file_content += f"DUPLICATES SKIPPED: {duplicate_count + removed_dupes}\n"
+    if user_sites_pruned > 0:
+        file_content += f"USER_SITES PRUNED: {user_sites_pruned}\n"
     file_content += f"PROXIES USED: {len(PROXY_LIST)} | BAD: {len(BAD_PROXIES)}\n"
     file_content += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     file_content += "\n".join(working_sites_content) if working_sites_content else "No valid sites found!"
@@ -887,18 +954,31 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
         if status_message_id:
             try:
-                dup_final = ""
+                # ─── NEW: clearer completion message with explicit "Wiped" count ───
+                completed_lines = [
+                    f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>{command_name} Complete!</b>",
+                    "",
+                    f"<b>Total Checked:</b> <code>{len(sites_to_check)}</code>",
+                    f"<b>Kept ({price_label}):</b> <code>{len(final_unique_sites)}</code> <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>",
+                    f"<b>Wiped from DB:</b> <code>{dead_count}</code> <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>",
+                ]
                 if (duplicate_count + removed_dupes) > 0:
-                    dup_final = f"\n<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>Duplicates Blocked:</b> <code>{duplicate_count + removed_dupes}</code>"
+                    completed_lines.append(
+                        f"<b>Duplicates Removed:</b> <code>{duplicate_count + removed_dupes}</code>"
+                    )
+                if user_sites_pruned > 0:
+                    completed_lines.append(
+                        f"<b>User Sites Pruned:</b> <code>{user_sites_pruned}</code>"
+                    )
+                completed_lines.append("<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
+                completed_lines.append(
+                    f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> "
+                    f"<b>Proxies:</b> <code>{len(PROXY_LIST)}</code> | "
+                    f"<b>Bad:</b> <code>{len(BAD_PROXIES)}</code>"
+                )
                 await bot.edit_message_text(
                     chat_id=chat_id, message_id=status_message_id,
-                    text=f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>{command_name} Complete!</b>\n\n"
-                         f"<b>Total Checked:</b> {len(sites_to_check)}\n"
-                         f"<b>Valid ({price_label}):</b> {len(final_unique_sites)} <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>\n"
-                         f"<b>Rejected:</b> {dead_count} <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>\n"
-                         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-                         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> {len(PROXY_LIST)} | <b>Bad:</b> {len(BAD_PROXIES)}"
-                         f"{dup_final}",
+                    text="\n".join(completed_lines),
                     parse_mode="HTML"
                 )
             except Exception:
@@ -1066,6 +1146,7 @@ async def sitechk_command(message: types.Message):
 
     status_msg = await message.answer(
         f"🔄 <b>Starting Audit on {len(sites)} Sites...</b>\n"
+        f"<i>Failed sites will be permanently wiped from the database.</i>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"🔄 <b>Checked:</b> <code>0/{len(sites)}</code>\n"
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> <b>Proxies:</b> <code>{len(PROXY_LIST)}</code>",
@@ -1259,6 +1340,70 @@ async def mystripesite_command(message: types.Message):
     await message.reply_document(file, caption=text, parse_mode="HTML")
 
 
+# ─── /clearsite (singular) — NEW: admin-only global wipe ─────────────────────
+
+@router.message(Command("clearsite"))
+async def clearsite_global_command(message: types.Message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
+        return
+
+    # Global pool + sites.txt
+    global_deleted = await asyncio.to_thread(clear_all_sites)
+
+    # Every user's custom site list
+    user_deleted = await asyncio.to_thread(_db_clear_all_user_sites)
+
+    # Global Stripe pool + stripe_sites.txt
+    stripe_global = await asyncio.to_thread(clear_all_stripe_sites)
+
+    # Every user's custom Stripe site list
+    stripe_user = await asyncio.to_thread(_db_clear_all_user_stripe_sites)
+
+    # Fresh start — wipe the manual ban list so re-added sites aren't
+    # silently filtered by msh.py's sites.txt fallback.
+    banned_removed = False
+    try:
+        if os.path.exists(BANNED_SITES_FILE):
+            os.remove(BANNED_SITES_FILE)
+            banned_removed = True
+    except Exception as e:
+        logging.warning(f"[CLEARSITE] banned_sites.json remove failed: {e}")
+
+    # Force msh.py to re-read from DB on next /msh
+    try:
+        from mass_gates.msh import invalidate_sites_cache
+        invalidate_sites_cache()
+    except Exception:
+        pass
+
+    _log(f"[CLEARSITE] admin={user_id} global={global_deleted} "
+         f"user={user_deleted} stripe_global={stripe_global} "
+         f"stripe_user={stripe_user}")
+
+    await message.answer(
+        f"🗑️ <b>Global wipe complete.</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"🌐 <b>Global sites:</b> <code>{global_deleted}</code>\n"
+        f"👤 <b>User sites (all):</b> <code>{user_deleted}</code>\n"
+        f"💳 <b>Global Stripe:</b> <code>{stripe_global}</code>\n"
+        f"💳 <b>User Stripe (all):</b> <code>{stripe_user}</code>\n"
+        f"📄 <b>sites.txt / stripe_sites.txt:</b> cleared\n"
+        f"🚫 <b>banned_sites.json:</b> {'cleared' if banned_removed else 'not present'}",
+        parse_mode="HTML"
+    )
+
+
+# ─── /clearsites (plural) — user-scoped custom-site clear (unchanged) ────────
+
+@router.message(Command("clearsites"))
+async def clearsites_user_command(message: types.Message):
+    user_id = message.from_user.id
+    deleted = await asyncio.to_thread(clear_user_sites_db, user_id)
+    await message.reply(f"🗑️ <b>Cleared {deleted} custom sites.</b>", parse_mode="HTML")
+
+
 @router.message(Command("clearstripesites"))
 @router.message(Command("clearstripesite"))
 async def clearstripesites_command(message: types.Message):
@@ -1291,14 +1436,6 @@ async def mysites_command(message: types.Message):
     content = "\n".join(user_sites).encode('utf-8')
     file = BufferedInputFile(content, filename=f"my_sites_{user_id}.txt")
     await message.reply_document(file, caption=text, parse_mode="HTML")
-
-
-@router.message(Command("clearsites"))
-@router.message(Command("clearsite"))
-async def clearsites_command(message: types.Message):
-    user_id = message.from_user.id
-    deleted = await asyncio.to_thread(clear_user_sites_db, user_id)
-    await message.reply(f"🗑️ <b>Cleared {deleted} custom sites.</b>", parse_mode="HTML")
 
 
 @router.message(Command("siteall"))
