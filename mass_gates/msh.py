@@ -84,7 +84,13 @@ OUTER_RETRY_DELAYS = [
 
 MAX_PROXY_RETRIES = int(os.environ.get("MAX_PROXY_RETRIES", 8))
 MAX_SITE_RETRIES  = int(os.environ.get("MAX_SITE_RETRIES", 8))
-CARD_CONCURRENCY  = int(os.environ.get("CARD_CONCURRENCY", 15))
+
+# Lowered 15 → 10. Each concurrent card holds an open API call plus a
+# BIN-lookup task. 10 cards × 4 API replicas ≈ 2.5 per replica ≈ 250 MB
+# peak per replica — safe on Railway Hobby's 512 MB even if the env var
+# is never set.
+CARD_CONCURRENCY  = int(os.environ.get("CARD_CONCURRENCY", 10))
+
 MAX_FALLBACKS = 3
 SITE_COOLDOWN_TTL = 90
 POOL_EXHAUSTED_MAX_INNER = 1
@@ -97,13 +103,16 @@ MAX_SATURATION_WAITS = int(os.environ.get("MAX_SATURATION_WAITS", 50))
 MAX_API_BACKOFF_WAITS = int(os.environ.get("MAX_API_BACKOFF_WAITS", 4))
 API_BACKOFF_BASE = float(os.environ.get("API_BACKOFF_BASE", 2.0))
 
-# PROXY_ERROR alone is a real proxy-layer failure. The "dead/in cooldown"
-# variant is the API's internal cooldown report — msh.py must NOT treat it
-# as a fresh proxy failure, or the two cooldown trackers drift and lock
-# the same proxy out of both ends forever. That variant is short-circuited
-# in process_single_card before this set is even checked.
-PROXY_ERROR_CODES = {"PROXY_ERROR"}
+# PATCH P2: NO_SELLER_PROPOSAL gets its own budget (50) so cards don't
+# die after 8 address rejections — ~40% of sites return it and the 8-cap
+# kills 1-in-160 cards purely from address mismatch.
+MAX_NO_SELLER_HITS = int(os.environ.get("MAX_NO_SELLER_HITS", 50))
 
+# PATCH P1: how long to locally cooldown a proxy the API reports as
+# "dead/in cooldown". Short so the two trackers stay roughly in sync.
+API_COOLDOWN_MIRROR_SECONDS = int(os.environ.get("API_COOLDOWN_MIRROR_SECONDS", 30))
+
+PROXY_ERROR_CODES = {"PROXY_ERROR"}
 _ALL_COOLED_SENTINEL = "__ALL_COOLED__"
 
 SKIP_SITE_CODES = {
@@ -438,14 +447,26 @@ class ProxyManager:
         if proxy in self.failed_proxies:
             del self.failed_proxies[proxy]
 
+    # PATCH P1: mark a proxy as cooling for a SHORT fixed window without
+    # touching fail_count or applying exponential backoff. Called when
+    # api.py returns "dead/in cooldown" — that's the API's own cooldown
+    # state, not a fresh failure. Without this the proxy is never
+    # re-marked in OUR pool, get_next_proxy() keeps returning it, and
+    # the card spins in an infinite rotate loop.
+    def mirror_api_cooldown(self, proxy: str, seconds: float = None):
+        if proxy in self.failed_proxies:
+            return
+        now = time.time()
+        self.failed_proxies[proxy] = {
+            'fail_count': 1,
+            'first_fail': now,
+            'last_fail': now,
+            'cooldown_until': now + (seconds if seconds is not None else API_COOLDOWN_MIRROR_SECONDS),
+        }
+
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
 
-        # CASCADE FIX: the API reports "PROXY_ERROR - All 1 proxies dead/in
-        # cooldown" when ITS OWN state has the proxy marked dead. That is a
-        # rotation instruction, not a fresh failure — do not refresh our
-        # cooldown to match, or the two trackers drift apart and the same
-        # proxy stays locked out of both ends forever.
         if "dead/in cooldown" in response_lower:
             return False
 
@@ -582,6 +603,7 @@ FINAL_SITE_REJECTIONS = frozenset({
     "Sites exhausted",
     "No proxies configured",
     "Site pool saturated",
+    "All sites address-rejected",
 })
 RETRYABLE_ERRORS = frozenset({
     "THROTTLED", "TIMEOUT", "PROXY_ERROR", "SITE_ERROR",
@@ -1280,12 +1302,13 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     used_site = None
     is_insufficient = False
 
-    proxy_fails      = 0
-    site_fails       = 0
-    no_product_hits  = 0
+    proxy_fails         = 0
+    site_fails          = 0
+    no_product_hits     = 0
+    no_seller_hits      = 0          # PATCH P2
     pool_exhausted_hits = 0
-    saturation_waits = 0
-    api_backoff_waits = 0
+    saturation_waits    = 0
+    api_backoff_waits   = 0
     proxy_fail_codes: list[str] = []
 
     parts = cc_formatted.split('|')
@@ -1312,6 +1335,10 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             if site_fails >= MAX_SITE_RETRIES:
                 result_status = "ERROR"
                 response_msg = f"All sites exhausted ({site_fails} site errors)"
+                break
+            if no_seller_hits >= MAX_NO_SELLER_HITS:
+                result_status = "ERROR"
+                response_msg = f"All sites address-rejected ({no_seller_hits} attempts)"
                 break
             if saturation_waits >= MAX_SATURATION_WAITS:
                 result_status = "ERROR"
@@ -1459,7 +1486,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.sleep(0.05)
                 continue
 
-            # API overload backoff: not a proxy failure
             if code == "API_REPLICAS_UNREACHABLE":
                 api_backoff_waits += 1
                 backoff = API_BACKOFF_BASE * (2 ** (api_backoff_waits - 1)) \
@@ -1472,18 +1498,21 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.sleep(backoff)
                 continue
 
-            # ─── CASCADE FIX ───
-            # If the API is telling us ITS OWN cooldown state — do NOT
-            # charge a fresh proxy retry and do NOT refresh our own cooldown.
-            # Just rotate to another proxy silently. Otherwise the two
-            # trackers drift apart and lock the same proxy out of both
-            # ends forever, producing every "All proxies exhausted" card
-            # you see in the logs.
+            # ─── PATCH P1: mirror api.py's cooldown locally ───
+            # If the API says "dead/in cooldown" that means the API's OWN
+            # proxy pool has this proxy marked. That is not a fresh failure
+            # and msh.py must not charge a retry — but we DO have to mark
+            # it here or get_next_proxy() keeps returning it forever and
+            # the card spins in an infinite rotate loop. A short fixed
+            # 30s local cooldown is enough; when it expires we try again
+            # and either api.py has also recovered it, or we mirror again.
             if code in PROXY_ERROR_CODES:
                 if "dead/in cooldown" in message.lower():
+                    proxy_manager.mirror_api_cooldown(proxy)
                     logging.debug(
-                        f"[MSH] Proxy {mask_proxy(proxy)} already cooling on API — "
-                        f"rotate silently (no retry charged)"
+                        f"[MSH] Proxy {mask_proxy(proxy)} cooling on API — "
+                        f"local {API_COOLDOWN_MIRROR_SECONDS}s cooldown "
+                        f"(no retry charged)"
                     )
                     await asyncio.sleep(0.05)
                     continue
@@ -1497,7 +1526,33 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.sleep(0.1)
                 continue
 
+            # ─── PATCH P2: NO_SELLER_PROPOSAL gets its own budget ───
+            # ~40% of Shopify stores reject the test address for shipping.
+            # That's not a site failure — it's an address mismatch. Give
+            # it a separate 50-attempt budget instead of sharing the
+            # 8-attempt site-fails budget, or cards die purely from
+            # address mismatch on roughly 1-in-160 runs.
             if code in SITE_ERROR_CODES:
+                if code == "NO_SELLER_PROPOSAL":
+                    no_seller_hits += 1
+                    if no_seller_hits >= MAX_NO_SELLER_HITS:
+                        result_status = "ERROR"
+                        response_msg = (
+                            f"All sites address-rejected "
+                            f"({no_seller_hits} attempts)"
+                        )
+                        break
+                    session.setdefault('_blacklisted_sites', {})[site] = (
+                        time.time() + SITE_COOLDOWN_TTL
+                    )
+                    logging.debug(
+                        f"[MSH] Site {site} address-rejected (NO_SELLER_PROPOSAL) — "
+                        f"cool {SITE_COOLDOWN_TTL}s, no retry "
+                        f"({no_seller_hits}/{MAX_NO_SELLER_HITS})"
+                    )
+                    await asyncio.sleep(0.05)
+                    continue
+
                 site_fails += 1
                 session.setdefault('_blacklisted_sites', {})[site] = (
                     time.time() + SITE_COOLDOWN_TTL
