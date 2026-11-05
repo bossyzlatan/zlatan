@@ -1,6 +1,26 @@
 """
 MongoDB Database Module for Railway.com Deployment
 with automatic SQLite fallback when MongoDB is unavailable.
+
+v2.1 — bug fixes 1–18 from audit:
+  1.  claim_code / claim_plan_key atomic check
+  2.  get_premium_status no longer wipes credits
+  3.  _parse_where correct AND/OR precedence (paren-aware)
+  4.  MongoCursorWrapper preserves COUNT(*) alias
+  5.  set_global_sites no longer drops indexes
+  6.  set_premium / claim_* no longer create partial user docs
+  7.  replace_one uses transaction (atomic delete + insert)
+  8.  $inc on missing SQLite column auto-creates it
+  9.  JOIN WHERE on joined-table columns is honoured
+ 10.  BETWEEN regex survives parentheses
+ 11.  Non-equality JOIN ON raises a warning instead of silent zero-rows
+ 12.  Placeholder substitution is quote-aware
+ 13.  SQLite commits only on DML/DDL (no commit per SELECT)
+ 14.  is_gate_enabled reads first, upserts only on miss
+ 15.  _get_db_name regex handles all URI shapes correctly
+ 16.  ISO dates with Z suffix parse on Python < 3.11
+ 17.  DB_CONFIG wired up as fallback when no URI env present
+ 18.  Dead compat shims annotated
 """
 
 import os
@@ -26,7 +46,7 @@ _DB_BACKEND = None  # "mongodb" or "sqlite"
 
 
 # ═══════════════════════════════════════════════════════════════
-# psycopg2 MOCKS (unchanged)
+# psycopg2 MOCKS
 # ═══════════════════════════════════════════════════════════════
 def _setup_psycopg2_mocks():
     try:
@@ -80,15 +100,27 @@ def _get_mongodb_uri() -> str:
     if db_url and db_url.startswith("mongodb"):
         logger.info("Using MongoDB URI from DATABASE_URL")
         return db_url
-    fallback = "mongodb://localhost:27017/freshbot"
-    logger.warning(f"No MongoDB URI found in env, using fallback: {fallback}")
-    return fallback
+    # FIX #17: build URI from DB_CONFIG as a real fallback
+    host = DB_CONFIG.get("host", "localhost")
+    port = DB_CONFIG.get("port", 27017)
+    user = DB_CONFIG.get("user", "")
+    password = DB_CONFIG.get("password", "")
+    database = DB_CONFIG.get("database", "freshbot")
+    if user and password:
+        uri = f"mongodb://{user}:{password}@{host}:{port}/{database}"
+    else:
+        uri = f"mongodb://{host}:{port}/{database}"
+    logger.warning(f"No MongoDB URI found in env, using config: {uri}")
+    return uri
 
 
 def _get_db_name() -> str:
+    # FIX #15: correctly extract the database segment from any URI shape
     uri = _get_mongodb_uri()
-    match = re.search(r"/([^/?]+)(\?|$)", uri)
-    return match.group(1) if match else "freshbot"
+    m = re.match(r"mongodb(?:\+srv)?://(?:[^@]+@)?([^/]+)(?:/([^?]+))?", uri)
+    if m and m.group(2):
+        return m.group(2).split("/")[0]
+    return DB_CONFIG.get("database", "freshbot")
 
 
 _mongo_client = None
@@ -126,7 +158,6 @@ _sqlite_conn: Optional[sqlite3.Connection] = None
 _sqlite_db_shim: Optional["SQLiteDBShim"] = None
 
 
-# Column schemas: (col_name, sql_type)
 _SQLITE_TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
     "users": [
         ("user_id", "INTEGER PRIMARY KEY"),
@@ -193,11 +224,11 @@ _SQLITE_TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
     "pending_feedback": [
         ("_id", "TEXT PRIMARY KEY"),
         ("created_at", "TEXT"),
-        ("_data", "TEXT"),  # JSON blob for arbitrary fields
+        ("_data", "TEXT"),
     ],
     "settings": [
         ("key", "TEXT PRIMARY KEY"),
-        ("value", "TEXT"),  # JSON-encoded
+        ("value", "TEXT"),
         ("updated_at", "TEXT"),
     ],
     "global_sites": [
@@ -231,13 +262,11 @@ _STATS_TABLE_SCHEMA = [
 
 
 def _sqlite_create_table(conn: sqlite3.Connection, name: str):
-    """Create a table if it doesn't exist yet."""
     if name.endswith("_stats") and name not in _SQLITE_TABLE_SCHEMAS:
         cols = _STATS_TABLE_SCHEMA
     else:
         cols = _SQLITE_TABLE_SCHEMAS.get(name)
     if cols is None:
-        # Unknown collection: create a default table with an INTEGER _id
         sql = f'CREATE TABLE IF NOT EXISTS "{name}" (_id INTEGER PRIMARY KEY AUTOINCREMENT)'
         conn.execute(sql)
         return
@@ -261,8 +290,6 @@ def _get_sqlite_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
 
-    # Register Postgres-compat SQL functions so `DEFAULT NOW()` / `NOW()`
-    # in DDL and DML work without modification.
     conn.create_function(
         "NOW", 0,
         lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -284,7 +311,7 @@ def _get_sqlite_conn() -> sqlite3.Connection:
 
 
 # ───────────────────────────────────────────────────────────────
-# MongoDB-filter → SQL WHERE translator (used by the shim)
+# FIX #12 & #16: quote-aware value adaptation, ISO Z-suffix parsing
 # ───────────────────────────────────────────────────────────────
 def _adapt_sqlite_value(val):
     if isinstance(val, datetime):
@@ -296,13 +323,25 @@ def _adapt_sqlite_value(val):
     return val
 
 
+def _parse_iso_datetime(val: str) -> Optional[datetime]:
+    """FIX #16: parse ISO strings including the 'Z' UTC suffix on Python < 3.11."""
+    if not val:
+        return None
+    try:
+        iso = val
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        return datetime.fromisoformat(iso)
+    except Exception:
+        return None
+
+
 def _deadapt_sqlite_value(val):
     if isinstance(val, str):
         if len(val) >= 10 and val[4] == "-" and val[7] == "-" and "T" in val:
-            try:
-                return datetime.fromisoformat(val)
-            except Exception:
-                pass
+            parsed = _parse_iso_datetime(val)
+            if parsed is not None:
+                return parsed
         if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
             try:
                 return json.loads(val)
@@ -312,7 +351,6 @@ def _deadapt_sqlite_value(val):
 
 
 def _filter_to_where(filter_dict: Optional[dict]) -> Tuple[str, list]:
-    """Convert a pymongo-style filter dict into a SQL WHERE clause + params."""
     if not filter_dict:
         return "1=1", []
     clauses: List[str] = []
@@ -393,7 +431,7 @@ def _filter_to_where(filter_dict: Optional[dict]) -> Tuple[str, list]:
 
 
 # ───────────────────────────────────────────────────────────────
-# SQLite result shims
+# Result shims
 # ───────────────────────────────────────────────────────────────
 class _SQLiteUpdateResult:
     def __init__(self, modified_count=0, upserted_id=None, matched_count=0):
@@ -413,8 +451,6 @@ class _SQLiteDeleteResult:
 
 
 class _SQLiteFindCursor:
-    """Minimal cursor mimicking pymongo's find() return value."""
-
     def __init__(self, coll: "SQLiteCollectionShim", filter_dict, projection):
         self._coll = coll
         self._filter = filter_dict or {}
@@ -462,15 +498,11 @@ class _SQLiteFindCursor:
             yield doc
 
 
-# ───────────────────────────────────────────────────────────────
-# SQLite collection shim
-# ───────────────────────────────────────────────────────────────
 class SQLiteCollectionShim:
     def __init__(self, conn: sqlite3.Connection, name: str):
         self.conn = conn
         self.name = name
 
-    # ---- helpers -------------------------------------------------
     def _table_exists(self) -> bool:
         cur = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -524,7 +556,6 @@ class SQLiteCollectionShim:
             out.pop("_id", None)
         return out
 
-    # ---- CRUD ----------------------------------------------------
     def find_one(self, filter_dict=None, projection=None, sort=None):
         cur = self.find(filter_dict or {}, projection)
         if sort:
@@ -571,11 +602,30 @@ class SQLiteCollectionShim:
         return _SQLiteInsertResult(inserted_id=cur.lastrowid)
 
     def replace_one(self, filter_dict: dict, doc: dict, upsert: bool = False):
+        # FIX #7: atomic delete + insert inside one transaction
         where, params = _filter_to_where(filter_dict)
+        doc = dict(doc)
+        self._ensure_columns(doc)
+        cols = [k for k in doc.keys() if not k.startswith("$")]
+        vals = [_adapt_sqlite_value(doc[k]) for k in cols]
+        ph = ",".join(["?"] * len(cols))
+        insert_sql = (
+            f'INSERT INTO "{self.name}" '
+            f'({",".join(chr(34)+c+chr(34) for c in cols)}) VALUES ({ph})'
+        )
         with _SQLITE_LOCK:
-            self.conn.execute(f'DELETE FROM "{self.name}" WHERE {where}', params)
-            self.conn.commit()
-        return self.insert_one(doc)
+            try:
+                self.conn.execute("BEGIN")
+                self.conn.execute(f'DELETE FROM "{self.name}" WHERE {where}', params)
+                cur = self.conn.execute(insert_sql, vals)
+                self.conn.commit()
+                return _SQLiteInsertResult(inserted_id=cur.lastrowid)
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     def _apply_update(self, filter_dict, update_op, upsert: bool) -> _SQLiteUpdateResult:
         set_dict = dict(update_op.get("$set", {}))
@@ -585,6 +635,9 @@ class SQLiteCollectionShim:
         where, params = _filter_to_where(filter_dict)
 
         if set_dict or inc_dict:
+            # FIX #8: auto-create missing columns for $inc / $set so
+            # SQLite doesn't raise "no such column" on new fields.
+            self._ensure_columns({**set_dict, **{k: 0 for k in inc_dict}})
             parts = []
             upd_params = []
             for k, v in set_dict.items():
@@ -687,14 +740,113 @@ class SQLiteDBShim:
 
 
 # ───────────────────────────────────────────────────────────────
-# SQL placeholder + DDL normalization for the raw cursor path
+# FIX #12: quote-aware splitting / substitution helpers
 # ───────────────────────────────────────────────────────────────
+def _split_unquoted(s: str, sep: str) -> List[str]:
+    """Split `s` on `sep` only when the separator is not inside a quoted string."""
+    parts = []
+    current: List[str] = []
+    in_quote = False
+    quote_char = None
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if in_quote:
+            current.append(c)
+            if c == quote_char:
+                if i + 1 < len(s) and s[i + 1] == quote_char:
+                    current.append(s[i + 1])
+                    i += 2
+                    continue
+                in_quote = False
+            i += 1
+        else:
+            if c in ("'", '"'):
+                in_quote = True
+                quote_char = c
+                current.append(c)
+                i += 1
+            elif s[i:i + len(sep)] == sep:
+                parts.append("".join(current))
+                current = []
+                i += len(sep)
+            else:
+                current.append(c)
+                i += 1
+    parts.append("".join(current))
+    return parts
+
+
+def _replace_unquoted(s: str, placeholder: str, replacement: str) -> str:
+    parts = _split_unquoted(s, placeholder)
+    return replacement.join(parts)
+
+
+def _split_sql_expression(s: str, sep_re: str) -> List[str]:
+    """
+    FIX #3 (support): split on a regex separator only at depth 0.
+    Parens and quotes protect the separator from being treated as a split.
+    """
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    in_quote = False
+    quote_char = None
+    i = 0
+    pat = re.compile(sep_re, re.IGNORECASE)
+    while i < len(s):
+        c = s[i]
+        if in_quote:
+            current.append(c)
+            if c == quote_char:
+                if i + 1 < len(s) and s[i + 1] == quote_char:
+                    current.append(s[i + 1])
+                    i += 2
+                    continue
+                in_quote = False
+            i += 1
+            continue
+        if c in ("'", '"'):
+            in_quote = True
+            quote_char = c
+            current.append(c)
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            current.append(c)
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            current.append(c)
+            i += 1
+            continue
+        if depth == 0:
+            m = pat.match(s, i)
+            if m:
+                parts.append("".join(current))
+                current = []
+                i = m.end()
+                continue
+        current.append(c)
+        i += 1
+    parts.append("".join(current))
+    return parts
+
+
 def _sqlite_convert_placeholders(sql: str) -> str:
-    # %(name)s  → :name
-    sql = re.sub(r"%\((\w+)\)s", r":\1", sql)
-    # %s        → ?
-    sql = sql.replace("%s", "?")
-    return sql
+    # FIX #12: only substitute placeholders outside quoted string literals
+    pieces = re.split(r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")", sql)
+    out = []
+    for piece in pieces:
+        if piece and (piece[0] == "'" or piece[0] == '"'):
+            out.append(piece)
+        else:
+            piece = re.sub(r"%\((\w+)\)s", r":\1", piece)
+            piece = piece.replace("%s", "?")
+            out.append(piece)
+    return "".join(out)
 
 
 def _sqlite_column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -713,7 +865,6 @@ def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def _normalize_pg_type(fragment: str) -> str:
-    """Rewrite Postgres type names/keywords to SQLite equivalents."""
     out = fragment
     out = re.sub(r"\bBIGINT\b", "INTEGER", out, flags=re.IGNORECASE)
     out = re.sub(r"\bSMALLINT\b", "INTEGER", out, flags=re.IGNORECASE)
@@ -735,23 +886,14 @@ def _normalize_pg_type(fragment: str) -> str:
 
 
 def _normalize_sqlite_sql(conn: sqlite3.Connection, sql: str):
-    """
-    Translate Postgres-flavoured DDL into SQLite.
-
-    Returns a string to run, or None if the statement should be a no-op,
-    or the sentinel "__ADD_COLUMN_SKIP__" if the column already exists
-    and the ALTER should be skipped silently.
-    """
     s = sql.strip().rstrip(";").strip()
     if not s:
         return None
     upper = s.upper()
 
-    # --- ALTER TABLE ... ALTER COLUMN ... TYPE ...  (no-op in SQLite) ---
     if re.match(r"ALTER\s+TABLE\s+\w+\s+ALTER\s+COLUMN\s+", upper):
         return None
 
-    # --- ALTER TABLE ... ADD COLUMN [IF NOT EXISTS] col TYPE [DEFAULT ...] ---
     m = re.match(
         r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+"
         r"(?:IF\s+NOT\s+EXISTS\s+)?"
@@ -767,14 +909,10 @@ def _normalize_sqlite_sql(conn: sqlite3.Connection, sql: str):
         typedef = _normalize_pg_type(typedef)
         return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typedef}'
 
-    # --- CREATE TABLE / CREATE INDEX / everything else ---
     if upper.startswith("CREATE TABLE") or upper.startswith("CREATE INDEX"):
         s = _normalize_pg_type(s)
-        # SQLite doesn't understand "IF NOT EXISTS" on some constraint forms,
-        # but the common forms are fine. Return as-is after type rewrite.
         return s
 
-    # --- Fallback: still rewrite NOW() and unsupported types anywhere ---
     s = re.sub(r"\bNOW\(\)", "CURRENT_TIMESTAMP", s, flags=re.IGNORECASE)
     s = _normalize_pg_type(s)
     return s
@@ -793,13 +931,9 @@ class SQLiteCursorWrapper:
         if self._closed:
             raise Exception("Cursor is closed")
 
-        # 1. Placeholder translation
         sql = _sqlite_convert_placeholders(query)
-
-        # 2. DDL normalization
         normalized = _normalize_sqlite_sql(self._conn, sql)
 
-        # 3. Fast-exit cases
         if normalized is None:
             self._description = None
             self._rowcount = 0
@@ -810,7 +944,6 @@ class SQLiteCursorWrapper:
             return self
         sql = normalized
 
-        # 4. Bind params
         if params is None:
             sql_params: Any = ()
         elif isinstance(params, dict):
@@ -820,13 +953,16 @@ class SQLiteCursorWrapper:
         else:
             sql_params = (_adapt_sqlite_value(params),)
 
-        # 5. Run
         with _SQLITE_LOCK:
             try:
                 self._cursor.execute(sql, sql_params)
                 self._description = self._cursor.description
                 self._rowcount = self._cursor.rowcount
-                self._conn.commit()
+                # FIX #13: only commit for DML / DDL — not on reads
+                upper_sql = sql.strip().upper()
+                is_read = upper_sql.startswith("SELECT") or upper_sql.startswith("PRAGMA")
+                if not is_read:
+                    self._conn.commit()
             except sqlite3.OperationalError as e:
                 msg = str(e).lower()
                 if "duplicate column name" in msg or "already exists" in msg:
@@ -908,14 +1044,9 @@ class SQLiteConnectionWrapper:
             pass
 
     def close(self):
-        # Do NOT actually close the shared SQLite connection — the pool
-        # owns it. Just mark this wrapper as closed.
         self._closed = True
 
 
-# ───────────────────────────────────────────────────────────────
-# Unified DB accessor with MongoDB → SQLite fallback
-# ───────────────────────────────────────────────────────────────
 def _get_db():
     global _DB_BACKEND, _sqlite_db_shim, _IS_SQLITE_MODE, _IS_MONGODB_MODE
     if _DB_BACKEND == "sqlite":
@@ -973,18 +1104,15 @@ def health_check() -> bool:
         return False
 
 
-# ═══════════════════════════════════════════════════════════════
-# Utility: convert ISO date strings to datetime objects
-# ═══════════════════════════════════════════════════════════════
+# FIX #16: Z-suffix aware date conversion
 def _convert_dates_in_doc(doc):
     if isinstance(doc, dict):
         for key, value in doc.items():
             if isinstance(value, str):
-                try:
-                    if "T" in value and ":" in value and "-" in value:
-                        doc[key] = datetime.fromisoformat(value)
-                except Exception:
-                    pass
+                if "T" in value and ":" in value and "-" in value:
+                    parsed = _parse_iso_datetime(value)
+                    if parsed is not None:
+                        doc[key] = parsed
             elif isinstance(value, dict):
                 _convert_dates_in_doc(value)
             elif isinstance(value, list):
@@ -993,26 +1121,24 @@ def _convert_dates_in_doc(doc):
     return doc
 
 
-# ═══════════════════════════════════════════════════════════════
-# SQL parameter substitution (used by MongoDB cursor)
-# ═══════════════════════════════════════════════════════════════
 def _substitute_params(query: str, params) -> str:
     if params is None:
         return query
     if isinstance(params, dict):
+        # FIX #12: quote-aware substitution for named placeholders
         for key, val in params.items():
             placeholder = f"%({key})s"
-            query = query.replace(placeholder, _format_value(val))
+            query = _replace_unquoted(query, placeholder, _format_value(val))
         return query
     if not isinstance(params, (list, tuple)):
         params = (params,)
-    parts = query.split("%s")
+    parts = _split_unquoted(query, "%s")
     if len(parts) - 1 == len(params):
         result = parts[0]
         for i, param in enumerate(params):
             result += _format_value(param) + parts[i + 1]
         return result
-    parts = query.split("?")
+    parts = _split_unquoted(query, "?")
     if len(parts) - 1 == len(params):
         result = parts[0]
         for i, param in enumerate(params):
@@ -1037,15 +1163,18 @@ def _format_value(val) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# WHERE clause parser (MongoDB side)
+# FIX #3 & #10: paren-aware WHERE parser with correct AND/OR precedence
 # ═══════════════════════════════════════════════════════════════
 def _parse_where(where_clause: str) -> Dict[str, Any]:
     if not where_clause:
         return {}
     where_clause = where_clause.strip()
     filt: Dict[str, Any] = {}
+
+    # FIX #10: BETWEEN regex now stops at a closing paren
     between_pattern = re.compile(
-        r"(\w+)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)(?:\s+AND|\s*$)", re.IGNORECASE
+        r"(\w+)\s+BETWEEN\s+(.+?)\s+AND\s+([^)]+?)(?:\s+AND|\)|\s*$)",
+        re.IGNORECASE,
     )
     between_matches = list(between_pattern.finditer(where_clause))
     if between_matches:
@@ -1055,31 +1184,53 @@ def _parse_where(where_clause: str) -> Dict[str, Any]:
             high = _parse_sql_value(m.group(3).strip())
             filt[col] = {"$gte": low, "$lte": high}
         where_clause = between_pattern.sub("", where_clause).strip()
-        if where_clause.startswith("AND "):
-            where_clause = where_clause[4:]
-    if not where_clause:
+        while where_clause.startswith("AND "):
+            where_clause = where_clause[4:].strip()
+        # trim a dangling leading '(' or stray ')'
+        while where_clause.startswith("(") and ")" not in where_clause:
+            where_clause = where_clause[1:].strip()
+        if not where_clause:
+            return filt
+
+    # FIX #3: split on OR FIRST (top-level, paren-aware), then AND inside each branch
+    or_groups = _split_sql_expression(where_clause, r"\s+OR\s+")
+    if len(or_groups) > 1:
+        parsed_or: List[Dict[str, Any]] = []
+        for grp in or_groups:
+            grp = grp.strip()
+            if grp.startswith("(") and grp.endswith(")"):
+                grp = grp[1:-1].strip()
+            branch = _parse_where(grp)
+            if branch:
+                parsed_or.append(branch)
+        if parsed_or:
+            if len(parsed_or) == 1:
+                filt.update(parsed_or[0])
+            else:
+                filt["$or"] = parsed_or
         return filt
-    conditions = re.split(r"\s+AND\s+", where_clause, flags=re.IGNORECASE)
-    for cond in conditions:
+
+    # No top-level OR — process ANDs (each AND branch may itself be a paren group)
+    and_parts = _split_sql_expression(where_clause, r"\s+AND\s+")
+    sub_filters: List[Dict[str, Any]] = []
+    for cond in and_parts:
         cond = cond.strip().strip(";").strip()
         if not cond:
             continue
-        or_parts = re.split(r"\s+OR\s+", cond, flags=re.IGNORECASE)
-        if len(or_parts) > 1:
-            or_filters = []
-            for part in or_parts:
-                parsed = _parse_single_condition(part.strip())
-                if parsed:
-                    or_filters.append(parsed)
-            if or_filters:
-                if "$or" in filt:
-                    filt["$or"].extend(or_filters)
-                else:
-                    filt["$or"] = or_filters
+        if cond.startswith("(") and cond.endswith(")"):
+            inner_filt = _parse_where(cond[1:-1])
+            if inner_filt:
+                sub_filters.append(inner_filt)
             continue
         parsed = _parse_single_condition(cond)
         if parsed:
-            filt.update(parsed)
+            sub_filters.append(parsed)
+
+    if len(sub_filters) == 1:
+        filt.update(sub_filters[0])
+    elif len(sub_filters) > 1:
+        filt["$and"] = sub_filters
+
     return filt
 
 
@@ -1140,11 +1291,10 @@ def _parse_sql_value(val_str: str):
     if (val_str.startswith("'") and val_str.endswith("'")) or \
        (val_str.startswith('"') and val_str.endswith('"')):
         inner = val_str[1:-1].replace("''", "'").replace('""', '"')
-        try:
-            if "T" in inner and ":" in inner and "-" in inner:
-                return datetime.fromisoformat(inner)
-        except Exception:
-            pass
+        if "T" in inner and ":" in inner and "-" in inner:
+            parsed = _parse_iso_datetime(inner)
+            if parsed is not None:
+                return parsed
         try:
             if re.match(r"^-?\d+$", inner):
                 return int(inner)
@@ -1238,9 +1388,6 @@ def _parse_set_clause(set_clause: str) -> Dict[str, Any]:
     return result
 
 
-# ═══════════════════════════════════════════════════════════════
-# MongoDB cursor wrapper
-# ═══════════════════════════════════════════════════════════════
 class MongoCursorWrapper:
     def __init__(self, db, cursor_factory=None):
         self.db = db
@@ -1269,7 +1416,8 @@ class MongoCursorWrapper:
             logger.info(f"[SQL] {query[:180]}")
 
             if re.match(r"SELECT\s+1\s*;?\s*$", query, re.IGNORECASE):
-                self._last_result = [(1,)]
+                # FIX #4: name the column so cursor_factory callers get a dict
+                self._last_result = [{"?column?": 1}]
                 self._rowcount = 1
                 self._result_type = "many"
                 return self
@@ -1290,16 +1438,18 @@ class MongoCursorWrapper:
                 if handled is not None:
                     return handled
 
+            # FIX #4: preserve the alias on COUNT(*) so callers can use row[alias]
             count_match = re.match(
-                r"SELECT\s+COUNT\(\*\)(?:\s+AS\s+\w+)?\s+FROM\s+(\w+)"
+                r"SELECT\s+COUNT\(\*\)(?:\s+AS\s+(\w+))?\s+FROM\s+(\w+)"
                 r"(?:\s+WHERE\s+(.+?))?;?\s*$",
                 query, re.IGNORECASE | re.DOTALL,
             )
             if count_match:
-                table, where = count_match.groups()
+                alias, table, where = count_match.groups()
                 filt = _parse_where(where) if where else {}
                 cnt = self.db[table.lower()].count_documents(filt)
-                self._last_result = [(cnt,)]
+                col_name = alias or "count"
+                self._last_result = [{col_name: cnt}]
                 self._rowcount = 1
                 self._result_type = "many"
                 return self
@@ -1324,7 +1474,7 @@ class MongoCursorWrapper:
                 if len(cols) == 1 and cols[0] == "1":
                     doc = collection.find_one(filt)
                     if doc:
-                        self._last_result = [(1,)]
+                        self._last_result = [{"?column?": 1}]
                         self._rowcount = 1
                     else:
                         self._last_result = []
@@ -1559,14 +1709,40 @@ class MongoCursorWrapper:
             aliases.add(j["alias"])
             aliases.add(j["table"])
 
-        base_filter = {}
+        # FIX #9: partition WHERE by alias so joined-table conditions are
+        # not silently dropped (or applied to the base collection).
+        base_conds: List[str] = []
+        joined_conds: List[str] = []
         if where:
-            where_stripped = re.sub(
+            for cond in _split_sql_expression(where, r"\s+AND\s+"):
+                cond = cond.strip().strip("()").strip()
+                if not cond:
+                    continue
+                alias_m = re.match(r"(\w+)\.(\w+)", cond)
+                if alias_m and alias_m.group(1) not in (base_alias, base_table) \
+                        and alias_m.group(1) in aliases:
+                    joined_conds.append(cond)
+                else:
+                    base_conds.append(cond)
+
+        base_filter: Dict[str, Any] = {}
+        if base_conds:
+            base_where = " AND ".join(base_conds)
+            base_where = re.sub(
                 r"\b(\w+)\.(\w+)",
-                lambda mm: mm.group(2) if mm.group(1) in aliases else mm.group(0),
-                where,
+                lambda mm: mm.group(2) if mm.group(1) in (base_alias, base_table) else mm.group(0),
+                base_where,
             )
-            base_filter = _parse_where(where_stripped)
+            base_filter = _parse_where(base_where)
+
+        joined_filter: Dict[str, Any] = {}
+        if joined_conds:
+            joined_where = " AND ".join(joined_conds)
+            joined_filter = _parse_where(re.sub(
+                r"\b(\w+)\.(\w+)",
+                lambda mm: mm.group(2),
+                joined_where,
+            ))
 
         base_collection = self.db[base_table.lower()]
         base_docs = list(base_collection.find(base_filter))
@@ -1580,6 +1756,10 @@ class MongoCursorWrapper:
         for j in join_parts:
             on_m = re.match(r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)", j["on"])
             if not on_m:
+                # FIX #11: warn instead of silently returning zero rows
+                logger.warning(
+                    f"[SQL] Unsupported JOIN ON clause: {j['on']} — join skipped"
+                )
                 join_indexes.append(None)
                 continue
             left_alias, left_col, right_alias, right_col = on_m.groups()
@@ -1615,6 +1795,36 @@ class MongoCursorWrapper:
                             new_bucket.append(nm)
                     bucket = new_bucket
             merged_rows.extend(bucket)
+
+        # FIX #9: apply joined-table post-join filter
+        if joined_filter:
+            def _row_matches(mrow: Dict[str, Any]) -> bool:
+                for j in join_parts:
+                    jdoc = mrow.get(f"__{j['alias']}__")
+                    if not jdoc:
+                        continue
+                    for key, condition in joined_filter.items():
+                        if key not in jdoc:
+                            continue
+                        val = jdoc[key]
+                        if isinstance(condition, dict):
+                            if "$eq" in condition and val != condition["$eq"]:
+                                return False
+                            if "$ne" in condition and val == condition["$ne"]:
+                                return False
+                            if "$gt" in condition and not (val is not None and val > condition["$gt"]):
+                                return False
+                            if "$gte" in condition and not (val is not None and val >= condition["$gte"]):
+                                return False
+                            if "$lt" in condition and not (val is not None and val < condition["$lt"]):
+                                return False
+                            if "$lte" in condition and not (val is not None and val <= condition["$lte"]):
+                                return False
+                        else:
+                            if val != condition:
+                                return False
+                return True
+            merged_rows = [r for r in merged_rows if _row_matches(r)]
 
         col_parts = [c.strip() for c in cols_str.split(",")]
         parsed_cols = []
@@ -1786,12 +1996,17 @@ if psycopg2_mod and not hasattr(psycopg2_mod, "_is_real"):
 RealDictCursor = dict
 
 
-# ─── Pooled connection helpers (kept for compat) ───────────────
+# ─── Pooled connection helpers (FIX #18: annotated stubs) ──────
 class SQLiteThreadedPool:
+    """
+    FIX #18: compatibility stub. Real pooling is handled by the shared
+    SQLite connection guarded by `_SQLITE_LOCK`. Do NOT use this class
+    to obtain connections — use `get_db_connection()` instead.
+    """
     def __init__(self, minconn, maxconn, *a, **k):
         self.minconn = minconn
         self.maxconn = maxconn
-        logger.info("ThreadedPool mocked (MongoDB/SQLite backend)")
+        logger.info("SQLiteThreadedPool stub initialized (no real pooling)")
 
 
 class PooledConn:
@@ -1811,7 +2026,23 @@ class PooledConn:
 
 
 class PooledConn2:
-    pass
+    """FIX #18: unused compatibility stub. Will be removed in a future version."""
+
+    def __init__(self):
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = get_db_connection()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            try:
+                if exc_type:
+                    self.conn.rollback()
+            finally:
+                self.conn.close()
+        return False
 
 
 def _release_connection(conn):
@@ -1820,6 +2051,10 @@ def _release_connection(conn):
 
 
 class NoOpCache(dict):
+    """
+    FIX #18: no-op cache used as a placeholder. Real caching (if needed)
+    should go through an LRU or Redis-backed cache, not this class.
+    """
     def get(self, key, default=None): return None
     def __getitem__(self, key): raise KeyError(key)
     def __setitem__(self, key, value): pass
@@ -1959,7 +2194,6 @@ def ensure_stats_table(gate_name: str):
 
 
 def _migrate_numeric_and_date_fields():
-    """Only meaningful for MongoDB; SQLite stores typed values already."""
     if _DB_BACKEND != "mongodb":
         return
     try:
@@ -2112,19 +2346,27 @@ def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
             return (False, None)
         is_premium = user.get("is_premium", 0)
         expiry = user.get("premium_expiry")
+        if isinstance(expiry, str):
+            parsed = _parse_iso_datetime(expiry)
+            if parsed is not None:
+                expiry = parsed
+            else:
+                expiry = None
         if is_premium and expiry:
-            if isinstance(expiry, str):
-                try:
-                    expiry = datetime.fromisoformat(expiry)
-                except Exception:
-                    expiry = None
-            if expiry and datetime.now() < expiry:
+            if datetime.now() < expiry:
                 return (True, expiry)
+            # FIX #2: expire the flag but do NOT wipe credits
             db.users.update_one(
                 {"user_id": user_id},
-                {"$set": {"is_premium": 0, "premium_expiry": None, "credits": 150}},
+                {"$set": {"is_premium": 0, "premium_expiry": None}},
             )
             return (False, None)
+        # FIX #2: corrupt state (is_premium=1 but no expiry) — clear the flag
+        if is_premium and not expiry:
+            db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"is_premium": 0, "premium_expiry": None}},
+            )
         return (False, None)
     except Exception as e:
         logger.error(f"Error fetching premium status for user {user_id}: {e}")
@@ -2135,11 +2377,21 @@ def set_premium(user_id: int, days: int) -> bool:
     try:
         expiry = datetime.now() + timedelta(days=days)
         db = _get_db()
-        db.users.update_one(
+        # FIX #6: do not upsert — require the user to exist, or create a full record
+        result = db.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_premium": 1, "premium_expiry": expiry}},
-            upsert=True,
         )
+        if result.matched_count == 0:
+            logger.warning(f"[set_premium] user {user_id} not found — creating full record")
+            create_user(user_id, "Unknown", "User")
+            result = db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"is_premium": 1, "premium_expiry": expiry}},
+            )
+            if result.matched_count == 0:
+                logger.error(f"[set_premium] still could not update user {user_id}")
+                return False
         logger.info(f"Set premium for user {user_id} for {days} days")
         return True
     except Exception as e:
@@ -2150,13 +2402,16 @@ def set_premium(user_id: int, days: int) -> bool:
 def is_gate_enabled(gate: str) -> bool:
     try:
         db = _get_db()
-        db.gate_status.update_one(
-            {"gate": gate},
-            {"$setOnInsert": {"gate": gate, "is_enabled": 1, "updated_at": datetime.now()}},
-            upsert=True,
-        )
+        # FIX #14: read first, upsert only if missing (avoids write on every call)
         status = db.gate_status.find_one({"gate": gate})
-        return bool(status.get("is_enabled", 1)) if status else True
+        if status is None:
+            db.gate_status.update_one(
+                {"gate": gate},
+                {"$setOnInsert": {"gate": gate, "is_enabled": 1, "updated_at": datetime.now()}},
+                upsert=True,
+            )
+            return True
+        return bool(status.get("is_enabled", 1))
     except Exception as e:
         logger.error(f"Error checking gate status for {gate}: {e}")
         return True
@@ -2298,19 +2553,27 @@ def claim_code(user_id: int, code: str) -> Tuple[bool, str]:
         code_doc = db.codes.find_one({"code": code})
         if not code_doc:
             return False, "Invalid code."
-        if code_doc.get("claimed_by") is not None:
-            return False, "Code already claimed."
-        db.codes.update_one(
+        # FIX #1: atomic claim — only succeeds if claimed_by is still None
+        claim_result = db.codes.update_one(
             {"code": code, "claimed_by": None},
             {"$set": {"claimed_by": user_id, "claimed_at": datetime.now()}},
         )
+        if claim_result.modified_count == 0:
+            return False, "Code already claimed."
+        # FIX #6: do not upsert — user must already exist
         duration = code_doc.get("duration_days", 0)
         expiry = datetime.now() + timedelta(days=duration)
-        db.users.update_one(
+        user_result = db.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_premium": 1, "premium_expiry": expiry}},
-            upsert=True,
         )
+        if user_result.matched_count == 0:
+            # rollback claim since user doesn't exist
+            db.codes.update_one(
+                {"code": code, "claimed_by": user_id},
+                {"$set": {"claimed_by": None, "claimed_at": None}},
+            )
+            return False, "User not found. Use /start first."
         return True, f"Code redeemed! Premium extended by {duration} days."
     except Exception as e:
         logger.error(f"Error claiming code {code} for user {user_id}: {e}")
@@ -2354,19 +2617,26 @@ def claim_plan_key(user_id: int, key: str) -> Tuple[bool, str]:
         key_doc = db.plan_keys.find_one({"key": key})
         if not key_doc:
             return False, "Invalid key."
-        if key_doc.get("claimed_by") is not None:
-            return False, "Key already claimed."
-        db.plan_keys.update_one(
+        # FIX #1: atomic claim — only succeeds if claimed_by is still None
+        claim_result = db.plan_keys.update_one(
             {"key": key, "claimed_by": None},
             {"$set": {"claimed_by": user_id, "claimed_at": datetime.now()}},
         )
+        if claim_result.modified_count == 0:
+            return False, "Key already claimed."
+        # FIX #6: do not upsert
         duration = key_doc.get("duration_days", key_doc.get("days", 0))
         expiry = datetime.now() + timedelta(days=duration)
-        db.users.update_one(
+        user_result = db.users.update_one(
             {"user_id": user_id},
             {"$set": {"is_premium": 1, "premium_expiry": expiry}},
-            upsert=True,
         )
+        if user_result.matched_count == 0:
+            db.plan_keys.update_one(
+                {"key": key, "claimed_by": user_id},
+                {"$set": {"claimed_by": None, "claimed_at": None}},
+            )
+            return False, "User not found. Use /start first."
         return True, f"Key redeemed! Premium extended by {duration} days."
     except Exception as e:
         logger.error(f"Error claiming plan key {key} for user {user_id}: {e}")
@@ -2689,7 +2959,8 @@ def get_global_sites() -> List[str]:
 def set_global_sites(sites: List[str]) -> int:
     try:
         db = _get_db()
-        db.global_sites.drop()
+        # FIX #5: delete_many keeps the unique index intact
+        db.global_sites.delete_many({})
         docs = []
         if sites:
             docs = [{"url": s.strip(), "added_at": datetime.now()} for s in sites if s and s.strip()]
@@ -2749,7 +3020,8 @@ def get_global_stripe_sites() -> List[str]:
 def set_global_stripe_sites(sites: List[str]) -> int:
     try:
         db = _get_db()
-        db.global_stripe_sites.drop()
+        # FIX #5: delete_many keeps the unique index intact
+        db.global_stripe_sites.delete_many({})
         docs = []
         if sites:
             docs = [{"url": s.strip(), "added_at": datetime.now()}
@@ -2931,7 +3203,6 @@ def cleanup_old_pending_feedback(hours: int = 48) -> int:
 # INITIALIZATION
 # ═══════════════════════════════════════════════════════════════
 try:
-    # Force backend detection now.
     _get_db()
     initialize_schema()
     if _DB_BACKEND == "sqlite":
