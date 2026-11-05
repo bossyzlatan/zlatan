@@ -77,7 +77,7 @@ from whop import whop_command, router as whop_router
 import payments as pay_sys
 import shopify_api
 
-BOT_TOKEN = "8854418593:AAG1XUIPMq6Oaoj_5YDxFP8ArOUm0Rbetc8"
+BOT_TOKEN = "8838092010:AAHhudzXYPZy-v1N6iKj79Bs9TvIVAd2dLU"
 WEBHOOK_URL = f""
 WEBHOST = "0.0.0.0"
 WEBPORT = 8080
