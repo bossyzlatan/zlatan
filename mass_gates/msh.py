@@ -78,13 +78,13 @@ BUTTON_LOCK_SECONDS = 30
 MAX_OUTER_ROUNDS = int(os.environ.get("MAX_OUTER_ROUNDS", 4))
 OUTER_RETRY_DELAYS = [
     int(os.environ.get("RETRY_DELAY_1", 90)),
-    int(os.environ.get("RETRY_DELAY_2", 180)),
-    int(os.environ.get("RETRY_DELAY_3", 300)),
-    int(os.environ.get("RETRY_DELAY_4", 300)),
+    int(os.environ.get("RETRY_DELAY_2", 90)),
+    int(os.environ.get("RETRY_DELAY_3", 90)),
+    int(os.environ.get("RETRY_DELAY_4", 90)),
 ]
 
-MAX_PROXY_RETRIES = int(os.environ.get("MAX_PROXY_RETRIES", 8))
-MAX_SITE_RETRIES  = int(os.environ.get("MAX_SITE_RETRIES", 8))
+MAX_PROXY_RETRIES = int(os.environ.get("MAX_PROXY_RETRIES", 2))
+MAX_SITE_RETRIES  = int(os.environ.get("MAX_SITE_RETRIES", 2))
 CARD_CONCURRENCY  = int(os.environ.get("CARD_CONCURRENCY", 50))
 MAX_FALLBACKS = 3
 SITE_COOLDOWN_TTL = 90
@@ -100,7 +100,7 @@ SKIP_SITE_CODES = {
     "CAPTCHA_REQUIRED",
 }
 
-PROXY_ERROR_CODES = {"PROXY_ERROR", "API_REPLICAS_UNREACHABLE"}
+PROXY_ERROR_CODES = {"PROXY_ERROR"}
 
 SITE_ERROR_CODES = {
     "CHECKOUT_FAILED", "CART_FAILED", "GRAPHQL_ERROR", "SITE_ERROR",
