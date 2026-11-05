@@ -58,7 +58,6 @@ BTN_LIVE_EMOJI_ID = "5039844895779455925"
 BTN_STOP_EMOJI_ID = "5040042498634810056"
 BTN_ALL_EMOJI_ID = "5447602197439218445"
 
-# ── Hit-log / summary specific premium emoji IDs (user-specified) ──
 HIT_CHARGED_EMOJI_ID = "5188487846968732572"
 HIT_USER_EMOJI_ID    = "5201873447554145566"
 HIT_WARNING_EMOJI_ID = "4915853119839011973"
@@ -85,7 +84,7 @@ OUTER_RETRY_DELAYS = [
 
 MAX_PROXY_RETRIES = int(os.environ.get("MAX_PROXY_RETRIES", 8))
 MAX_SITE_RETRIES  = int(os.environ.get("MAX_SITE_RETRIES", 8))
-CARD_CONCURRENCY  = int(os.environ.get("CARD_CONCURRENCY", 50))
+CARD_CONCURRENCY  = int(os.environ.get("CARD_CONCURRENCY", 15))
 MAX_FALLBACKS = 3
 SITE_COOLDOWN_TTL = 90
 POOL_EXHAUSTED_MAX_INNER = 1
@@ -94,18 +93,17 @@ SITE_CONCURRENCY_LIMIT = int(os.environ.get("SITE_CONCURRENCY_LIMIT", 5))
 API_ATTEMPTS = 1
 API_TIMEOUT = 14.0
 
-# Saturation: our own limiter, NOT a site failure — separate cap, no retry charge.
 MAX_SATURATION_WAITS = int(os.environ.get("MAX_SATURATION_WAITS", 50))
-
-# API overload: transient, NOT a proxy failure — exponential backoff on same proxy.
 MAX_API_BACKOFF_WAITS = int(os.environ.get("MAX_API_BACKOFF_WAITS", 4))
 API_BACKOFF_BASE = float(os.environ.get("API_BACKOFF_BASE", 2.0))
 
-# FIX: API_REPLICAS_UNREACHABLE is now handled by the backoff branch below,
-# so it is no longer classed as a proxy error.
+# PROXY_ERROR alone is a real proxy-layer failure. The "dead/in cooldown"
+# variant is the API's internal cooldown report — msh.py must NOT treat it
+# as a fresh proxy failure, or the two cooldown trackers drift and lock
+# the same proxy out of both ends forever. That variant is short-circuited
+# in process_single_card before this set is even checked.
 PROXY_ERROR_CODES = {"PROXY_ERROR"}
 
-# FIX #2 from previous audit — saturation sentinel for ProxyManager
 _ALL_COOLED_SENTINEL = "__ALL_COOLED__"
 
 SKIP_SITE_CODES = {
@@ -442,6 +440,15 @@ class ProxyManager:
 
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
+
+        # CASCADE FIX: the API reports "PROXY_ERROR - All 1 proxies dead/in
+        # cooldown" when ITS OWN state has the proxy marked dead. That is a
+        # rotation instruction, not a fresh failure — do not refresh our
+        # cooldown to match, or the two trackers drift apart and the same
+        # proxy stays locked out of both ends forever.
+        if "dead/in cooldown" in response_lower:
+            return False
+
         if "proxy_error" in response_lower or "proxy error" in response_lower:
             return True
         for success_indicator in self.SUCCESS_RESPONSES:
@@ -476,8 +483,8 @@ class ProxyManager:
             multiplier_index = min(fail_count - 1, len(cooldown_multipliers) - 1)
             cooldown_duration = cooldown_multipliers[multiplier_index]
             fail_data['cooldown_until'] = current_time + cooldown_duration
-            logging.warning(f"[ProxyManager] Proxy FAILED: {mask_proxy(proxy)} (#{fail_count}) "
-                            f"Cooldown: {cooldown_duration}s | {api_response[:80]}")
+            logging.debug(f"[ProxyManager] Proxy FAILED: {mask_proxy(proxy)} (#{fail_count}) "
+                          f"Cooldown: {cooldown_duration}s | {api_response[:80]}")
         else:
             self.report_success(proxy)
 
@@ -1376,13 +1383,11 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.wait_for(_site_sem.acquire(), timeout=1.5)
                 _entered = True
             except asyncio.TimeoutError:
-                # Saturation is OUR limiter, not the site's failure.
-                # Bump only `saturation_waits`, NEVER `site_fails`.
                 saturation_waits += 1
                 session.setdefault('_blacklisted_sites', {})[site] = (
                     time.time() + 15
                 )
-                logging.info(
+                logging.debug(
                     f"[MSH] Site {site} saturated — rotating "
                     f"(waits={saturation_waits}/{MAX_SATURATION_WAITS})"
                 )
@@ -1424,7 +1429,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             code = _extract_code(message)
 
             if code in POOL_EXHAUSTED_CODES:
-                logging.warning(
+                logging.debug(
                     f"[MSH] SITES_EXHAUSTED for {cc_formatted} on site={site} "
                     f"(available={len(available)}, pool_hit={pool_exhausted_hits}/"
                     f"{POOL_EXHAUSTED_MAX_INNER}). msg={message[:200]}"
@@ -1446,7 +1451,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                     time.time() + SITE_COOLDOWN_TTL
                 )
                 no_product_hits += 1
-                logging.info(
+                logging.debug(
                     f"[MSH] Site {site} rejected ({code}) — "
                     f"cooling down {SITE_COOLDOWN_TTL}s "
                     f"({no_product_hits}/{len(sites_list)})"
@@ -1454,15 +1459,12 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.sleep(0.05)
                 continue
 
-            # ── NEW: API overload backoff ──
-            # API_REPLICAS_UNREACHABLE = API replicas slow/overloaded, NOT a
-            # proxy problem. Back off on the SAME proxy without charging
-            # proxy_fails or site_fails.
+            # API overload backoff: not a proxy failure
             if code == "API_REPLICAS_UNREACHABLE":
                 api_backoff_waits += 1
                 backoff = API_BACKOFF_BASE * (2 ** (api_backoff_waits - 1)) \
                           + random.uniform(0, 1.0)
-                logging.info(
+                logging.debug(
                     f"[MSH] API slow for {cc_formatted} — backing off "
                     f"{backoff:.1f}s (waits={api_backoff_waits}/"
                     f"{MAX_API_BACKOFF_WAITS}): {message[:80]}"
@@ -1470,10 +1472,25 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 await asyncio.sleep(backoff)
                 continue
 
+            # ─── CASCADE FIX ───
+            # If the API is telling us ITS OWN cooldown state — do NOT
+            # charge a fresh proxy retry and do NOT refresh our own cooldown.
+            # Just rotate to another proxy silently. Otherwise the two
+            # trackers drift apart and lock the same proxy out of both
+            # ends forever, producing every "All proxies exhausted" card
+            # you see in the logs.
             if code in PROXY_ERROR_CODES:
+                if "dead/in cooldown" in message.lower():
+                    logging.debug(
+                        f"[MSH] Proxy {mask_proxy(proxy)} already cooling on API — "
+                        f"rotate silently (no retry charged)"
+                    )
+                    await asyncio.sleep(0.05)
+                    continue
+
                 proxy_fails += 1
                 proxy_fail_codes.append(code)
-                logging.info(
+                logging.debug(
                     f"[MSH] Proxy error for {cc_formatted} — rotating "
                     f"({proxy_fails}/{MAX_PROXY_RETRIES}): code={code} msg={message[:80]}"
                 )
@@ -1485,7 +1502,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 session.setdefault('_blacklisted_sites', {})[site] = (
                     time.time() + SITE_COOLDOWN_TTL
                 )
-                logging.info(
+                logging.debug(
                     f"[MSH] Site error for {cc_formatted} on {site} — "
                     f"cooling down {SITE_COOLDOWN_TTL}s "
                     f"({site_fails}/{MAX_SITE_RETRIES}): {message[:60]}"
@@ -1571,7 +1588,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             session.setdefault('_blacklisted_sites', {})[site] = (
                 time.time() + SITE_COOLDOWN_TTL
             )
-            logging.info(
+            logging.debug(
                 f"[MSH] Unknown response for {cc_formatted} on {site}: "
                 f"{message[:80]} — rotating site ({site_fails}/{MAX_SITE_RETRIES})"
             )
