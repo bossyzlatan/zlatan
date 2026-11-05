@@ -4,7 +4,7 @@ import aiohttp
 import asyncio
 import json
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from typing import Optional
 
 from aiogram import types, F, Router
@@ -26,15 +26,11 @@ router = Router()
 ADMIN_IDS = {6962534443, 8428369446}
 
 # ─── PERF TUNING ────────────────────────────────────────────
-# 50 concurrent checks: 100 proxies finish in ~16s instead of ~160s.
 MAX_CONCURRENT_CHECKS = 50
-PROXY_TIMEOUT = 8           # per-endpoint timeout
-PROGRESS_EDIT_INTERVAL = 8  # seconds between Telegram message edits
+PROXY_TIMEOUT = 8
+PROGRESS_EDIT_INTERVAL = 8
 
 # ─── MULTI-ENDPOINT IP LOOKUP ──────────────────────────────
-# Tried in order. If ONE returns 200 → proxy is live.
-# If ALL return 429 → "unknown" (do not remove from DB).
-# If ANY throws a proxy-level error → "dead".
 IP_ENDPOINTS = [
     "https://api.ipify.org?format=json",
     "https://api64.ipify.org?format=json",
@@ -48,6 +44,11 @@ IP_ENDPOINTS = [
 # PROXY PARSING
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def is_socks_proxy_input(line: str) -> bool:
+    """P1: detect SOCKS input so we can warn the user instead of silently dropping."""
+    return bool(re.match(r'^socks[45]?://', (line or "").strip(), re.IGNORECASE))
+
+
 def parse_proxy_input(proxy_input):
     s = proxy_input.strip()
     protocol = 'http'
@@ -55,6 +56,11 @@ def parse_proxy_input(proxy_input):
     if protocol_match:
         protocol = protocol_match.group('p').lower()
         s = s[len(protocol_match.group('p')) + 3:]
+
+    # P1: SOCKS is not supported by aiohttp — return None so the caller
+    # warns the user instead of silently adding a proxy that will fail.
+    if protocol in ('socks4', 'socks5'):
+        return None
 
     def is_valid(ip, port):
         return port and port.isdigit()
@@ -79,10 +85,19 @@ def parse_proxy_input(proxy_input):
         user, password, ip, port = match.groups()
         if is_valid(ip, port): return build_dict(user, password, ip, port, protocol, proxy_input)
 
-    match = re.match(r'^([^:@]+)\s+([^:@]+)\s+([^:@]+)\s+(\d+)$', s)
+    # P9: db_format round-trips via quote/unquote. Use [^:@\s]+ so we never
+    # ambiguously span spaces — passwords with spaces are stored URL-encoded.
+    match = re.match(r'^([^:@\s]+)\s+([^:@\s]+)\s+([^:@\s]+)\s+(\d+)$', s)
     if match:
         user, password, ip, port = match.groups()
-        if is_valid(ip, port): return build_dict(user, password, ip, port, protocol, proxy_input)
+        if user == "-" and password == "-":
+            # P8: no-auth placeholder
+            if is_valid(ip, port):
+                return build_dict(None, None, ip, port, protocol, proxy_input)
+        else:
+            if is_valid(ip, port):
+                return build_dict(unquote(user), unquote(password),
+                                  ip, port, protocol, proxy_input)
 
     match = re.match(r'^([^:@]+):([^:@]+):([^:@]+):(\d+)$', s)
     if match:
@@ -94,14 +109,37 @@ def parse_proxy_input(proxy_input):
         ip, port, user, password = match.groups()
         if is_valid(ip, port): return build_dict(user, password, ip, port, protocol, proxy_input)
 
+    # P8: plain ip:port (no auth)
+    match = re.match(r'^([^:@\s]+):(\d+)$', s)
+    if match:
+        ip, port = match.groups()
+        if is_valid(ip, port):
+            return build_dict(None, None, ip, port, protocol, proxy_input)
+
     return None
 
 
 def build_dict(user, password, ip, port, protocol, original_input):
-    user = user.strip()
-    password = password.strip()
+    user = (user or "").strip()
+    password = (password or "").strip()
     ip = ip.strip()
     port = port.strip()
+
+    # P8: no-auth proxy — use "-" as placeholder in DB so the round-trip
+    # through db_format is unambiguous.
+    if not user or not password:
+        return {
+            "user": None,
+            "password": None,
+            "ip": ip,
+            "port": port,
+            "original_format": original_input,
+            "url_format": f"{protocol}://{ip}:{port}",
+            "db_format": f"- - {ip} {port}",
+            "http_format": f"http://{ip}:{port}",
+        }
+
+    # P9: quote so passwords with spaces / special chars round-trip safely.
     encoded_user = quote(user, safe='')
     encoded_pass = quote(password, safe='')
     return {
@@ -111,8 +149,8 @@ def build_dict(user, password, ip, port, protocol, original_input):
         "port": port,
         "original_format": original_input,
         "url_format": f"{protocol}://{encoded_user}:{encoded_pass}@{ip}:{port}",
-        "db_format": f"{user} {password} {ip} {port}",
-        "http_format": f"http://{user}:{password}@{ip}:{port}"
+        "db_format": f"{encoded_user} {encoded_pass} {ip} {port}",
+        "http_format": f"http://{encoded_user}:{encoded_pass}@{ip}:{port}",
     }
 
 
@@ -121,7 +159,6 @@ def build_dict(user, password, ip, port, protocol, original_input):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _extract_ip(text: str) -> Optional[str]:
-    """Extract an IP from either a JSON response or plain text."""
     text = (text or "").strip()
     if not text:
         return None
@@ -138,13 +175,10 @@ def _extract_ip(text: str) -> Optional[str]:
 async def check_proxy_live(proxy_url: str, session: aiohttp.ClientSession,
                            timeout: float = PROXY_TIMEOUT):
     """
-    Try multiple IP endpoints in order.
-
     Returns (status, info):
-      (True,  {"ip": "..."} )  → proxy is live
-      (False, {"error": "..."}) → proxy is dead (proxy-level connection failure)
-      (None,  {"error": "..."}) → status unknown (all endpoints rate-limited)
-                                  Caller MUST NOT remove from DB on this result.
+      (True,  {...}) → proxy is live
+      (False, {...}) → proxy is dead (proxy-level connection failure only)
+      (None,  {...}) → status unknown (could not verify) — caller MUST keep it
     """
     rate_limit_hits = 0
     last_error = "unknown"
@@ -165,9 +199,13 @@ async def check_proxy_live(proxy_url: str, session: aiohttp.ClientSession,
                     rate_limit_hits += 1
                     last_error = "endpoint rate limited"
                     continue
-                elif resp.status in (403, 503):
-                    # Endpoint blocked us — proxy itself responded, so it's alive
-                    return True, {"ip": "unknown", "endpoint": endpoint, "http": resp.status}
+                elif resp.status == 403:
+                    # P3: endpoint blocked this specific proxy IP — proxy works
+                    return True, {"ip": "unknown", "endpoint": endpoint, "http": 403}
+                elif resp.status == 503:
+                    # P3: endpoint is down — don't vouch for the proxy
+                    last_error = f"endpoint 503 ({endpoint})"
+                    continue
                 else:
                     last_error = f"HTTP {resp.status} from {endpoint}"
                     continue
@@ -187,18 +225,16 @@ async def check_proxy_live(proxy_url: str, session: aiohttp.ClientSession,
             last_error = str(e)[:60]
             continue
 
-    # Every endpoint failed
+    # P2: no proxy-level error was observed — return None (unknown), never
+    # False. False here would mean "delete from DB", which we can't justify
+    # if all we know is that the IP endpoints didn't give us an answer.
     if rate_limit_hits >= len(IP_ENDPOINTS) - 1:
         return None, {"error": "all IP endpoints rate-limited — try again later"}
-    return False, {"error": last_error}
+    return None, {"error": last_error or "all endpoints failed (non-proxy)"}
 
 
 async def check_proxies_parallel(proxies_list, max_concurrent: int = MAX_CONCURRENT_CHECKS,
                                  on_progress=None):
-    """
-    Shared session for all checks (single TCP pool).
-    on_progress(done, total, live_count) is throttled to PROGRESS_EDIT_INTERVAL.
-    """
     semaphore = asyncio.Semaphore(max_concurrent)
     timeout = aiohttp.ClientTimeout(total=PROXY_TIMEOUT, connect=PROXY_TIMEOUT / 2)
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json,text/plain,*/*'}
@@ -234,7 +270,9 @@ async def check_proxies_parallel(proxies_list, max_concurrent: int = MAX_CONCURR
     processed = []
     for i, res in enumerate(results):
         if isinstance(res, Exception):
-            processed.append((proxies_list[i], False, {"error": str(res)[:60]}))
+            # P5: an exception is "couldn't verify", not "dead" — None keeps
+            # the proxy in the DB instead of deleting it on a stray exception.
+            processed.append((proxies_list[i], None, {"error": str(res)[:60]}))
         else:
             processed.append(res)
     return processed
@@ -277,18 +315,22 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
     dead_count  = sum(1 for _, is_live, _ in results_list if is_live is False)
     unknown_count = sum(1 for _, is_live, _ in results_list if is_live is None)
 
-    # Parallel DB writes (was serial)
     live_entries = [p for (p, is_live, _) in results_list if is_live is True]
     if live_entries:
         add_results = await asyncio.gather(
             *[asyncio.to_thread(add_proxy, user_id, p['db_format']) for p in live_entries],
             return_exceptions=True,
         )
-        added_count = sum(1 for r in add_results if r is True)
-        clone_count = sum(1 for r in add_results if r is False)
+        added_count   = sum(1 for r in add_results if r is True)
+        clone_count   = sum(1 for r in add_results if r is False)
+        # P10: anything that isn't True/False (exception, None, unexpected) is
+        # a DB error — surface it instead of silently bucketing it as clone.
+        errored_count = len(add_results) - added_count - clone_count
     else:
+        add_results = []
         added_count = 0
         clone_count = 0
+        errored_count = 0
 
     is_bulk = total_count > 1
     if is_bulk:
@@ -300,6 +342,8 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
             f"<b>Clones ➛</b> <b>{clone_count}</b> 🔁\n"
             f"<b>Dead ➛</b> <b>{dead_count}</b> ⚠️"
         )
+        if errored_count:
+            caption += f"\n<b>DB Errors ➛</b> <b>{errored_count}</b> 🛑"
         if unknown_count:
             caption += f"\n<b>Unknown ➛</b> <b>{unknown_count}</b> ❔ (endpoints throttled)"
     else:
@@ -307,21 +351,38 @@ async def process_proxies_background(bot, message: types.Message, valid_proxies:
             proxy_data, is_live, info = results_list[0]
         else:
             proxy_data, is_live, info = valid_proxies[0], False, {}
+
+        single_result = add_results[0] if add_results else None
+
         if is_live is True:
             ip = info.get("ip") or proxy_data['ip']
-            if added_count > 0:
+            if isinstance(single_result, Exception):
+                caption = (
+                    f"<b>❌ DB Error</b>\n\n"
+                    f"<b>Status ➛ Live ✅</b>\n"
+                    f"<b>IP ➛</b> <code>{ip}</code>\n\n"
+                    f"<b>⚠️ {str(single_result)[:80]}</b>"
+                )
+            elif single_result is True:
                 caption = (
                     f"<b>✅ Success!</b>\n\n"
                     f"<b>Status ➛ Live ✅</b>\n"
                     f"<b>IP ➛</b> <code>{ip}</code>\n\n"
                     f"<b>💾 Saved to database</b>"
                 )
-            else:
+            elif single_result is False:
                 caption = (
                     f"<b>⚠️ Warning!</b>\n\n"
                     f"<b>Status ➛ Live ✅</b>\n"
                     f"<b>IP ➛</b> <code>{ip}</code>\n\n"
                     f"<b>🔁 Already exists in DB</b>"
+                )
+            else:
+                caption = (
+                    f"<b>❓ Uncertain</b>\n\n"
+                    f"<b>Status ➛ Live ✅</b>\n"
+                    f"<b>IP ➛</b> <code>{ip}</code>\n\n"
+                    f"<b>⚠️ Could not determine DB result</b>"
                 )
         elif is_live is False:
             error_msg = info.get("error", "Unknown")
@@ -371,16 +432,32 @@ async def check_db_proxies_background(bot, message: types.Message):
     )
 
     proxies_to_check = []
+    skipped_count = 0
+    # P1: legacy SOCKS entries can never work with aiohttp — remove them
+    # proactively rather than letting them rot in the DB.
+    socks_to_remove = []
     for p_str in proxies_str_list:
+        if is_socks_proxy_input(p_str):
+            socks_to_remove.append(p_str)
+            continue
         parsed = parse_proxy_input(p_str)
         if parsed:
             proxies_to_check.append(parsed)
+        else:
+            skipped_count += 1
 
     if not proxies_to_check:
-        await status_msg.edit_text(
-            "<b>⚠️ None of the saved proxies could be parsed.</b>",
-            parse_mode="HTML"
-        )
+        msg = "<b>⚠️ None of the saved proxies could be parsed.</b>"
+        if skipped_count:
+            msg += f"\n<b>Skipped ➛</b> <b>{skipped_count}</b>"
+        if socks_to_remove:
+            msg += f"\n<b>SOCKS (unsupported) ➛</b> <b>{len(socks_to_remove)}</b>"
+            # Clean them out of the DB
+            await asyncio.gather(
+                *[asyncio.to_thread(remove_proxy, user_id, s) for s in socks_to_remove],
+                return_exceptions=True,
+            )
+        await status_msg.edit_text(msg, parse_mode="HTML")
         return
 
     async def _progress(done, total, live):
@@ -412,10 +489,10 @@ async def check_db_proxies_background(bot, message: types.Message):
         else:  # None — keep
             unknown_proxies.append(proxy_data['db_format'])
 
-    # Parallel DB removal (was serial)
-    if dead_proxies:
+    to_remove = dead_proxies + socks_to_remove
+    if to_remove:
         await asyncio.gather(
-            *[asyncio.to_thread(remove_proxy, user_id, d) for d in dead_proxies],
+            *[asyncio.to_thread(remove_proxy, user_id, d) for d in to_remove],
             return_exceptions=True,
         )
 
@@ -425,6 +502,11 @@ async def check_db_proxies_background(bot, message: types.Message):
         f"<b>Live ➛</b> <b>{len(live_proxies)}</b> ✅\n"
         f"<b>Removed ➛</b> <b>{len(dead_proxies)}</b> 🗑️"
     )
+    if socks_to_remove:
+        caption += f"\n<b>SOCKS Removed ➛</b> <b>{len(socks_to_remove)}</b> (unsupported)"
+    if skipped_count:
+        # P7: show unparseable entries so totals reconcile.
+        caption += f"\n<b>Skipped ➛</b> <b>{skipped_count}</b> (unparseable)"
     if unknown_proxies:
         caption += f"\n<b>Unknown ➛</b> <b>{len(unknown_proxies)}</b> ❔ (kept)"
 
@@ -478,15 +560,20 @@ async def check_db_proxies_background(bot, message: types.Message):
 # COMMANDS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@router.message(F.text.regexp(r'^/proxy(?:\s|$)'))
+@router.message(
+    F.text.regexp(r'^/proxy(?:\s|$)') | F.caption.regexp(r'^/proxy(?:\s|$)')
+)
 async def proxy_command(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username or "Unknown"
     first_name = message.from_user.first_name or "User"
     await asyncio.to_thread(create_user, user_id, username)
 
+    # P4: caption-based messages have message.text = None.
+    full_text = message.text or message.caption or ""
+
     raw_text = ""
-    parts = message.text.split(maxsplit=1)
+    parts = full_text.split(maxsplit=1)
     if len(parts) > 1:
         raw_text += parts[1].strip() + "\n"
     if message.reply_to_message and message.reply_to_message.text:
@@ -516,6 +603,7 @@ async def proxy_command(message: types.Message):
             "<b>❌ Invalid Usage!</b>\n\n"
             "<b>How to use:</b>\n"
             "• <code>/proxy user:pass@host:port</code>\n"
+            "• <code>/proxy host:port</code> (no-auth)\n"
             "• Reply to a message containing proxies with <code>/proxy</code>\n"
             "• Or upload a .txt file with proxies and caption it <code>/proxy</code>",
             parse_mode="HTML"
@@ -524,24 +612,49 @@ async def proxy_command(message: types.Message):
 
     lines = raw_text.strip().split('\n')
     valid_proxies = []
+    socks_count = 0
     for line in lines:
-        proxy_data = parse_proxy_input(line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # P1: silently reject SOCKS but count for the warning.
+        if is_socks_proxy_input(stripped):
+            socks_count += 1
+            continue
+        proxy_data = parse_proxy_input(stripped)
         if proxy_data:
             valid_proxies.append(proxy_data)
 
     if not valid_proxies:
-        await message.reply("<b>⚠️ No valid proxies found.</b>", parse_mode="HTML")
+        msg = "<b>⚠️ No valid proxies found.</b>"
+        if socks_count:
+            msg += (
+                f"\n\n<b>❌ {socks_count} SOCKS proxies rejected.</b>\n"
+                f"<i>SOCKS is not supported — use HTTP(S) proxies.</i>"
+            )
+        await message.reply(msg, parse_mode="HTML")
         return
+
+    if socks_count:
+        await message.reply(
+            f"<b>⚠️ {socks_count} SOCKS proxies skipped.</b>\n"
+            f"<i>Only HTTP(S) proxies are supported.</i>",
+            parse_mode="HTML"
+        )
 
     asyncio.create_task(process_proxies_background(message.bot, message, valid_proxies))
 
 
-@router.message(F.text.regexp(r'^/checkproxy(?:\s|$)'))
+@router.message(
+    F.text.regexp(r'^/checkproxy(?:\s|$)') | F.caption.regexp(r'^/checkproxy(?:\s|$)')
+)
 async def checkproxy_command(message: types.Message):
     asyncio.create_task(check_db_proxies_background(message.bot, message))
 
 
-@router.message(F.text.regexp(r'^/clearproxy(?:\s|$)'))
+@router.message(
+    F.text.regexp(r'^/clearproxy(?:\s|$)') | F.caption.regexp(r'^/clearproxy(?:\s|$)')
+)
 async def clearproxy_command(message: types.Message):
     user_id = message.from_user.id
     deleted_count = await asyncio.to_thread(clear_proxies, user_id)
@@ -552,7 +665,9 @@ async def clearproxy_command(message: types.Message):
     await message.reply(msg, parse_mode="HTML")
 
 
-@router.message(F.text.regexp(r'^/myproxies(?:\s|$)'))
+@router.message(
+    F.text.regexp(r'^/myproxies(?:\s|$)') | F.caption.regexp(r'^/myproxies(?:\s|$)')
+)
 async def myproxies_command(message: types.Message):
     user_id = message.from_user.id
     count = await asyncio.to_thread(count_proxies, user_id)
@@ -576,7 +691,9 @@ async def myproxies_command(message: types.Message):
 # ADMIN: /rtvproxy
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@router.message(F.text.regexp(r'^/rtvproxy(?:\s|$)'))
+@router.message(
+    F.text.regexp(r'^/rtvproxy(?:\s|$)') | F.caption.regexp(r'^/rtvproxy(?:\s|$)')
+)
 async def rtvproxy_command(message: types.Message):
     """Admin-only: download every proxy in the database, grouped by user."""
     user = message.from_user
