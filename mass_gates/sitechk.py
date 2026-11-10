@@ -45,7 +45,7 @@ BAD_PROXIES = set()
 
 DEFAULT_MAX_PRICE = 5.0
 
-MAX_CONCURRENT_CHECKS = int(os.environ.get("SITECHK_CONCURRENCY", 100))
+MAX_CONCURRENT_CHECKS = int(os.environ.get("SITECHK_CONCURRENCY", 20))
 
 
 def _log(msg: str):
@@ -138,26 +138,39 @@ router = Router()
 
 
 async def _push_sites_after_change(label: str = "sitechk"):
+    """Post-mutation hook. Since v4.6.6 api.py is stateless and receives
+    `site` per-request, so the replica push is deprecated and a no-op.
+
+    v4.6.8: this hook must never crash — the audit result is already saved
+    to DB by the time it runs. Every optional step is now defensive.
+    """
     try:
-        from mass_gates.msh import invalidate_sites_cache
-        from shopify_api import push_sites_to_all_replicas
         from database import get_global_sites
-        invalidate_sites_cache()
         fresh = await asyncio.to_thread(get_global_sites)
         if not fresh:
-            logging.warning(f"[{label}] pool empty after mutation")
+            logging.info(f"[{label}] pool empty after mutation")
             return
-        result = await push_sites_to_all_replicas(fresh)
-        ok = sum(1 for r in result["results"].values() if r.get("ok"))
-        detail = {
-            host.split("//")[-1].split(".")[0]:
-                (r.get("pool_size") if r.get("ok") else r.get("error"))
-            for host, r in result["results"].items()
-        }
-        logging.info(f"[{label}] pushed {result['pushed']} sites to "
-                     f"{ok}/{len(result['results'])} replicas: {detail}")
+
+        # Optional cache invalidate — no-op if msh.py has no cache
+        try:
+            from mass_gates.msh import invalidate_sites_cache
+            invalidate_sites_cache()
+        except (ImportError, AttributeError):
+            pass
+
+        # Optional replica push — deprecated since api.py is stateless
+        try:
+            from shopify_api import push_sites_to_all_replicas
+            result = await push_sites_to_all_replicas(fresh)
+            if isinstance(result, dict):
+                ok = sum(1 for r in result.get("results", {}).values() if r.get("ok"))
+                logging.info(f"[{label}] pushed {result.get('pushed', 0)} sites to {ok} replicas")
+        except ImportError:
+            logging.debug(f"[{label}] push_to_replicas not available (stateless API)")
+
     except Exception as e:
-        logging.error(f"[{label}] push failed: {e}", exc_info=True)
+        # Non-fatal — audit results are already persisted
+        logging.warning(f"[{label}] post-mutation hook (non-critical): {e}")
 
 
 SITES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sites.txt")
@@ -566,6 +579,14 @@ def _get_sitechk_http_session():
 
 async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str,
                               validate_only: bool = False) -> dict:
+    """Query the API. Returns a dict with `error` set to None on a real
+    200-OK response, or to a transport-level code (PROXY_ERROR, TIMEOUT,
+    API_RATE_LIMITED, HTTP_401, …) otherwise.
+
+    v4.6.8: HTTP 429 from the API endpoint is now classified as
+    API_RATE_LIMITED and retried — it used to be treated as a site-level
+    death and silently pruned healthy sites during burst overload.
+    """
     try:
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
         api_proxy = normalize_proxy(proxy)
@@ -583,11 +604,13 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str,
         for server in servers_to_try:
             current_api = f"{server}/shopify"
             for key in [SHOPIFY_API_KEY, ALT_API_KEY]:
-                params = {"site": site_url, "cc": cc_formatted, "proxy": api_proxy_clean, "key": key}
+                params = {"site": site_url, "cc": cc_formatted,
+                          "proxy": api_proxy_clean, "key": key}
                 if validate_only:
                     params["validate_only"] = "true"
                 try:
-                    async with _http.get(current_api, params=params, timeout=timeout, ssl=False) as resp:
+                    async with _http.get(current_api, params=params,
+                                         timeout=timeout, ssl=False) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             response_msg = data.get("Response", "Unknown")
@@ -595,46 +618,65 @@ async def call_site_check_api(site_url: str, cc_formatted: str, proxy: str,
                             proxy_raw = data.get("Proxy", "Live")
                             gateway = data.get("Gateway", "")
                             status = data.get("Status", False)
-                            status_bool = status.lower() == "true" if isinstance(status, str) else bool(status)
+                            status_bool = (status.lower() == "true"
+                                           if isinstance(status, str) else bool(status))
                             proxy_status = "Live" if "live" in str(proxy_raw).lower() else "Dead"
                             return {
-                                "success": True, "response": response_msg, "price": price_str,
-                                "proxy_status": proxy_status, "gateway": gateway,
-                                "status": status_bool, "error": None
+                                "success": True, "response": response_msg,
+                                "price": price_str, "proxy_status": proxy_status,
+                                "gateway": gateway, "status": status_bool, "error": None,
                             }
-                        elif resp.status in (401, 403):
+
+                        # ---- v4.6.8: endpoint rate-limited ----
+                        if resp.status == 429:
+                            last_error = "API_RATE_LIMITED"
+                            last_resp_msg = "API Rate Limited (HTTP 429)"
+                            logging.debug(f"[SITECHK] API {server} rate-limited, retrying")
+                            continue  # try next key/server
+
+                        if resp.status in (401, 403):
                             last_error = f"HTTP_{resp.status}"
                             last_resp_msg = f"HTTP Error {resp.status}"
-                            continue
-                        else:
+                            continue  # try next key/server
+
+                        if resp.status >= 500:
                             last_error = f"HTTP_{resp.status}"
                             last_resp_msg = f"HTTP Error {resp.status}"
-                            break
+                            break  # try next server
+
+                        last_error = f"HTTP_{resp.status}"
+                        last_resp_msg = f"HTTP Error {resp.status}"
+                        break
                 except asyncio.CancelledError:
                     raise
                 except Exception as ex:
                     last_error = "CLIENT_ERROR"
                     last_resp_msg = str(ex)
                     break
+
         return {"success": False, "response": last_resp_msg, "price": "-1.0",
                 "proxy_status": "Live", "gateway": "", "error": last_error}
+
     except asyncio.TimeoutError:
         return {"success": False, "response": "Timeout Error", "price": "-1.0",
                 "proxy_status": "Dead", "gateway": "", "error": "TIMEOUT"}
     except aiohttp.ClientConnectorError as e:
         error_str = str(e).lower()
         if "proxy" in error_str or "tunnel" in error_str:
-            return {"success": False, "response": f"Proxy Error: {str(e)[:60]}", "price": "-1.0",
-                    "proxy_status": "Dead", "gateway": "", "error": "PROXY_ERROR"}
-        return {"success": False, "response": f"Connection Error: {str(e)[:60]}", "price": "-1.0",
-                "proxy_status": "Dead", "gateway": "", "error": "CONNECTION_ERROR"}
+            return {"success": False, "response": f"Proxy Error: {str(e)[:60]}",
+                    "price": "-1.0", "proxy_status": "Dead", "gateway": "",
+                    "error": "PROXY_ERROR"}
+        return {"success": False, "response": f"Connection Error: {str(e)[:60]}",
+                "price": "-1.0", "proxy_status": "Dead", "gateway": "",
+                "error": "CONNECTION_ERROR"}
     except aiohttp.ClientError as e:
-        return {"success": False, "response": f"Client Error: {str(e)[:60]}", "price": "-1.0",
-                "proxy_status": "Dead", "gateway": "", "error": "CLIENT_ERROR"}
+        return {"success": False, "response": f"Client Error: {str(e)[:60]}",
+                "price": "-1.0", "proxy_status": "Dead", "gateway": "",
+                "error": "CLIENT_ERROR"}
     except Exception as e:
-        return {"success": False, "response": f"Error: {str(e)[:60]}", "price": "-1.0",
-                "proxy_status": "Dead", "gateway": "", "error": "UNKNOWN_ERROR"}
-
+        return {"success": False, "response": f"Error: {str(e)[:60]}",
+                "price": "-1.0", "proxy_status": "Dead", "gateway": "",
+                "error": "UNKNOWN_ERROR"}
 
 async def call_stripe_check_api(site_url: str, cc_formatted: str, proxy: str) -> dict:
     try:
@@ -721,8 +763,19 @@ async def check_stripe_site_status(site_url: str) -> tuple:
 
 
 async def check_site_status(site_url: str, validate_only: bool = False) -> tuple:
+    """Classify a site as KEEP, REMOVE, or ERROR.
+
+    v4.6.8: separates three layers of failure that were conflated before:
+      * API-level transport (429/5xx/timeout/proxy) → retry with backoff,
+        then ERROR. Never treated as site death.
+      * Site-level throttle (THROTTLED, "429" in body, rate-limit messages)
+        → retry with a different proxy, then ERROR. Never treated as death.
+      * Site-level permanent death (NO_PRODUCT, login-required, 404, etc.)
+        → REMOVE.
+    """
     MAX_RETRIES = 3
     max_price = _get_max_price()
+
     for attempt in range(MAX_RETRIES):
         proxy = get_random_proxy()
         result = await call_site_check_api(
@@ -733,23 +786,40 @@ async def check_site_status(site_url: str, validate_only: bool = False) -> tuple
         price_str = result.get("price", "-1.0")
         error_type = result.get("error")
 
-        if error_type in ["PROXY_ERROR", "TIMEOUT"]:
-            mark_proxy_bad(proxy)
+        # ── Layer 1: API transport errors ──────────────────────────────
+        if error_type in ("PROXY_ERROR", "TIMEOUT", "HTTP_429",
+                          "API_RATE_LIMITED", "CONNECTION_ERROR",
+                          "CLIENT_ERROR", "UNKNOWN_ERROR"):
+            if error_type == "PROXY_ERROR":
+                mark_proxy_bad(proxy)
             if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(2 ** attempt)   # 1s, 2s, 4s
                 continue
+            return site_url, "ERROR", {"Price": -1.0}, f"API unavailable: {response_msg}"
 
-        is_dead = False
+        if error_type in ("HTTP_401", "HTTP_403"):
+            return site_url, "ERROR", {"Price": -1.0}, f"API auth: {response_msg}"
+
+        if error_type in ("JSON_PARSE_ERROR", "HTTP_500", "HTTP_502",
+                          "HTTP_503", "HTTP_504", "HTTP_404"):
+            return site_url, "REMOVE", {"Price": -1.0}, response_msg
+
+        # ── Layer 2: site-level throttle (transient) ──────────────────
         response_lower = response_msg.lower()
+        if any(k in response_lower
+               for k in ("throttled", "too many requests", "rate limit", "429")):
+            if attempt < MAX_RETRIES - 1:
+                mark_proxy_bad(proxy)             # force different proxy on retry
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return site_url, "ERROR", {"Price": -1.0}, f"Site throttled: {response_msg}"
+
+        # ── Layer 3: site-level permanent death ───────────────────────
+        is_dead = False
         for err in DEAD_ERRORS:
             if err.lower() in response_lower:
                 is_dead = True
                 break
-
-        if not result.get("success"):
-            if error_type in ["JSON_PARSE_ERROR", "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_404"]:
-                is_dead = True
-
         if is_dead:
             return site_url, "REMOVE", {"Price": -1.0}, response_msg
 
@@ -764,12 +834,15 @@ async def check_site_status(site_url: str, validate_only: bool = False) -> tuple
                         actual_price = -1.0
 
             if not (0.00 <= actual_price <= max_price):
-                return site_url, "REMOVE", {"Price": actual_price}, f"Price ${actual_price:.2f} (> ${max_price:.2f} Rejected) | {response_msg}"
+                return site_url, "REMOVE", {"Price": actual_price}, \
+                       f"Price ${actual_price:.2f} (> ${max_price:.2f} Rejected) | {response_msg}"
 
             if validate_only:
-                return site_url, "KEEP", {"Price": actual_price}, f"${actual_price:.2f} | {response_msg}"
+                return site_url, "KEEP", {"Price": actual_price}, \
+                       f"${actual_price:.2f} | {response_msg}"
 
-            FAKE_CARDS = ["4003035140199121|11|29|470", "4400666318254873|03|27|336"]
+            FAKE_CARDS = ["4003035140199121|11|29|470",
+                          "4400666318254873|03|27|336"]
             fake_results = await asyncio.gather(
                 *[call_site_check_api(site_url=site_url, cc_formatted=fc, proxy=proxy)
                   for fc in FAKE_CARDS],
@@ -782,16 +855,18 @@ async def check_site_status(site_url: str, validate_only: bool = False) -> tuple
                     for k in ["thank you", "order_placed", "charged", "order_paid"]
                 )
             )
-
             if fake_charged >= 1:
-                return site_url, "REMOVE", {"Price": actual_price}, f"Fake Charge Detected (Fake Card Approved) | {response_msg}"
+                return site_url, "REMOVE", {"Price": actual_price}, \
+                       f"Fake Charge Detected (Fake Card Approved) | {response_msg}"
 
-            return site_url, "KEEP", {"Price": actual_price}, f"${actual_price:.2f} | {response_msg}"
+            return site_url, "KEEP", {"Price": actual_price}, \
+                   f"${actual_price:.2f} | {response_msg}"
 
         if result.get("success"):
             return site_url, "KEEP", {"Price": 0.0}, f"Unknown Response: {response_msg}"
 
         return site_url, "REMOVE", {"Price": -1.0}, response_msg
+
     return site_url, "ERROR", {"Price": -1.0}, "Max Retries Reached"
 
 
@@ -890,7 +965,11 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             working_sites_content.append(f"{site} | Price: {price} | Response: {resp_msg}")
         else:
             dead_count += 1
-            failed_sites.append(site)
+            # Only prune user_sites for PROVABLY dead sites. ERROR status
+            # means we couldn't verify (transient API failure) — leave the
+            # user's list untouched so a later audit can retry.
+            if status == "REMOVE":
+                failed_sites.append(site)
 
         current_time = time.time()
         if (current_time - MIN_EDIT_INTERVAL > last_edit_time) or (checked_count % CHECKS_PER_UPDATE == 0):
@@ -990,7 +1069,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
                     "",
                     f"<b>Total Checked:</b> <code>{len(sites_to_check)}</code>",
                     f"<b>Kept ({price_label}):</b> <code>{len(final_unique_sites)}</code> <tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji>",
-                    f"<b>Wiped from DB:</b> <code>{dead_count}</code> <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>",
+                    f"<b>Removed:</b> <code>{dead_count}</code> <tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji>",
                 ]
                 if (duplicate_count + removed_dupes) > 0:
                     completed_lines.append(
