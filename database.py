@@ -21,6 +21,49 @@ v2.1 — bug fixes 1–18 from audit:
  16.  ISO dates with Z suffix parse on Python < 3.11
  17.  DB_CONFIG wired up as fallback when no URI env present
  18.  Dead compat shims annotated
+
+v2.2 — performance fixes (Patches 1–15 from the runtime-logs audit):
+
+  THE CRASH: `_SQLiteFindCursor.sort() takes 2 positional arguments but
+  3 were given`. Every read path that used `.sort("field", 1)` against
+  SQLite — get_user_sites_db, get_proxies, get_user_stripe_sites_db,
+  get_charge_leaderboard — was throwing this TypeError, so those reads
+  returned empty lists. That is why msh.py fell back to sites.txt and
+  showed "no sites available" even after sitechk.py saved them.
+
+  Patch  1. _SQLiteFindCursor.sort now accepts every pymongo signature:
+            .sort(spec), .sort(spec, direction), .sort(tuple), .sort(list).
+  Patch  2. NoOpCache → real _TTLCache. The caches for gate status,
+            premium status, and user credits were never wired up — the
+            placeholder class silently discarded every value, so every
+            /msh card hit MongoDB three times unnecessarily.
+  Patch  3. is_gate_enabled uses the cache.
+  Patch  4. set_gate_status invalidates the gate cache.
+  Patch  5. get_user_credits uses the cache.
+  Patch  6. update_credits / deduct_credits_atomic invalidate the cache.
+  Patch  7. get_premium_status uses the cache.
+  Patch  8. set_premium / claim_code / claim_plan_key invalidate the
+            premium cache.
+  Patch  9. Faster SQLite PRAGMAs: synchronous=NORMAL, temp_store=MEMORY,
+            cache_size=-64000 (64 MB), mmap_size=256 MB. ~5-10× faster
+            writes under WAL, and faster scans for /sitechk audits.
+  Patch 10. _get_sqlite_conn is now thread-safe (double-checked lock).
+            Two concurrent first-time callers used to race and create
+            two connections to the same file.
+  Patch 11. SQLiteCollectionShim caches PRAGMA table_info results.
+            Before: every insert_one / update_one ran an extra PRAGMA.
+            After: zero PRAGMA calls once a collection is first touched.
+  Patch 12. SQLiteCollectionShim gains insert_many (one transaction per
+            batch instead of one commit per doc).
+  Patch 13. set_global_sites / add_global_sites / set_global_stripe_sites
+            / add_global_stripe_sites use insert_many instead of a
+            loop-of-upserts. 65 sites = 1 round trip, not 65.
+  Patch 14. _migrate_numeric_and_date_fields runs once per DB, not once
+            per restart. Marker stored in `settings`.
+  Patch 15. _convert_dates_in_doc only parses known date-field names.
+            Prevents accidental type drift (a username that looks like
+            an ISO timestamp was being converted to datetime), and is
+            faster because it skips the parse on every non-date string.
 """
 
 import os
@@ -31,6 +74,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -281,33 +325,56 @@ def _sqlite_create_table(conn: sqlite3.Connection, name: str):
 
 
 def _get_sqlite_conn() -> sqlite3.Connection:
+    """
+    Patch 9 & 10: thread-safe first-time init + faster PRAGMAs.
+
+    The previous version:
+      * could race two threads creating two connections to the same file
+      * used SQLite defaults (synchronous=FULL, 2 MB cache, no mmap) which
+        made /sitechk audits and global_sites writes several times slower
+        than necessary.
+    """
     global _sqlite_conn
     if _sqlite_conn is not None:
         return _sqlite_conn
-    db_path = os.environ.get("SQLITE_PATH", "freshbot.db")
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-
-    conn.create_function(
-        "NOW", 0,
-        lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
-    conn.create_function(
-        "CURRENT_TIMESTAMP_PG", 0,
-        lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
-
     with _SQLITE_LOCK:
+        if _sqlite_conn is not None:
+            return _sqlite_conn
+        db_path = os.environ.get("SQLITE_PATH", "freshbot.db")
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        # NORMAL is safe under WAL (fsync only on checkpoint) and ~5–10×
+        # faster writes than FULL. What most production SQLite deployments
+        # use.
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # Temp tables in RAM — speeds up COUNT/GROUP BY and sort spills.
+        conn.execute("PRAGMA temp_store=MEMORY")
+        # 64 MB page cache instead of 2 MB default. Big win for global_sites
+        # and user_sites scans that touch thousands of rows.
+        conn.execute("PRAGMA cache_size=-64000")
+        # 256 MB memory-mapped I/O — the OS serves reads from page cache
+        # without a syscall per row.
+        conn.execute("PRAGMA mmap_size=268435456")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        conn.create_function(
+            "NOW", 0,
+            lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        conn.create_function(
+            "CURRENT_TIMESTAMP_PG", 0,
+            lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
         for name in list(_SQLITE_TABLE_SCHEMAS.keys()):
             _sqlite_create_table(conn, name)
         for gate in ["ST", "STR", "PF", "VBV", "FT", "BL", "PP", "AT", "PW", "PYU"]:
             _sqlite_create_table(conn, f"{gate}_stats")
         conn.commit()
-    _sqlite_conn = conn
+        _sqlite_conn = conn
     logger.info(f"SQLite fallback connected: {db_path}")
-    return conn
+    return _sqlite_conn
 
 
 # ───────────────────────────────────────────────────────────────
@@ -459,8 +526,28 @@ class _SQLiteFindCursor:
         self._limit = None
         self._skip = None
 
-    def sort(self, spec):
-        self._sort = spec
+    def sort(self, spec, direction=None):
+        """
+        Patch 1: accept every pymongo sort signature so
+        `.sort("_id", 1)` (used by get_user_sites_db, get_proxies,
+        get_user_stripe_sites_db, get_charge_leaderboard, get_stats,
+        get_all_proxies_with_users) no longer raises
+            TypeError: sort() takes 2 positional arguments but 3 were given
+        which was crashing those reads and making msh.py see an empty site
+        pool.
+        """
+        if direction is not None:
+            # .sort("field", 1)  or  .sort("field", -1)
+            self._sort = [(str(spec), int(direction))]
+        elif isinstance(spec, str):
+            # .sort("field") — pymongo defaults to ascending
+            self._sort = [(spec, 1)]
+        elif isinstance(spec, tuple):
+            # .sort(("field", 1))
+            self._sort = [spec]
+        else:
+            # .sort([("f1", 1), ("f2", -1)])  or  .sort([])
+            self._sort = list(spec)
         return self
 
     def limit(self, n):
@@ -499,6 +586,16 @@ class _SQLiteFindCursor:
 
 
 class SQLiteCollectionShim:
+    """
+    Patch 11: PRAGMA table_info results are now cached per collection
+    name. Previously every insert_one / update_one / replace_one called
+    `_ensure_columns`, which ran an extra `PRAGMA table_info` on every
+    write — one extra statement per write. The cache makes subsequent
+    writes PRAGMA-free.
+    """
+    _columns_cache: Dict[str, set] = {}
+    _columns_lock = threading.Lock()
+
     def __init__(self, conn: sqlite3.Connection, name: str):
         self.conn = conn
         self.name = name
@@ -511,24 +608,38 @@ class SQLiteCollectionShim:
         return cur.fetchone() is not None
 
     def _existing_columns(self) -> List[str]:
+        with self._columns_lock:
+            cached = self._columns_cache.get(self.name)
+            if cached is not None:
+                return list(cached)
         if not self._table_exists():
             _sqlite_create_table(self.conn, self.name)
             self.conn.commit()
         cur = self.conn.execute(f'PRAGMA table_info("{self.name}")')
-        return [row[1] for row in cur.fetchall()]
+        cols = set(row[1] for row in cur.fetchall())
+        with self._columns_lock:
+            self._columns_cache[self.name] = cols
+        return list(cols)
 
     def _ensure_columns(self, doc: dict):
         existing = set(self._existing_columns())
         for col in doc.keys():
-            if col not in existing and not col.startswith("$"):
-                if self.name == "pending_feedback" and col not in ("_id", "created_at", "_data"):
-                    continue
-                try:
-                    self.conn.execute(
-                        f'ALTER TABLE "{self.name}" ADD COLUMN "{col}" TEXT'
-                    )
-                except sqlite3.OperationalError:
-                    pass
+            if col in existing or col.startswith("$"):
+                continue
+            if self.name == "pending_feedback" and col not in ("_id", "created_at", "_data"):
+                continue
+            try:
+                self.conn.execute(
+                    f'ALTER TABLE "{self.name}" ADD COLUMN "{col}" TEXT'
+                )
+                existing.add(col)
+            except sqlite3.OperationalError as e:
+                # Concurrent writer may have added it between our read
+                # and our ALTER — treat that as success.
+                if "duplicate" in str(e).lower():
+                    existing.add(col)
+        with self._columns_lock:
+            self._columns_cache[self.name] = existing
 
     def _row_to_doc(self, cols, row) -> Dict[str, Any]:
         doc: Dict[str, Any] = {}
@@ -600,6 +711,76 @@ class SQLiteCollectionShim:
             cur = self.conn.execute(sql, vals)
             self.conn.commit()
         return _SQLiteInsertResult(inserted_id=cur.lastrowid)
+
+    def insert_many(self, docs, ordered=True):
+        """
+        Patch 12: real batch insert. One transaction for the whole batch
+        instead of one commit per document. Callers like set_global_sites
+        and add_global_sites write 65+ rows per /sitechk — previously that
+        was 65 commits; now it is one.
+        """
+        if not docs:
+            return []
+
+        # Prepare docs outside the transaction so _ensure_columns's ALTER
+        # TABLE + commit does not mix with our BEGIN.
+        prepared = []
+        for doc in docs:
+            doc = dict(doc)
+            if self.name == "pending_feedback":
+                data = {k: v for k, v in doc.items()
+                        if k not in ("_id", "created_at", "_data")}
+                row = {
+                    "_id": doc.get("_id"),
+                    "created_at": _adapt_sqlite_value(doc.get("created_at")),
+                    "_data": json.dumps(data, default=str),
+                }
+                prepared.append(("pending", row))
+            else:
+                self._ensure_columns(doc)
+                cols = [k for k in doc.keys() if not k.startswith("$")]
+                vals = [_adapt_sqlite_value(doc[k]) for k in cols]
+                prepared.append(("standard", (cols, vals)))
+
+        results: List[Any] = []
+        with _SQLITE_LOCK:
+            try:
+                self.conn.execute("BEGIN")
+                for kind, payload in prepared:
+                    try:
+                        if kind == "pending":
+                            row = payload
+                            cols = list(row.keys())
+                            ph = ",".join(["?"] * len(cols))
+                            sql = (
+                                f'INSERT OR REPLACE INTO "{self.name}" '
+                                f'({",".join(cols)}) VALUES ({ph})'
+                            )
+                            cur = self.conn.execute(sql, [row[c] for c in cols])
+                            results.append(_SQLiteInsertResult(inserted_id=cur.lastrowid))
+                        else:
+                            cols, vals = payload
+                            ph = ",".join(["?"] * len(cols))
+                            sql = (
+                                f'INSERT INTO "{self.name}" '
+                                f'({",".join(chr(34)+c+chr(34) for c in cols)}) '
+                                f'VALUES ({ph})'
+                            )
+                            cur = self.conn.execute(sql, vals)
+                            results.append(_SQLiteInsertResult(inserted_id=cur.lastrowid))
+                    except Exception as e:
+                        if ordered:
+                            raise
+                        logger.warning(f"[SQLite] insert_many skipped doc: {e}")
+                        results.append(None)
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                raise
+        return results
 
     def replace_one(self, filter_dict: dict, doc: dict, upsert: bool = False):
         # FIX #7: atomic delete + insert inside one transaction
@@ -721,6 +902,8 @@ class SQLiteCollectionShim:
         with _SQLITE_LOCK:
             self.conn.execute(f'DROP TABLE IF EXISTS "{self.name}"')
             self.conn.commit()
+        with self._columns_lock:
+            self._columns_cache.pop(self.name, None)
 
 
 class SQLiteDBShim:
@@ -1104,15 +1287,27 @@ def health_check() -> bool:
         return False
 
 
-# FIX #16: Z-suffix aware date conversion
+# ───────────────────────────────────────────────────────────────
+# Patch 15: restrict date parsing to known date-field names.
+# Faster (skips parse on usernames / URLs), and prevents accidental
+# type drift when a string that happens to look like an ISO timestamp
+# is not actually a date field.
+# ───────────────────────────────────────────────────────────────
+_DATE_FIELDS = frozenset({
+    "joined_at", "premium_expiry",
+    "purchased_on", "expires_on",
+    "created_at", "claimed_at",
+    "added_at", "updated_at", "banned_at", "granted_at",
+})
+
+
 def _convert_dates_in_doc(doc):
     if isinstance(doc, dict):
         for key, value in doc.items():
-            if isinstance(value, str):
-                if "T" in value and ":" in value and "-" in value:
-                    parsed = _parse_iso_datetime(value)
-                    if parsed is not None:
-                        doc[key] = parsed
+            if key in _DATE_FIELDS and isinstance(value, str):
+                parsed = _parse_iso_datetime(value)
+                if parsed is not None:
+                    doc[key] = parsed
             elif isinstance(value, dict):
                 _convert_dates_in_doc(value)
             elif isinstance(value, list):
@@ -1186,7 +1381,6 @@ def _parse_where(where_clause: str) -> Dict[str, Any]:
         where_clause = between_pattern.sub("", where_clause).strip()
         while where_clause.startswith("AND "):
             where_clause = where_clause[4:].strip()
-        # trim a dangling leading '(' or stray ')'
         while where_clause.startswith("(") and ")" not in where_clause:
             where_clause = where_clause[1:].strip()
         if not where_clause:
@@ -2050,24 +2244,75 @@ def _release_connection(conn):
         conn.close()
 
 
-class NoOpCache(dict):
+# ───────────────────────────────────────────────────────────────
+# Patch 2: real TTL cache
+#
+# The previous NoOpCache silently discarded every value, so the three
+# "cache" variables that hold gate status, premium status, and user
+# credits were effectively dead code. Every /msh card hit the DB three
+# times for data that changes slowly.
+# ───────────────────────────────────────────────────────────────
+class _TTLCache:
     """
-    FIX #18: no-op cache used as a placeholder. Real caching (if needed)
-    should go through an LRU or Redis-backed cache, not this class.
+    Minimal thread-safe TTL cache for hot-path reads:
+      * gate status    — read on every command
+      * user premium   — read on every command
+      * user credits   — read on every check
+
+    `get()` returns the default on miss OR on expiry — callers must
+    distinguish a cached falsy value (False / 0) from a miss, which
+    every caller in this module does with `is not None`.
     """
-    def get(self, key, default=None): return None
-    def __getitem__(self, key): raise KeyError(key)
-    def __setitem__(self, key, value): pass
-    def pop(self, key, default=None): return None
-    def clear(self): pass
+    def __init__(self, ttl: float):
+        self._ttl = ttl
+        self._data: Dict[Any, Tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return default
+            expires, value = entry
+            if time.time() >= expires:
+                self._data.pop(key, None)
+                return default
+            return value
+
+    def set(self, key, value, ttl: Optional[float] = None):
+        with self._lock:
+            expires = time.time() + (ttl if ttl is not None else self._ttl)
+            self._data[key] = (expires, value)
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
+
+    def __getitem__(self, key):
+        v = self.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def pop(self, key, default=None):
+        with self._lock:
+            entry = self._data.pop(key, None)
+            return entry[1] if entry else default
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+    def invalidate(self, key):
+        self.pop(key)
 
 
-_gate_cache = NoOpCache()
 _gate_cache_ttl = 30
-_credits_cache = NoOpCache()
 _credits_cache_ttl = 5
-_premium_cache = NoOpCache()
 _premium_cache_ttl = 60
+
+_gate_cache    = _TTLCache(_gate_cache_ttl)
+_credits_cache = _TTLCache(_credits_cache_ttl)
+_premium_cache = _TTLCache(_premium_cache_ttl)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2194,10 +2439,21 @@ def ensure_stats_table(gate_name: str):
 
 
 def _migrate_numeric_and_date_fields():
+    """
+    Patch 14: run once per DB, not once per restart.
+
+    The previous version scanned users + receipts + codes + plan_keys
+    on every boot. With 10k users that was ~10k find + update calls per
+    restart. The marker in `settings` skips the whole thing after the
+    first successful run.
+    """
     if _DB_BACKEND != "mongodb":
         return
     try:
         db = _get_db()
+        marker = db.settings.find_one({"key": "_migration_v22_done"})
+        if marker:
+            return
         numeric_fields = ["credits", "is_premium", "cc_checked", "cc_charged"]
         date_fields = ["joined_at", "premium_expiry"]
         for field in numeric_fields:
@@ -2230,7 +2486,16 @@ def _migrate_numeric_and_date_fields():
                     coll.update_one({"_id": doc["_id"]}, {"$set": {"claimed_at": new_val}})
                 except Exception:
                     pass
-        logger.info("Numeric and date field migration completed")
+        db.settings.update_one(
+            {"key": "_migration_v22_done"},
+            {"$set": {
+                "key": "_migration_v22_done",
+                "value": 1,
+                "updated_at": datetime.now(),
+            }},
+            upsert=True,
+        )
+        logger.info("Numeric and date field migration completed (one-shot)")
     except Exception as e:
         logger.warning(f"Migration skipped: {e}")
 
@@ -2298,29 +2563,41 @@ def create_user(user_id: int, username: str, first_name: str = "User", initial_c
         )
         if getattr(result, "upserted_id", None):
             logger.info(f"Created user {user_id} ({username})")
+            _credits_cache.set(str(user_id), int(initial_credits))
+            _premium_cache.pop(str(user_id))
     except Exception as e:
         logger.error(f"Error creating user {user_id}: {e}")
 
 
 def get_user_credits(user_id: int) -> int:
+    # Patch 5: cache hits eliminate ~1 DB read per card check
+    key = str(user_id)
+    cached = _credits_cache.get(key)
+    if cached is not None:
+        return cached
     try:
         db = _get_db()
         user = db.users.find_one({"user_id": user_id}, {"credits": 1})
-        return user.get("credits", 0) if user else 0
+        value = int(user.get("credits", 0)) if user else 0
+        _credits_cache.set(key, value)
+        return value
     except Exception as e:
         logger.error(f"Error fetching credits for user {user_id}: {e}")
         return 0
 
 
 def update_credits(user_id: int, new_credits: int):
+    # Patch 6: invalidate cache after write
     try:
         db = _get_db()
         db.users.update_one({"user_id": user_id}, {"$set": {"credits": new_credits}})
+        _credits_cache.set(str(user_id), int(new_credits))
     except Exception as e:
         logger.error(f"Error updating credits for user {user_id}: {e}")
 
 
 def deduct_credits_atomic(user_id: int, amount: int) -> int:
+    # Patch 6: invalidate cache after write
     try:
         db = _get_db()
         result = db.users.find_one_and_update(
@@ -2329,7 +2606,9 @@ def deduct_credits_atomic(user_id: int, amount: int) -> int:
             return_document=True,
         )
         if result:
-            return result.get("credits", 0)
+            new_val = int(result.get("credits", 0))
+            _credits_cache.set(str(user_id), new_val)
+            return new_val
         return -1
     except Exception as e:
         logger.error(f"Error deducting credits for user {user_id}: {e}")
@@ -2337,12 +2616,18 @@ def deduct_credits_atomic(user_id: int, amount: int) -> int:
 
 
 def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
+    # Patch 7: cache hits eliminate ~1 DB read per command
+    key = str(user_id)
+    cached = _premium_cache.get(key)
+    if cached is not None:
+        return cached
     try:
         db = _get_db()
         user = db.users.find_one(
             {"user_id": user_id}, {"is_premium": 1, "premium_expiry": 1}
         )
         if not user:
+            _premium_cache.set(key, (False, None))
             return (False, None)
         is_premium = user.get("is_premium", 0)
         expiry = user.get("premium_expiry")
@@ -2354,12 +2639,15 @@ def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
                 expiry = None
         if is_premium and expiry:
             if datetime.now() < expiry:
-                return (True, expiry)
+                result = (True, expiry)
+                _premium_cache.set(key, result)
+                return result
             # FIX #2: expire the flag but do NOT wipe credits
             db.users.update_one(
                 {"user_id": user_id},
                 {"$set": {"is_premium": 0, "premium_expiry": None}},
             )
+            _premium_cache.set(key, (False, None))
             return (False, None)
         # FIX #2: corrupt state (is_premium=1 but no expiry) — clear the flag
         if is_premium and not expiry:
@@ -2367,6 +2655,7 @@ def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
                 {"user_id": user_id},
                 {"$set": {"is_premium": 0, "premium_expiry": None}},
             )
+        _premium_cache.set(key, (False, None))
         return (False, None)
     except Exception as e:
         logger.error(f"Error fetching premium status for user {user_id}: {e}")
@@ -2374,6 +2663,7 @@ def get_premium_status(user_id: int) -> Tuple[bool, Optional[datetime]]:
 
 
 def set_premium(user_id: int, days: int) -> bool:
+    # Patch 8: invalidate premium cache after write
     try:
         expiry = datetime.now() + timedelta(days=days)
         db = _get_db()
@@ -2392,6 +2682,7 @@ def set_premium(user_id: int, days: int) -> bool:
             if result.matched_count == 0:
                 logger.error(f"[set_premium] still could not update user {user_id}")
                 return False
+        _premium_cache.pop(str(user_id))
         logger.info(f"Set premium for user {user_id} for {days} days")
         return True
     except Exception as e:
@@ -2400,6 +2691,10 @@ def set_premium(user_id: int, days: int) -> bool:
 
 
 def is_gate_enabled(gate: str) -> bool:
+    # Patch 3: cache hits eliminate ~1 DB read per command
+    cached = _gate_cache.get(gate)
+    if cached is not None:
+        return cached
     try:
         db = _get_db()
         # FIX #14: read first, upsert only if missing (avoids write on every call)
@@ -2410,14 +2705,18 @@ def is_gate_enabled(gate: str) -> bool:
                 {"$setOnInsert": {"gate": gate, "is_enabled": 1, "updated_at": datetime.now()}},
                 upsert=True,
             )
+            _gate_cache.set(gate, True)
             return True
-        return bool(status.get("is_enabled", 1))
+        result = bool(status.get("is_enabled", 1))
+        _gate_cache.set(gate, result)
+        return result
     except Exception as e:
         logger.error(f"Error checking gate status for {gate}: {e}")
         return True
 
 
 def set_gate_status(gate: str, enabled: bool) -> bool:
+    # Patch 4: invalidate cache after write
     try:
         db = _get_db()
         db.gate_status.update_one(
@@ -2425,6 +2724,7 @@ def set_gate_status(gate: str, enabled: bool) -> bool:
             {"$set": {"is_enabled": int(enabled), "updated_at": datetime.now()}},
             upsert=True,
         )
+        _gate_cache.set(gate, bool(enabled))
         logger.info(f"Set gate {gate} to {'enabled' if enabled else 'disabled'}")
         return True
     except Exception as e:
@@ -2574,6 +2874,8 @@ def claim_code(user_id: int, code: str) -> Tuple[bool, str]:
                 {"$set": {"claimed_by": None, "claimed_at": None}},
             )
             return False, "User not found. Use /start first."
+        # Patch 8: invalidate premium cache
+        _premium_cache.pop(str(user_id))
         return True, f"Code redeemed! Premium extended by {duration} days."
     except Exception as e:
         logger.error(f"Error claiming code {code} for user {user_id}: {e}")
@@ -2637,6 +2939,8 @@ def claim_plan_key(user_id: int, key: str) -> Tuple[bool, str]:
                 {"$set": {"claimed_by": None, "claimed_at": None}},
             )
             return False, "User not found. Use /start first."
+        # Patch 8: invalidate premium cache
+        _premium_cache.pop(str(user_id))
         return True, f"Key redeemed! Premium extended by {duration} days."
     except Exception as e:
         logger.error(f"Error claiming plan key {key} for user {user_id}: {e}")
@@ -2957,15 +3261,19 @@ def get_global_sites() -> List[str]:
 
 
 def set_global_sites(sites: List[str]) -> int:
+    # Patch 13: one insert_many instead of N inserts
     try:
         db = _get_db()
         # FIX #5: delete_many keeps the unique index intact
         db.global_sites.delete_many({})
         docs = []
         if sites:
-            docs = [{"url": s.strip(), "added_at": datetime.now()} for s in sites if s and s.strip()]
-            for d in docs:
-                db.global_sites.insert_one(d)
+            docs = [
+                {"url": s.strip(), "added_at": datetime.now()}
+                for s in sites if s and s.strip()
+            ]
+            if docs:
+                db.global_sites.insert_many(docs, ordered=False)
         return len(docs)
     except Exception as e:
         logger.error(f"Error setting global sites: {e}")
@@ -2973,23 +3281,26 @@ def set_global_sites(sites: List[str]) -> int:
 
 
 def add_global_sites(sites: List[str]) -> int:
+    # Patch 13: read all existing in one shot, then insert_many the fresh ones
     added = 0
     try:
         db = _get_db()
+        normalized = []
         for s in sites:
             s = str(s).strip()
             if not s:
                 continue
             if not s.startswith(("http://", "https://")):
                 s = "https://" + s
-            s = s.rstrip("/").lower()
-            result = db.global_sites.update_one(
-                {"url": s},
-                {"$setOnInsert": {"url": s, "added_at": datetime.now()}},
-                upsert=True,
-            )
-            if getattr(result, "upserted_id", None):
-                added += 1
+            normalized.append(s.rstrip("/").lower())
+        if not normalized:
+            return 0
+        existing = {d["url"] for d in db.global_sites.find({}, {"url": 1, "_id": 0})}
+        fresh = [u for u in normalized if u not in existing]
+        if fresh:
+            docs = [{"url": u, "added_at": datetime.now()} for u in fresh]
+            db.global_sites.insert_many(docs, ordered=False)
+            added = len(fresh)
         return added
     except Exception as e:
         logger.error(f"Error adding global sites: {e}")
@@ -3018,16 +3329,19 @@ def get_global_stripe_sites() -> List[str]:
 
 
 def set_global_stripe_sites(sites: List[str]) -> int:
+    # Patch 13
     try:
         db = _get_db()
         # FIX #5: delete_many keeps the unique index intact
         db.global_stripe_sites.delete_many({})
         docs = []
         if sites:
-            docs = [{"url": s.strip(), "added_at": datetime.now()}
-                    for s in sites if s and s.strip()]
-            for d in docs:
-                db.global_stripe_sites.insert_one(d)
+            docs = [
+                {"url": s.strip(), "added_at": datetime.now()}
+                for s in sites if s and s.strip()
+            ]
+            if docs:
+                db.global_stripe_sites.insert_many(docs, ordered=False)
         return len(docs)
     except Exception as e:
         logger.error(f"Error setting global stripe sites: {e}")
@@ -3035,23 +3349,26 @@ def set_global_stripe_sites(sites: List[str]) -> int:
 
 
 def add_global_stripe_sites(sites: List[str]) -> int:
+    # Patch 13
     added = 0
     try:
         db = _get_db()
+        normalized = []
         for s in sites:
             s = str(s).strip()
             if not s:
                 continue
             if not s.startswith(("http://", "https://")):
                 s = "https://" + s
-            s = s.rstrip("/").lower()
-            result = db.global_stripe_sites.update_one(
-                {"url": s},
-                {"$setOnInsert": {"url": s, "added_at": datetime.now()}},
-                upsert=True,
-            )
-            if getattr(result, "upserted_id", None):
-                added += 1
+            normalized.append(s.rstrip("/").lower())
+        if not normalized:
+            return 0
+        existing = {d["url"] for d in db.global_stripe_sites.find({}, {"url": 1, "_id": 0})}
+        fresh = [u for u in normalized if u not in existing]
+        if fresh:
+            docs = [{"url": u, "added_at": datetime.now()} for u in fresh]
+            db.global_stripe_sites.insert_many(docs, ordered=False)
+            added = len(fresh)
         return added
     except Exception as e:
         logger.error(f"Error adding global stripe sites: {e}")
