@@ -158,6 +158,15 @@ def _start_msh_gc():
 
 _start_msh_gc()
 
+def invalidate_sites_cache():
+    """No-op: msh.py reads `global_sites` from DB on every `get_sites()`
+    call, so there is no cache to invalidate.
+
+    Kept for backward compatibility with sitechk.py, which imports this
+    by name. Removing it would break sitechk.py's import at module load.
+    """
+    pass
+
 
 router = Router()
 
