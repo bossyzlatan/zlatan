@@ -247,7 +247,7 @@ def _db_clear_global_stripe_sites():
         return None
 
 
-# ─── NEW: cross-user site cleanup helpers (used by /clearsite and /sitechk) ───
+# ─── Cross-user site cleanup helpers (used by /clearsite and /sitechk) ───
 
 def _db_clear_all_user_sites():
     """Delete every row from user_sites across all users."""
@@ -378,16 +378,34 @@ def read_sites():
 
 
 def write_sites(sites_list):
-    if _db_write_global_sites(sites_list):
-        return len(set(sites_list))
-    return _txt_write_sites(sites_list)
+    """
+    v4.6.6 fix (Fix 3): write to DB *and* mirror to sites.txt.
+
+    The previous version returned early on the DB path, leaving sites.txt
+    empty. msh.py's get_sites() (pre-Fix-1) read sites.txt only — so any
+    site written here was invisible to /msh. Mirroring to txt closes that
+    loop and also keeps external/ops tooling that reads sites.txt in sync.
+    """
+    _db_write_global_sites(sites_list)
+    try:
+        _txt_write_sites(sites_list)
+    except Exception as e:
+        logging.warning(f"[SITECHK] txt mirror (write) failed: {e}")
+    return len(set(sites_list))
 
 
 def add_sites(new_sites):
+    """
+    v4.6.6 fix (Fix 3): add to DB *and* mirror to sites.txt.
+    """
     db_added = _db_add_global_sites(new_sites)
+    try:
+        _txt_add_sites(new_sites)
+    except Exception as e:
+        logging.warning(f"[SITECHK] txt mirror (add) failed: {e}")
     if db_added is not None:
         return db_added
-    return _txt_add_sites(new_sites)
+    return len(set(new_sites))
 
 
 def remove_site(site_url):
@@ -412,15 +430,13 @@ def remove_site(site_url):
 
 def clear_all_sites():
     db_count = _db_clear_global_sites()
+    try:
+        _txt_write_sites([])
+    except Exception:
+        pass
     if db_count is not None:
-        try:
-            _txt_write_sites([])
-        except Exception:
-            pass
         return db_count
-    txt_sites = _txt_read_sites()
-    _txt_write_sites([])
-    return len(txt_sites)
+    return 0
 
 
 def read_stripe_sites():
@@ -437,29 +453,36 @@ def read_stripe_sites():
 
 
 def write_stripe_sites(sites_list):
-    if _db_write_global_stripe_sites(sites_list):
-        return len(set(sites_list))
-    return _txt_write_stripe_sites(sites_list)
+    """v4.6.6 fix (Fix 3): mirror DB write to stripe_sites.txt."""
+    _db_write_global_stripe_sites(sites_list)
+    try:
+        _txt_write_stripe_sites(sites_list)
+    except Exception as e:
+        logging.warning(f"[SITECHK] txt mirror (stripe write) failed: {e}")
+    return len(set(sites_list))
 
 
 def add_stripe_sites(new_sites):
+    """v4.6.6 fix (Fix 3): mirror DB add to stripe_sites.txt."""
     db_added = _db_add_global_stripe_sites(new_sites)
+    try:
+        _txt_add_stripe_sites(new_sites)
+    except Exception as e:
+        logging.warning(f"[SITECHK] txt mirror (stripe add) failed: {e}")
     if db_added is not None:
         return db_added
-    return _txt_add_stripe_sites(new_sites)
+    return len(set(new_sites))
 
 
 def clear_all_stripe_sites():
     db_count = _db_clear_global_stripe_sites()
+    try:
+        _txt_write_stripe_sites([])
+    except Exception:
+        pass
     if db_count is not None:
-        try:
-            _txt_write_stripe_sites([])
-        except Exception:
-            pass
         return db_count
-    txt_sites = _txt_read_stripe_sites()
-    _txt_write_stripe_sites([])
-    return len(txt_sites)
+    return 0
 
 
 def load_user_proxies(user_id):
@@ -788,7 +811,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     live_count = 0
     dead_count = 0
     duplicate_count = 0
-    failed_sites = []  # NEW: track every URL that failed so we can prune user_sites
+    failed_sites = []
     last_edit_time = 0
     MIN_EDIT_INTERVAL = 2.0
     CHECKS_PER_UPDATE = 20
@@ -867,7 +890,7 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             working_sites_content.append(f"{site} | Price: {price} | Response: {resp_msg}")
         else:
             dead_count += 1
-            failed_sites.append(site)  # NEW: record raw URL for user_sites pruning
+            failed_sites.append(site)
 
         current_time = time.time()
         if (current_time - MIN_EDIT_INTERVAL > last_edit_time) or (checked_count % CHECKS_PER_UPDATE == 0):
@@ -891,7 +914,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
             except Exception:
                 pass
 
-    # Dedup survivors by normalize_url (strips www. + trailing slash + lowercases)
     final_unique_sites = []
     seen_normalized = set()
     for site in valid_sites:
@@ -904,17 +926,26 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
     _log(f"[SITECHK] Done: checked={checked_count} live={live_count} "
          f"dead={dead_count} dupes={duplicate_count} to_save={len(final_unique_sites)}")
 
-    # ─── Write survivors + prune failed sites from user_sites (Audit only) ───
+    # ─── Write survivors + refresh acting admin's user_sites + prune dead from user_sites ───
     user_sites_pruned = 0
     if command_name == "Audit":
-        # This call wipes global_sites entirely and re-inserts survivors —
-        # so failed URLs are already removed from global_sites here.
         written = await asyncio.to_thread(write_sites, final_unique_sites)
         _log(f"[SITECHK] global_sites written: {written} (expected {len(final_unique_sites)})")
 
-        # NEW: also prune every user's user_sites for URLs that failed validation.
-        # msh.py prefers user_sites over global, so this is critical — otherwise
-        # a user's custom-site list keeps pointing at dead sites forever.
+        # v4.6.6 fix (Fix 5): refresh the acting admin's user_sites so /msh
+        # immediately picks up the freshly-audited pool. msh.py prefers
+        # user_sites over the global pool, so without this the admin keeps
+        # seeing their stale list after the Audit.
+        if user_id and final_unique_sites:
+            try:
+                await asyncio.to_thread(clear_user_sites_db, user_id)
+                await asyncio.to_thread(add_user_sites_db, user_id, final_unique_sites)
+                _log(f"[SITECHK] Refreshed user_sites for admin {user_id} "
+                     f"({len(final_unique_sites)} sites)")
+            except Exception as ue:
+                logging.error(f"[SITECHK] Error refreshing admin user_sites: {ue}")
+
+        # Prune every user's user_sites for URLs that failed validation.
         if failed_sites:
             user_sites_pruned = await asyncio.to_thread(
                 _db_remove_user_sites_matching, failed_sites
@@ -954,7 +985,6 @@ async def run_site_checker(bot: Bot, chat_id: int, sites_to_check, command_name=
 
         if status_message_id:
             try:
-                # ─── NEW: clearer completion message with explicit "Wiped" count ───
                 completed_lines = [
                     f"<tg-emoji emoji-id='6242135305697106689'>🎁</tg-emoji> <b>{command_name} Complete!</b>",
                     "",
@@ -1153,9 +1183,14 @@ async def sitechk_command(message: types.Message):
         parse_mode="HTML"
     )
 
-    asyncio.create_task(run_site_checker(bot, chat_id, sites,
-                                          command_name="Audit",
-                                          status_message_id=status_msg.message_id))
+    # v4.6.6 fix (Fix 5): pass the acting admin's user_id so
+    # run_site_checker can refresh their user_sites after the Audit.
+    asyncio.create_task(run_site_checker(
+        bot, chat_id, sites,
+        command_name="Audit",
+        status_message_id=status_msg.message_id,
+        user_id=user_id,
+    ))
 
 
 @router.message(Command("addsite"))
@@ -1340,7 +1375,7 @@ async def mystripesite_command(message: types.Message):
     await message.reply_document(file, caption=text, parse_mode="HTML")
 
 
-# ─── /clearsite (singular) — NEW: admin-only global wipe ─────────────────────
+# ─── /clearsite (singular) — admin-only global wipe ─────────────────────────
 
 @router.message(Command("clearsite"))
 async def clearsites_command(message: types.Message):
@@ -1349,20 +1384,11 @@ async def clearsites_command(message: types.Message):
         await message.answer("⛔ <b>Not authorized.</b>", parse_mode="HTML")
         return
 
-    # Global pool + sites.txt
     global_deleted = await asyncio.to_thread(clear_all_sites)
-
-    # Every user's custom site list
     user_deleted = await asyncio.to_thread(_db_clear_all_user_sites)
-
-    # Global Stripe pool + stripe_sites.txt
     stripe_global = await asyncio.to_thread(clear_all_stripe_sites)
-
-    # Every user's custom Stripe site list
     stripe_user = await asyncio.to_thread(_db_clear_all_user_stripe_sites)
 
-    # Fresh start — wipe the manual ban list so re-added sites aren't
-    # silently filtered by msh.py's sites.txt fallback.
     banned_removed = False
     try:
         if os.path.exists(BANNED_SITES_FILE):
@@ -1371,7 +1397,6 @@ async def clearsites_command(message: types.Message):
     except Exception as e:
         logging.warning(f"[CLEARSITE] banned_sites.json remove failed: {e}")
 
-    # Force msh.py to re-read from DB on next /msh
     try:
         from mass_gates.msh import invalidate_sites_cache
         invalidate_sites_cache()
@@ -1395,7 +1420,7 @@ async def clearsites_command(message: types.Message):
     )
 
 
-# ─── /clearsites (plural) — user-scoped custom-site clear (unchanged) ────────
+# ─── /clearsites (plural) — user-scoped custom-site clear ────────────────────
 
 @router.message(Command("clearsites"))
 async def clearsites_plural_command(message: types.Message):
@@ -1608,10 +1633,8 @@ async def setprice_command(message: types.Message):
     else:
         await message.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>Save failed.</b>", parse_mode="HTML")
 
+
 # ─── Backward-compat aliases ──────────────────────────────────────────────
-# main.py imports `clearsites_command` at module load time. Both the old
-# name and the descriptive name resolve to the same handler so deploys
-# never crash on import again.
 clearsite_command         = clearsites_command           # singular alias
 clearsite_global_command  = clearsites_command           # descriptive alias
 clearsites_user_command   = clearsites_plural_command    # descriptive alias
