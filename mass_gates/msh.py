@@ -1,3 +1,4 @@
+import sys
 import re
 import urllib.parse
 if sys.platform == "win32":
