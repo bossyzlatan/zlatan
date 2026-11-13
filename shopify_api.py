@@ -1,5 +1,16 @@
 """
-Shopify API Manager — Stateless Edition (v4.5.0)
+Shopify API Manager — Stateless Edition (v4.5.1)
+
+CHANGES vs v4.5.0:
+  - format_proxy() now emits `user:pass@host:port` (or `host:port` for
+    no-auth proxies) instead of the previous `host:port:user:pass`.
+    api.py's `_sanitize_proxy_url()` anchors on the `@` separator to
+    detect user-info, so the old output was rejected as
+    INVALID_PROXY_FORMAT. Legacy `host:port:user:pass` input is still
+    accepted and reordered to the target shape for compatibility.
+  - format_proxy() additionally handles socks5/socks5h/socks4/socks4a
+    scheme prefixes (previously only http/https were parsed) and
+    space-separated db_format `user pass host port` input.
 
 CHANGES vs v4.4:
   - check_shopify_card: on retryable exceptions, the log message now
@@ -13,7 +24,6 @@ CHANGES vs v4.4:
     return payload (INFO on the msh.py side).
 
 Retained from v4.4:
-  - format_proxy() accepts stripped user:pass@host:port
   - classify_gate_response anchors 3-digit codes
   - _build_fallback seeds `seen` with primary site
   - Alt-key 401/403 records last_error
@@ -39,10 +49,13 @@ from typing import Optional, Dict, Any, List
 
 API_SERVERS = [
     "https://shopi-production-8a5f.up.railway.app",
+    "https://web-production-28654.up.railway.app",
+    "https://shopi-production-8424.up.railway.app",
+    "https://shopi-production-4802.up.railway.app",
 ]
 
 SHOPIFY_API_KEY = "oozaruhshop"
-ALT_API_KEY     = "oozaruhshop"
+ALT_API_KEY     = "btcbuoyshop"
 
 ACTIVE_API_SERVERS: List[str] = API_SERVERS.copy()
 SERVER_HEALTH: Dict[str, dict] = {}
@@ -73,26 +86,74 @@ def get_active_servers_excluding(seen: set) -> List[str]:
 
 
 def format_proxy(proxy: Optional[str]) -> Optional[str]:
+    """
+    Normalise any proxy shape into the form api.py's
+    `_sanitize_proxy_url()` accepts:
+
+        user:pass@host:port     (with auth)
+        host:port               (no auth)
+
+    api.py splits on the last `@` to extract user-info, then on the
+    first `:` inside the user-info to split user from password. Any
+    `&` / `%` / `:` inside the password survive because they're
+    percent-encoded by `urllib.parse.urlencode()` on the wire and
+    re-encoded by `_sanitize_proxy_url()` server-side.
+
+    Accepted input shapes:
+      1. http(s)://user:pass@host:port    (URL form)
+      2. socks5(h):// / socks4(a):// ...  (URL form)
+      3. user:pass@host:port              (already target shape)
+      4. host:port:user:pass              (legacy output of prior versions)
+      5. host:port                        (no auth)
+      6. user pass host port              (space-separated db_format)
+      7. - - host port                    (no-auth db_format)
+    """
     if not proxy:
         return None
     p = proxy.strip()
+    if not p:
+        return None
 
-    if p.startswith(("http://", "https://")):
-        parsed = urllib.parse.urlparse(p)
+    # 1) Full URL with scheme — parse then re-emit user-info form.
+    if p.startswith(("http://", "https://", "socks5://", "socks4://",
+                     "socks5h://", "socks4a://")):
+        try:
+            parsed = urllib.parse.urlparse(p)
+        except Exception:
+            return p
         if parsed.hostname and parsed.port:
-            if parsed.username and parsed.password:
-                return f"{parsed.hostname}:{parsed.port}:{parsed.username}:{parsed.password}"
+            if parsed.username is not None:
+                user = urllib.parse.unquote(parsed.username or "")
+                pw = urllib.parse.unquote(parsed.password or "")
+                return f"{user}:{pw}@{parsed.hostname}:{parsed.port}"
             return f"{parsed.hostname}:{parsed.port}"
         return p
 
-    if "@" in p and ":" in p.split("@", 1)[0]:
-        userinfo, hostport = p.split("@", 1)
+    # 2) Already `user:pass@host:port` (or `user@host:port`) — pass through.
+    #    `rsplit("@", 1)` mirrors api.py's parsing so a raw `@` inside
+    #    the password is treated as part of userinfo, not a separator.
+    if "@" in p:
+        _, hostport = p.rsplit("@", 1)
         if ":" in hostport and hostport.rsplit(":", 1)[1].isdigit():
-            user, _, pw = userinfo.partition(":")
-            return f"{hostport}:{user}:{pw}"
+            return p
 
-    if "@" not in p and p.count(":") == 1 and p.rsplit(":", 1)[1].isdigit():
+    # 3) Legacy `host:port:user:pass` — reorder to target shape.
+    parts = p.split(":")
+    if len(parts) == 4 and parts[1].isdigit():
+        host, port, user, pw = parts
+        return f"{user}:{pw}@{host}:{port}"
+
+    # 4) Bare `host:port` (no auth).
+    if p.count(":") == 1 and p.rsplit(":", 1)[1].isdigit():
         return p
+
+    # 5) Space-separated db_format `user pass host port` / `- - host port`.
+    sp = p.split()
+    if len(sp) == 4:
+        user, pw, host, port = sp
+        if user == "-" and pw == "-":
+            return f"{host}:{port}"
+        return f"{user}:{pw}@{host}:{port}"
 
     return p
 
@@ -239,7 +300,7 @@ async def check_shopify_card(
     ----------
     site : str — primary site URL or hostname.
     cc : str — card string formatted as `number|month|year|cvv`.
-    proxy : Optional[str] — any of the three shapes accepted by `format_proxy()`.
+    proxy : Optional[str] — any of the shapes accepted by `format_proxy()`.
     session : Optional[aiohttp.ClientSession] — caller owns TLS settings; this
         function does not modify them.
     max_retries : int — max distinct replicas to try (with jitter between).
