@@ -8,6 +8,7 @@ if sys.platform == "win32":
 
 import os
 import re
+import time
 import database
 import logging
 import asyncio
@@ -140,7 +141,61 @@ async def is_subscribed(bot: Bot, user_id: int) -> bool:
             continue
     return True
 
+
 class JoinCheckMiddleware(BaseMiddleware):
+    """
+    Subscription gate with:
+      - 5-minute per-user TTL cache (lock-guarded so concurrent callbacks
+        don't fan out into duplicate get_chat_member() calls).
+      - Callback-prefix exemptions for every internal UI button (mass
+        check stop/result, feedback, cmds, revokeall, sh_*). Without
+        this every result-callback tap burns 2 Telegram API calls
+        before it ever reaches the handler.
+      - Fail-OPEN on Telegram API errors — a get_chat_member outage
+        never locks the whole userbase out.
+    """
+
+    # Every callback prefix that belongs to our own UI — no gate needed.
+    EXEMPT_CALLBACK_PREFIXES = (
+        "mshs_", "mshr_",                    # msh stop / result
+        "msts_", "mstr_", "mstsr_", "mstss_",  # mst stop / result
+        "sh_", "revokeall_",                 # sh callbacks, revoke-all
+        "fb_", "cmds_",                      # feedback, /cmds
+    )
+    CACHE_TTL = 300  # seconds
+
+    def __init__(self):
+        super().__init__()
+        self._cache: Dict[int, float] = {}   # user_id -> cache_expiry_epoch
+        self._lock = asyncio.Lock()
+
+    def _is_exempt_callback(self, event) -> bool:
+        if not isinstance(event, types.CallbackQuery):
+            return False
+        data = event.data or ""
+        if data == "verify_fsub":
+            return True
+        return data.startswith(self.EXEMPT_CALLBACK_PREFIXES)
+
+    async def _is_subscribed_cached(self, bot: Bot, user_id: int) -> bool:
+        now = time.time()
+        if self._cache.get(user_id, 0) > now:
+            return True
+        async with self._lock:
+            if self._cache.get(user_id, 0) > now:
+                return True
+            try:
+                ok = await is_subscribed(bot, user_id)
+            except Exception as e:
+                logging.warning(
+                    "[JoinCheck] is_subscribed failed for %s (%s) — failing OPEN",
+                    user_id, e,
+                )
+                ok = True
+            if ok:
+                self._cache[user_id] = now + self.CACHE_TTL
+            return ok
+
     async def __call__(
         self,
         handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
@@ -153,11 +208,12 @@ class JoinCheckMiddleware(BaseMiddleware):
             return await handler(event, data)
         if chat and chat.type != "private":
             return await handler(event, data)
-        if isinstance(event, types.CallbackQuery) and event.data == "verify_fsub":
+        # Skip our own internal UI callbacks — those must never be gated.
+        if self._is_exempt_callback(event):
             return await handler(event, data)
 
         bot = data["bot"]
-        if not await is_subscribed(bot, user.id):
+        if not await self._is_subscribed_cached(bot, user.id):
             if isinstance(event, types.Message):
                 await event.reply(FSUB_TEXT, parse_mode="HTML", reply_markup=_FSUB_KB)
             elif isinstance(event, types.CallbackQuery):
@@ -822,14 +878,18 @@ async def start_dummy_server():
         logging.warning(f"Failed to start dummy web server: {e}. Continuing bot polling anyway.")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SITE POOL SYNC — MongoDB → bot → API replicas
+# SITE POOL MONITORING — MongoDB global_sites visibility only
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# NOTE (fix 1): Replicas read `global_sites` directly from MongoDB via
+# `database.get_global_sites()` on every `get_sites()` call. There is
+# nothing to push — `push_sites_to_all_replicas()` is deprecated and
+# removed from this loop. This task now exists purely to log pool
+# health so operators can see immediately when global_sites goes empty.
 
 async def _site_pool_sync_loop():
-    """
-    Push global_sites from MongoDB to all API replicas every 5 minutes.
-    Runs once ~10s after startup, then repeats.
-    """
+    """Monitor global_sites pool every 5 minutes. No pushes occur —
+    replicas read from MongoDB directly."""
     await asyncio.sleep(10)
 
     while True:
@@ -837,25 +897,49 @@ async def _site_pool_sync_loop():
             sites = await asyncio.to_thread(get_global_sites)
             if not sites:
                 logging.warning(
-                    "[site-sync] MongoDB global_sites is empty — "
-                    "replicas keep their current pool. Use /addsite to populate."
+                    "[site-sync] MongoDB global_sites is EMPTY — replicas "
+                    "will return NO_SITES until /addsite repopulates it."
                 )
             else:
-                result = await shopify_api.push_sites_to_all_replicas(sites)
-                ok = sum(1 for r in result["results"].values() if r.get("ok"))
-                detail = {
-                    host.split("//")[-1].split(".")[0]:
-                        (r.get("pool_size") if r.get("ok") else r.get("error"))
-                    for host, r in result["results"].items()
-                }
-                logging.info(
-                    "[site-sync] pushed %d sites to %d/%d replicas: %s",
-                    result["pushed"], ok, len(result["results"]), detail,
+                logging.debug(
+                    "[site-sync] global_sites pool size: %d", len(sites)
                 )
         except Exception as e:
-            logging.error("[site-sync] error: %s", e, exc_info=True)
+            logging.error("[site-sync] monitor error: %s", e, exc_info=True)
 
         await asyncio.sleep(300)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TASK SUPERVISOR — logs silent crashes of fire-and-forget tasks
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _supervise_task(task: asyncio.Task, name: str) -> None:
+    """
+    Attach a done_callback that logs (and clears) any exception the
+    task terminated with. Without this, fire-and-forget background
+    tasks die silently — you only notice when the feature they
+    powered stops working (e.g. health checks stop updating).
+    """
+    def _on_done(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            logging.info("[supervisor] task %s was cancelled", name)
+            return
+        except Exception as e:
+            logging.error(
+                "[supervisor] task %s done-callback raised: %s: %s",
+                name, type(e).__name__, e, exc_info=True,
+            )
+            return
+        if exc is not None:
+            logging.error(
+                "[supervisor] task %s crashed: %s: %s",
+                name, type(exc).__name__, exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+    task.add_done_callback(_on_done)
 
 
 async def main():
@@ -864,8 +948,15 @@ async def main():
 
     await start_dummy_server()
 
-    asyncio.create_task(shopify_api.auto_health_check())
-    asyncio.create_task(_site_pool_sync_loop())
+    health_task = asyncio.create_task(
+        shopify_api.auto_health_check(), name="auto_health_check"
+    )
+    _supervise_task(health_task, "auto_health_check")
+
+    sync_task = asyncio.create_task(
+        _site_pool_sync_loop(), name="site_pool_monitor"
+    )
+    _supervise_task(sync_task, "site_pool_monitor")
 
     logging.info("Bot starting via Long Polling…")
     while True:
