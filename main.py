@@ -48,9 +48,9 @@ from proxy import (
 )
 
 # ── Fix 1: register /myproxies in the same loop as the other proxy cmds ─
-     ("proxy", proxy_command), ("checkproxy", checkproxy_command),
-     ("clearproxy", clearproxy_command), ("rtvproxy", rtvproxy_command),
-     ("myproxies", myproxies_command),
+("proxy", proxy_command), ("checkproxy", checkproxy_command),
+("clearproxy", clearproxy_command), ("rtvproxy", rtvproxy_command),
+("myproxies", myproxies_command),
 
 from gates.st import st_command
 from gates.sh import sh_command, sh_callback_handler, router as sh_router
