@@ -42,7 +42,15 @@ from sub import (
     revokeall_command, revokeall_callback,
     revoke_command, revokeuser_command,
 )
-from proxy import proxy_command, checkproxy_command, clearproxy_command, rtvproxy_command
+from proxy import (
+     proxy_command, checkproxy_command, clearproxy_command,
+     rtvproxy_command, myproxies_command,
+)
+
+# ── Fix 1: register /myproxies in the same loop as the other proxy cmds ─
+     ("proxy", proxy_command), ("checkproxy", checkproxy_command),
+     ("clearproxy", clearproxy_command), ("rtvproxy", rtvproxy_command),
+     ("myproxies", myproxies_command),
 
 from gates.st import st_command
 from gates.sh import sh_command, sh_callback_handler, router as sh_router
