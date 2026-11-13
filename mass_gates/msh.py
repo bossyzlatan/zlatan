@@ -164,7 +164,14 @@ _start_msh_gc()
 
 def invalidate_sites_cache():
     """No-op: msh.py reads `global_sites` from DB on every `get_sites()`
-    call, so there is no cache to invalidate."""
+    call, so there is no cache to invalidate.
+
+    Fix 2 note: replicas read from MongoDB directly — no
+    `push_sites_to_all_replicas` calls exist anywhere in this file,
+    and none should be added. Adding them would reintroduce stale
+    per-replica caches and cause the "sites vanished after a save"
+    bug the DB-direct read already fixes.
+    """
     pass
 
 
@@ -784,6 +791,9 @@ def get_sites():
 
     Read MongoDB `global_sites` first, then fall back to sites.txt.
     Filters per-module ban list from banned_sites.json.
+
+    Fix 2: no cache, no replica push. The DB is the single source of
+    truth — every replica reads `global_sites` fresh here.
     """
     sites: list = []
 
@@ -2065,7 +2075,7 @@ async def msh_command(message: types.Message):
 
     is_premium, _ = get_premium_status(user_id)
     if not is_premium:
-        await message.reply("💎 GET KEY FROM @Lanxo2", parse_mode="HTML")
+        await message.reply("💎 GET KEY FROM @btcbuoy", parse_mode="HTML")
         return
 
     is_checking = False
