@@ -831,7 +831,6 @@ dp.callback_query.register(msh_stop_handler, MshStopCallback.filter())
 dp.callback_query.register(msh_result_handler, MshResultCallback.filter())
 dp.callback_query.register(mst_stop_handler, MstStopCallback.filter())
 dp.callback_query.register(mst_result_handler, MstResultCallback.filter())
-dp.callback_query.register(sh_callback_handler, F.data.startswith("sh_"))
 dp.callback_query.register(revokeall_callback, F.data.startswith("revokeall_"))
 
 for _cmd, _fn in [
