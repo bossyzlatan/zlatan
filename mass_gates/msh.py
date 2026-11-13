@@ -76,10 +76,7 @@ BUTTON_LOCK_SECONDS = 30
 # v4.6.7 — 4-REPLICA API CLUSTER
 # ══════════════════════════════════════════════════════════
 API_ENDPOINTS = [
-    "https://shopi-production-8424.up.railway.app",
-    "https://web-production-28654.up.railway.app",
-    "https://shopi-production-8a5f.up.railway.app",
-    "https://shopi-production-4802.up.railway.app",
+    "https://shopii-starkz-production.up.railway.app/",
 ]
 
 MSH_API_KEY = os.environ.get("MSH_API_KEY", "oozaruhshop").strip()
