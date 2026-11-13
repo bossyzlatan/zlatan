@@ -81,6 +81,23 @@ API_ENDPOINTS = [
 
 MSH_API_KEY = os.environ.get("MSH_API_KEY", "oozaruhshop").strip()
 
+# ─────────────────────────────────────────────────────────────────────────
+# Sentinel returned by process_card_api when Go is at capacity.
+#
+# Go (main.go) returns HTTP 503 with body {"error": "at capacity"} whenever
+# every worker slot in `workerSem` is busy. This is NOT a site failure, NOT
+# a proxy failure, and NOT an endpoint failure — the endpoint is healthy,
+# just saturated.
+#
+# The process_single_card loop must:
+#   • NOT consume the card's retry budget (attempt stays flat)
+#   • NOT rotate sites or blacklist
+#   • Back off with exponential jitter and retry
+#   • Cap at capacity_retries (40) to avoid infinite loops if Go stays full
+# ─────────────────────────────────────────────────────────────────────────
+_AT_CAPACITY = "AT_CAPACITY"
+_AT_CAPACITY_MAX_RETRIES = 40
+
 # Endpoint health tracking
 _API_ENDPOINT_COOLDOWN: dict[str, float] = {}
 _API_ENDPOINT_FAIL_COUNT: dict[str, int] = defaultdict(int)
@@ -160,9 +177,7 @@ _start_msh_gc()
 
 
 def invalidate_sites_cache():
-    """No-op: msh.py reads `global_sites` from DB on every `get_sites()`
-    call, so there is no cache to invalidate.
-    """
+    """No-op: msh.py reads `global_sites` from DB on every `get_sites()` call."""
     pass
 
 
@@ -257,8 +272,6 @@ class ProxyManager:
         self.session_id = session_id
         deduped = list(set(proxies_list))
 
-        # Cap so a 5k-proxy user doesn't burn CPU on the cooldown scan
-        # every get_next_proxy() call.
         if len(deduped) > MAX_PROXIES_PER_SESSION:
             random.shuffle(deduped)
             deduped = deduped[:MAX_PROXIES_PER_SESSION]
@@ -280,9 +293,6 @@ class ProxyManager:
 
     @staticmethod
     def _sanitize_proxy_url(url: str) -> str:
-        """Normalise a fully-formed proxy URL: URL-encode the user/password
-        components (so raw '&', '%', '@' from DEFAULT_PROXIES / db_format
-        round-trips correctly) and strip default ports."""
         if not url:
             return url
         if '://' not in url:
@@ -313,18 +323,15 @@ class ProxyManager:
 
         proxy = proxy.strip()
 
-        # Full URL — sanitise password encoding so raw '&' / '%' are safe.
         if proxy.startswith(('http://', 'https://')):
             return self._sanitize_proxy_url(proxy)
 
         if proxy.startswith('socks5://'):
             return None
 
-        # `user:pass@host:port` (already URL-encoded in db_format)
         if '@' in proxy and ':' in proxy.split('@')[0]:
             return self._sanitize_proxy_url(f'http://{proxy}')
 
-        # proxy.py db_format is `user pass host port` (space-separated).
         parts = proxy.split()
         if len(parts) == 4:
             user, pwd, host, port = parts
@@ -332,7 +339,6 @@ class ProxyManager:
                 return f'http://{host}:{port}'
             return f'http://{user}:{pwd}@{host}:{port}'
 
-        # `ip:port` (no auth)
         if ':' in proxy and '@' not in proxy:
             parts = proxy.split(':')
             if len(parts) == 2 and parts[1].isdigit():
@@ -392,6 +398,10 @@ class ProxyManager:
     def is_real_proxy_error(self, api_response: str, http_status: Optional[int] = None) -> bool:
         response_lower = api_response.lower() if api_response else ''
 
+        # Capacity sentinel is never a proxy error
+        if response_lower == _AT_CAPACITY.lower():
+            return False
+
         for success_indicator in self.SUCCESS_RESPONSES:
             if success_indicator.lower() in response_lower:
                 return False
@@ -420,6 +430,12 @@ class ProxyManager:
 
     def report_result(self, proxy: str, api_response: str, http_status: Optional[int] = None):
         current_time = time.time()
+
+        # Capacity sentinel: the proxy connected to Go fine, just got a 503.
+        # Credit it as a success — the proxy did its job.
+        if api_response == _AT_CAPACITY:
+            self.report_success(proxy)
+            return
 
         if self.is_real_proxy_error(api_response, http_status):
             if proxy not in self.failed_proxies:
@@ -579,9 +595,6 @@ def log_hit_to_mshh(user_id, username, first_name):
         logging.error(f"Error writing to mshh.txt: {e}")
 
 
-# ══════════════════════════════════════════
-# RETRY ERRORS - Site/Step Issues (Retry with NEW SITE)
-# ══════════════════════════════════════════
 RETRY_ERRORS = [
     'PAYMENTS_METHOD', 'no shipping handle obtained', 'validation_custom', 'decision_rule_block',
     'merchandise_expected_price_mismatch',
@@ -603,20 +616,11 @@ RETRY_ERRORS = [
     'delivery_no_delivery_strategy_available_for_mercha', 'delivery_no_delivery_strategy_available',
     'delivery_address', 'artifacts on the seller proposal', 'amount_too_small', '<b>Proxy Dead!</b>',
     'tokenization blocked: 403 Forbidden (proxy/IP blocked)', 'stableId not found in checkout HTML', 'UNKNOWN',
-    'checkout GET', 'NO_PRODUCT_FOUND', 'found 1 products, all 1 checkouts returned site errors (CAPTCHA_METADATA_MISSING) (9.1s)',
-     'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'No receipt in submit response (type: TooManyRequests)',
-    'step 0 failed',
-    'step 1 failed',
-    'step 2 failed',
-    'step 3 failed',
-    'step 4 failed',
-    'step 5 failed',
-    'step 6 failed',
-    'step 7 failed',
-    'step 8 failed',
-    'step 9 failed',
-    'step 10 failed',
-
+    'checkout GET', 'NO_PRODUCT_FOUND',
+    'TAX_NEW_TAX_MUST_BE_ACCEPTED',
+    'step 0 failed', 'step 1 failed', 'step 2 failed', 'step 3 failed',
+    'step 4 failed', 'step 5 failed', 'step 6 failed', 'step 7 failed',
+    'step 8 failed', 'step 9 failed', 'step 10 failed',
     'no available products found',
     'could not extract receiptid',
     'could not extract signedhandles',
@@ -784,7 +788,6 @@ def get_sites():
     """
     sites: list = []
 
-    # 1) DB — primary source of truth
     try:
         from database import get_global_sites
         db_sites = get_global_sites()
@@ -794,7 +797,6 @@ def get_sites():
     except Exception as e:
         logging.warning(f"[MSH] DB read failed, will fall back to sites.txt: {e}")
 
-    # 2) txt — legacy fallback
     if not sites:
         try:
             sites_file = os.path.join(os.path.dirname(__file__), "sites.txt")
@@ -809,7 +811,6 @@ def get_sites():
         except Exception as e:
             logging.error(f"Error reading sites.txt: {e}")
 
-    # 3) Filter per-module ban list
     banned_file = os.path.join(os.path.dirname(__file__), "banned_sites.json")
     if os.path.exists(banned_file):
         try:
@@ -860,27 +861,12 @@ async def process_card_api(
         (success, message, site, gateway, price, currency,
          proxy_status, http_status, receipt)
 
-    Go server response (HTTP 200):
-        {
-          "Response": "ORDER_PLACED" | "CARD_DECLINED" | "OTP_REQUIRED" | ...,
-          "CC":       "5455122802569146|12|26|543",
-          "Price":    "10.00 USD",       # ALREADY suffixed with currency
-          "Currency": "USD",
-          "Gate":     "Shopify Payments",
-          "Charged":  "True" | "False",
-          "Approved": "True" | "False",
-          "Time":     "1.4s",
-          "Receipt":  "https://..."       # "" when not charged
-        }
-
-    Non-200 statuses:
-        400 -> missing / malformed CC
-        503 -> at capacity / no sites loaded on Go side
-        504 -> card check timeout (body contains "Response": "timeout")
+    Special-case: when Go responds 503 with {"error": "at capacity"},
+    returns message=_AT_CAPACITY so the caller can back off and retry
+    WITHOUT penalising the endpoint, the proxy, or the site.
     """
     cc_formatted = f"{cc}|{mes}|{ano[-2:]}|{cvv}"
 
-    # Go API strips the scheme itself; keep it consistent.
     api_proxy = proxy
     for prefix in ("http://", "https://", "socks5://"):
         if api_proxy.startswith(prefix):
@@ -898,7 +884,6 @@ async def process_card_api(
 
     for base in _ordered_endpoints():
         endpoints_tried += 1
-        # Go ServeMux registers "/" as catch-all for handleCheck.
         endpoint_url = (
             f"{base.rstrip('/')}/"
             f"?site={quoted_site}"
@@ -917,7 +902,6 @@ async def process_card_api(
             async with _http.get(endpoint_url) as response:
                 http_status = response.status
 
-                # ── SUCCESS 200 — parse the real Go schema ─────────────
                 if response.status == 200:
                     data = await response.json()
                     _mark_endpoint_ok(base)
@@ -930,16 +914,12 @@ async def process_card_api(
                     charged = str(data.get("Charged", "False")).lower() == "true"
                     approved = str(data.get("Approved", "False")).lower() == "true"
 
-                    # Go returns "10.00 USD" — strip the currency suffix so
-                    # display code can append currency itself.
                     price = price_raw.strip()
                     if " " in price:
                         price = price.split(" ", 1)[0]
                     if not price or price == "?":
                         price = "0.00"
 
-                    # Go does NOT return a Proxy field. Infer it from the
-                    # message text so Telegram still shows something honest.
                     resp_lower = api_response.lower()
                     proxy_dead = any(x in resp_lower for x in (
                         "vault:", "proxy", "connection error",
@@ -955,8 +935,7 @@ async def process_card_api(
                         currency, proxy_status, http_status, receipt,
                     )
 
-                # ── non-200 — surface Go's error body, keep retryable text ──
-                _mark_endpoint_failed(base)
+                # ── Non-200 — read the error body first ────────────────
                 err_msg = ""
                 try:
                     err_body = await response.json()
@@ -967,10 +946,26 @@ async def process_card_api(
                 except Exception:
                     err_msg = ""
 
+                # ── Go 503 "at capacity": endpoint is ALIVE, just full.
+                #    Do NOT cool it down. Return the sentinel so the caller
+                #    can back off and retry transparently.
+                if response.status == 503 and "at capacity" in err_msg.lower():
+                    logging.info(
+                        f"[MSH API] {base} at capacity "
+                        f"(workers_cap reached) — backing off"
+                    )
+                    return (
+                        False, _AT_CAPACITY, site, "Shopify Payments",
+                        "0.00", "USD", "Error", http_status, "",
+                    )
+
+                # Any other failure — cool the endpoint down
+                _mark_endpoint_failed(base)
+
                 if response.status == 400:
                     last_error = f"Bad Request: {err_msg or 'invalid CC format'}"
                 elif response.status == 503:
-                    last_error = f"Service Unavailable: {err_msg or 'at capacity / no sites'}"
+                    last_error = f"Service Unavailable: {err_msg or 'no sites loaded on Go side'}"
                 elif response.status == 504:
                     last_error = err_msg or "timeout"
                 else:
@@ -1481,6 +1476,30 @@ async def update_progress_message(bot: Bot, session_id):
 # SINGLE CARD PROCESSING
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# Patterns that identify a *transient* site error — retryable, NEVER blacklists.
+_TRANSIENT_SITE_PATTERNS = (
+    "vault:", "cf 403", "rate limited", "429", "too many requests",
+    "502", "503", "504", "server error", "bad gateway", "timeout",
+    "throttled", "checkpoint denied", "cart add", "checkout error",
+    "empty response", "invalid json", "graphql error",
+    "negotiation failed", "failed to get session token",
+    "session token", "no payment method available",
+    "we couldn't complete", "could not complete",
+    "site error", "tls client error",
+    "no valid products", "no products found",
+    "proposal request failed", "submit error",
+    "proposal request", "at capacity", "service unavailable",
+    "checkout: we couldn", "checkout error:",
+)
+
+# Patterns that identify a site which is *definitively* unusable — safe to ban.
+_HARD_SITE_FAILURES = (
+    "site requires login", "not shopify",
+    "store incompatible", "merchant account closed",
+    "gateway not configured",
+)
+
+
 async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, user_obj, plan_name):
     session = MSH_SESSIONS.get(session_id)
     if not session:
@@ -1534,6 +1553,7 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
     MAX_RETRIES = 15
     attempt = 0
     rate_limit_streak = 0
+    capacity_retries = 0        # ← independent from `attempt` — AT_CAPACITY does NOT consume retry budget
 
     parts = cc_formatted.split('|')
     cc, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
@@ -1574,19 +1594,22 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
         # ── Site selection ────────────────────────────────────────────
         if use_go_sites:
-            # Python has no sites — let Go pick from its own sites.txt
             site = ""
             used_site = "Go Pool"
         else:
             blacklisted = GLOBAL_BLACKLISTED_SITES | session.get('_blacklisted_sites', set())
             clean_sites = [s for s in sites_list if s not in blacklisted]
             if not clean_sites:
+                banned_count = len(blacklisted & set(sites_list))
                 logging.warning(
-                    f"[MSH] All {len(sites_list)} sites blacklisted for session "
-                    f"{session_id} — aborting card {cc_formatted}"
+                    f"[MSH] Site pool exhausted for session {session_id} — "
+                    f"{banned_count}/{len(sites_list)} blacklisted"
                 )
                 result_status = "ERROR"
-                response_msg = "All sites blacklisted (fake charge detected)"
+                response_msg = (
+                    f"Site pool exhausted "
+                    f"({banned_count}/{len(sites_list)} blacklisted)"
+                )
                 break
             site = random.choice(clean_sites)
             used_site = site
@@ -1622,8 +1645,6 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
 
             if is_charged_response:
                 if use_go_sites:
-                    # Can't identify which site Go used — no verification
-                    # possible. Accept the charge but warn loudly.
                     logging.warning(
                         f"[MSH] Go pool mode — skipping fake verification for charge on card {cc_formatted}. "
                         f"Populate Python sites.txt to enable fake-charge detection."
@@ -1744,7 +1765,46 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                 response_msg = message
                 break
 
+            elif message == _AT_CAPACITY:
+                # ─────────────────────────────────────────────────────────────
+                # Go worker pool is full. This is NOT a site problem, NOT a
+                # proxy problem, NOT a card problem — Go is simply busy.
+                #
+                # Do NOT:
+                #   • count this against the card's retry budget
+                #   • rotate to a different site
+                #   • blacklist anything
+                #   • mark the endpoint as failed (process_card_api already
+                #     skipped _mark_endpoint_failed for this case)
+                #
+                # Do:
+                #   • back off with exponential jitter so we don't hammer a
+                #     saturated server
+                #   • cap total capacity retries at 40 (~worst-case 3 min) to
+                #     avoid infinite loops if Go stays wedged
+                # ─────────────────────────────────────────────────────────────
+                capacity_retries += 1
+                if capacity_retries > _AT_CAPACITY_MAX_RETRIES:
+                    result_status = "ERROR"
+                    response_msg = (
+                        f"Go server at capacity "
+                        f"({_AT_CAPACITY_MAX_RETRIES} retries exhausted)"
+                    )
+                    break
+                backoff = min(
+                    0.3 + capacity_retries * 0.15 + random.random() * 0.4,
+                    4.5,
+                )
+                # Reclaim the retry budget — capacity is not a card failure
+                attempt = max(0, attempt - 1)
+                await asyncio.sleep(backoff)
+                continue
+
             else:
+                # ─────────────────────────────────────────────────────────
+                # ERROR HANDLING — non-charge, non-approved, non-declined,
+                # non-capacity response
+                # ─────────────────────────────────────────────────────────
                 is_proxy_error = proxy_manager.is_real_proxy_error(message, http_status)
 
                 if is_proxy_error:
@@ -1756,33 +1816,49 @@ async def process_single_card(session_id, cc_formatted, cc_num, user_id, bot, us
                         attempt = max(0, attempt - 1)
                         await asyncio.sleep(0.1)
                         continue
-                else:
-                    if not use_go_sites and site:
-                        session.setdefault('_blacklisted_sites', set()).add(site)
 
-                    is_rate_limit = any(rl in message_lower for rl in
-                                        ["429", "too many requests", "http 429",
-                                         "generic_error", "generic error", "throttled"])
-                    if is_rate_limit:
-                        rate_limit_streak += 1
-                        if rate_limit_streak >= 5:
-                            result_status = "ERROR"
-                            response_msg = f"Rate limited {rate_limit_streak}x on different sites"
-                            break
-                        attempt = max(0, attempt - 1)
-                        await asyncio.sleep(0.3)
-
-                    if attempt < MAX_RETRIES:
-                        logging.info(
-                            f"[MSH] Site {site or 'Go Pool'} failed ({message[:50]}...) - "
-                            f"retrying with new site ({attempt}/{MAX_RETRIES})"
-                        )
-                        await asyncio.sleep(0.05)
-                        continue
-                    else:
+                # Rate-limit tracking across all sites for this card
+                is_rate_limit = any(rl in message_lower for rl in
+                                    ["429", "too many requests", "http 429",
+                                     "generic_error", "generic error", "throttled"])
+                if is_rate_limit:
+                    rate_limit_streak += 1
+                    if rate_limit_streak >= 5:
                         result_status = "ERROR"
-                        response_msg = f"Site Error (retried {MAX_RETRIES}x): {message}"
+                        response_msg = f"Rate limited {rate_limit_streak}x on different sites"
                         break
+
+                # Per-site failure counter — only blacklist after sustained failures
+                fails = session.setdefault('_site_failures', {})
+                key = site or "GoPool"
+                fails[key] = fails.get(key, 0) + 1
+
+                is_transient = any(p in message_lower for p in _TRANSIENT_SITE_PATTERNS)
+                is_hard_site = any(p in message_lower for p in _HARD_SITE_FAILURES)
+
+                if is_hard_site and not use_go_sites and site:
+                    session.setdefault('_blacklisted_sites', set()).add(site)
+                    logging.warning(
+                        f"[MSH] Site {site} blacklisted after hard failure: {message[:80]}"
+                    )
+                elif fails[key] >= 4 and not use_go_sites and site:
+                    session.setdefault('_blacklisted_sites', set()).add(site)
+                    logging.warning(
+                        f"[MSH] Site {site} blacklisted after {fails[key]} failures: {message[:80]}"
+                    )
+
+                if attempt < MAX_RETRIES:
+                    log_fn = logging.info if is_transient else logging.warning
+                    log_fn(
+                        f"[MSH] Site {site or 'GoPool'} failed "
+                        f"({attempt}/{MAX_RETRIES}) — rotating: {message[:80]}"
+                    )
+                    await asyncio.sleep(0.15 if is_transient else 0.05)
+                    continue
+                else:
+                    result_status = "ERROR"
+                    response_msg = f"Site Error (retried {MAX_RETRIES}x): {message[:80]}"
+                    break
 
         except asyncio.CancelledError:
             raise
@@ -2318,9 +2394,26 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
 
     use_go_sites = (not active_sites) and go_sites > 0
 
+    # ── Log the concurrency target so ops can verify what will be used ───
+    if go_cap > 0:
+        target_concurrency = max(15, min(260, int(go_cap * 1.2)))
+        logging.info(
+            f"[MSH] Go capacity={go_cap} workers (busy={go_busy}) — "
+            f"Python concurrency will target {target_concurrency}"
+        )
+        if go_cap < 20:
+            logging.warning(
+                f"[MSH] Go workers_cap={go_cap} is very tight. "
+                f"Consider raising maxWorkers in main.go."
+            )
+    else:
+        logging.warning(
+            "[MSH] /health returned workers_cap=0 or was unreachable — "
+            "Python will fall back to concurrency=60"
+        )
+
     # If neither side has sites, build the session and abort cleanly.
     if not active_sites and go_sites == 0:
-        # Build a minimal session so the message can be edited deterministically
         session_dict = {
             "session_id": session_id, "status": "FINISHED", "chat_id": chat_id,
             "user_id": user_id, "msg_id": None, "user_msg_id": message.message_id,
@@ -2331,6 +2424,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
             "live_cards": [], "dead_cards": [], "charged_cards": [],
             "error_cards": [], "user_obj": user_obj, "plan_name": plan_name,
             "is_group": is_group, "sites_list": [], "use_go_sites": False,
+            "_site_failures": {},
         }
         MSH_SESSIONS[session_id] = session_dict
         try:
@@ -2406,6 +2500,7 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
         "sites_list": active_sites,
         "use_go_sites": use_go_sites,
         "go_sites_count": go_sites,
+        "_site_failures": {},
     }
     MSH_SESSIONS[session_id] = session_dict
 
@@ -2416,15 +2511,38 @@ async def process_mass_check_background(message: types.Message, bot: Bot, valid_
     print(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} (Go: {go_sites}) - Proxies: {len(user_proxies)} - Group: {is_group}")
     logging.info(f"🚀 [MSH] Started - {total_cards} cards - User: {user_id} - Sites: {site_source} (Go: {go_sites}) - Proxies: {len(user_proxies)} - Group: {is_group}")
 
-    asyncio.create_task(run_mass_checker(bot, session_id, valid_cards, user_obj, plan_name))
+    asyncio.create_task(
+        run_mass_checker(bot, session_id, valid_cards, user_obj, plan_name, go_capacity=go_cap)
+    )
 
 
-async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name):
+async def run_mass_checker(bot: Bot, session_id, cards, user_obj, plan_name, go_capacity: int = 0):
     session = MSH_SESSIONS.get(session_id)
     if not session:
         return
 
-    sem = asyncio.Semaphore(260)
+    # ── Size concurrency to Go's worker cap ──────────────────────────────
+    # Profile B: 1.2x overshoot keeps Go's queue always full (no idle
+    # workers) at the cost of ~17% AT_CAPACITY retries, which the
+    # _AT_CAPACITY branch in process_single_card handles transparently.
+    #
+    # For go_capacity=200 → target=240. Go serves 200 in parallel; ~40
+    # extra Python goroutines back off 0.3-0.6s and retry. Net throughput
+    # ≈ Go's 200-worker ceiling with zero idle slots.
+    #
+    # Floor: 15 (below that, small batches crawl).
+    # Ceiling: 260 (the file's historical hard-coded max; protects the
+    #   bot from opening thousands of sockets on 10k+ card batches).
+    if go_capacity > 0:
+        target = max(15, min(260, int(go_capacity * 1.2)))
+    else:
+        target = 60          # conservative fallback if /health unreachable
+
+    logging.info(
+        f"[MSH] Session {session_id} — concurrency semaphore sized to {target} "
+        f"(go_cap={go_capacity or 'unknown'})"
+    )
+    sem = asyncio.Semaphore(target)
 
     async def worker(cc_formatted, cc_num):
         if is_session_stopped(session_id):
